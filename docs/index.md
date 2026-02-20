@@ -112,9 +112,12 @@ Like sleep for your AI's brain. Periodically:
 │                   AI Agent                       │
 │         (Claude Code, Aider, etc.)               │
 │                                                  │
-│  Hooks: UserPromptSubmit → Recall context       │
+│  Hooks: SessionStart → Init + project recall     │
+│         UserPromptSubmit → Recall context        │
+│         PreToolUse → Capture intent              │
 │         PostToolUse → Learn from errors          │
 │         Stop → Hebbian learning                  │
+│         + 8 more lifecycle hooks                 │
 │                                                  │
 │  MCP Tools: remember, recall, connect,           │
 │             forget, amend, reflect, etc.          │

@@ -268,12 +268,19 @@ Hooks run automatically during Claude Code sessions:
 
 | Hook | Event | What it does |
 |------|-------|-------------|
+| `session-start` | SessionStart | Initializes brain, starts session, recalls project-specific memories |
 | `prompt-submit` | UserPromptSubmit | Recalls relevant memories and injects them as context before every prompt |
+| `pre-tool` | PreToolUse | Captures intent before tool execution (Task and Bash with descriptions) |
 | `post-tool` | PostToolUse | Learns from Bash errors, file edits, and tool outputs (novelty-gated before storing) |
-| `pre-tool` | PreToolUse | Reads thinking blocks before tool execution for richer context capture |
+| `post-tool-failure` | PostToolUseFailure | Captures tool failures as antipatterns or experiences |
 | `stop` | Stop | Reads session transcript, applies Hebbian learning, propagates sub-agent atoms to parent session |
 | `subagent-stop` | SubagentStop | Same as stop — runs in sub-agent (Task) sessions and merges atoms into the parent's learning graph |
+| `subagent-start` | SubagentStart | Captures sub-agent delegation patterns as insights |
 | `pre-compact` | PreCompact | Checkpoints Hebbian learning mid-session so atoms aren't lost if context compacts before stop fires |
+| `session-end` | SessionEnd | Safety net: final Hebbian pass if Stop hook was missed |
+| `permission-request` | PermissionRequest | Records permission requests (antipattern if dangerous, else experience) |
+| `task-completed` | TaskCompleted | Records task completion milestones as experience atoms |
+| `notification` | Notification | Captures elicitation dialog notifications (user clarification requests) |
 
 ### Sub-agent learning
 
