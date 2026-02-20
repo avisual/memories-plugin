@@ -1,0 +1,16 @@
+{
+  "name": "memories",
+  "version": "0.1.0",
+  "description": "Brain-like memory system for Claude Code with neural graph architecture and spreading activation. Automatically captures learnings across sessions, recalls relevant context at prompt time, and strengthens connections between related ideas via Hebbian learning.",
+  "author": {
+    "name": "avisual",
+    "url": "https://github.com/avisual"
+  },
+  "homepage": "https://github.com/avisual/memories",
+  "repository": "https://github.com/avisual/memories",
+  "license": "MIT",
+  "keywords": ["memory", "learning", "mcp", "hooks", "hebbian", "recall", "context", "persistence"],
+  "skills": "./.claude/skills/",
+  "hooks": "./hooks/hooks.json",
+  "mcpServers": "./.mcp.json"
+}

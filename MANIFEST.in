@@ -1,0 +1,6 @@
+include README.md
+include LICENSE
+include CHANGELOG.md
+recursive-include src *.py
+recursive-include tests *.py
+include src/memories/py.typed

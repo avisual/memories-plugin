@@ -1,0 +1,95 @@
+[project]
+name = "avisual-memories"
+version = "0.1.0"
+description = "Brain-like memory system for AI agents with antipatterns, spreading activation, and Hebbian learning"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.13"
+authors = [
+    {name = "avisual", email = "john@nothingwecantdo.com"}
+]
+maintainers = [
+    {name = "avisual", email = "john@nothingwecantdo.com"}
+]
+keywords = [
+    "AI",
+    "memory", 
+    "agents",
+    "LLM",
+    "Claude",
+    "antipatterns",
+    "spreading-activation",
+    "hebbian-learning",
+    "MCP",
+    "local-first"
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Typing :: Typed",
+]
+dependencies = [
+    "anyio>=4.12.1",
+    "httpx>=0.28.1",
+    "mcp[cli]>=1.26.0",
+    "numpy>=1.26.0",
+    "ollama>=0.6.1",
+    "sqlite-vec>=0.1.6",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=9.0.2",
+    "pytest-asyncio>=1.3.0",
+    "pytest-cov>=4.1.0",
+]
+docs = [
+    "mkdocs>=1.5.0",
+    "mkdocs-material>=9.5.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/avisual/memories"
+Documentation = "https://avisual.github.io/memories"
+Repository = "https://github.com/avisual/memories"
+Issues = "https://github.com/avisual/memories/issues"
+Changelog = "https://github.com/avisual/memories/blob/main/CHANGELOG.md"
+
+[project.scripts]
+memories = "memories.__main__:main"
+avisual-memories = "memories.__main__:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "/src",
+    "/tests",
+    "/README.md",
+    "/LICENSE",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/memories"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+markers = [
+    "load: Load and concurrency tests (deselect with '-m \"not load\"')",
+]
+
+[tool.ruff]
+line-length = 88
+target-version = "py313"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W", "UP"]

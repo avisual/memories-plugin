@@ -1,0 +1,70 @@
+# avisual memories - Docker Compose
+# Usage: docker compose up -d
+# This sets up memories + Ollama for a complete local deployment
+
+version: "3.9"
+
+services:
+  # Main memory service
+  memories:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: avisual-memories
+    restart: unless-stopped
+    volumes:
+      - memories-data:/data
+    ports:
+      - "8080:8080"
+    environment:
+      - MEMORIES_OLLAMA_URL=http://ollama:11434
+      - MEMORIES_DB_PATH=/data/memories.db
+      - MEMORIES_EMBEDDING_MODEL=nomic-embed-text
+    depends_on:
+      ollama:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-m", "memories", "health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  # Ollama for local embeddings
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama
+    restart: unless-stopped
+    volumes:
+      - ollama-models:/root/.ollama
+    ports:
+      - "11434:11434"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:11434/api/tags"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    # Pull the embedding model on first run
+    # Run manually: docker exec ollama ollama pull nomic-embed-text
+
+volumes:
+  memories-data:
+    driver: local
+  ollama-models:
+    driver: local
+
+# Usage notes:
+# 
+# First time setup:
+#   docker compose up -d
+#   docker exec ollama ollama pull nomic-embed-text
+#
+# Check logs:
+#   docker compose logs -f memories
+#
+# Stop:
+#   docker compose down
+#
+# Reset data:
+#   docker compose down -v
