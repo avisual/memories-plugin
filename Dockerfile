@@ -56,5 +56,5 @@ CMD ["serve"]
 # Labels
 LABEL org.opencontainers.image.title="avisual memories"
 LABEL org.opencontainers.image.description="Brain-like memory system for AI agents"
-LABEL org.opencontainers.image.source="https://github.com/avisual/memories"
+LABEL org.opencontainers.image.source="https://github.com/avisual/memories-plugin"
 LABEL org.opencontainers.image.licenses="MIT"

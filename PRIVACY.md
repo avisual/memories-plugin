@@ -42,4 +42,4 @@ This policy may be updated as the plugin evolves. Changes will be reflected in t
 
 ## Contact
 
-For questions or to report a vulnerability: https://github.com/avisual/memories/issues
+For questions or to report a vulnerability: https://github.com/avisual/memories-plugin/issues

@@ -8,4 +8,4 @@ Contributions welcome!
 4. Ensure all tests pass: `uv run pytest`
 5. Submit a PR
 
-See [GitHub repository](https://github.com/avisual/memories) for more details.
+See [GitHub repository](https://github.com/avisual/memories-plugin) for more details.

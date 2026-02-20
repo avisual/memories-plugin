@@ -55,11 +55,11 @@ docs = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/avisual/memories"
+Homepage = "https://github.com/avisual/memories-plugin"
 Documentation = "https://avisual.github.io/memories"
-Repository = "https://github.com/avisual/memories"
-Issues = "https://github.com/avisual/memories/issues"
-Changelog = "https://github.com/avisual/memories/blob/main/CHANGELOG.md"
+Repository = "https://github.com/avisual/memories-plugin"
+Issues = "https://github.com/avisual/memories-plugin/issues"
+Changelog = "https://github.com/avisual/memories-plugin/blob/main/CHANGELOG.md"
 
 [project.scripts]
 memories = "memories.__main__:main"

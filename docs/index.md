@@ -143,7 +143,7 @@ Like sleep for your AI's brain. Periodically:
 - **0.7ms** average search query
 - **1,545 recalls/sec** retrieval throughput
 
-Tested with 1,000-atom datasets. See [benchmarks](https://github.com/avisual/memories/tree/main/tests/load).
+Tested with 1,000-atom datasets. See [benchmarks](https://github.com/avisual/memories-plugin/tree/main/tests/load).
 
 ## Use Cases
 
@@ -163,7 +163,7 @@ Tested with 1,000-atom datasets. See [benchmarks](https://github.com/avisual/mem
 
 ## Support
 
-- **GitHub Issues**: [github.com/avisual/memories/issues](https://github.com/avisual/memories/issues)
+- **GitHub Issues**: [github.com/avisual/memories-plugin/issues](https://github.com/avisual/memories-plugin/issues)
 - **Documentation**: [avisual.github.io/memories](https://avisual.github.io/memories)
 - **PyPI**: Coming soon
 
