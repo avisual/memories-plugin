@@ -6,8 +6,8 @@
     "name": "avisual",
     "url": "https://github.com/avisual"
   },
-  "homepage": "https://github.com/avisual/memories",
-  "repository": "https://github.com/avisual/memories",
+  "homepage": "https://github.com/avisual/memories-plugin",
+  "repository": "https://github.com/avisual/memories-plugin",
   "license": "MIT",
   "keywords": ["memory", "learning", "mcp", "hooks", "hebbian", "recall", "context", "persistence"],
   "skills": "./.claude/skills/",

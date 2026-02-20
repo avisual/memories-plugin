@@ -4,7 +4,7 @@
 [![PyPI](https://img.shields.io/badge/PyPI-coming%20soon-lightgrey)](https://github.com/avisual/memories-plugin)
 [![Python 3.13+](https://img.shields.io/badge/python-3.13+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Tests](https://img.shields.io/badge/tests-935%20passing-success)](https://github.com/avisual/memories)
+[![Tests](https://img.shields.io/badge/tests-935%20passing-success)](https://github.com/avisual/memories-plugin)
 
 > **The only AI memory system that prevents mistakes _before_ they happen.**
 
@@ -70,8 +70,8 @@ The system integrates with Claude Code through two channels:
 
 ```bash
 # 1. Clone and install
-git clone https://github.com/avisual/memories.git
-cd memories
+git clone https://github.com/avisual/memories-plugin.git
+cd memories-plugin
 uv sync
 
 # 2. Run interactive setup
@@ -95,7 +95,7 @@ Start a new Claude Code session and memories will be active!
 ```
 Install the avisual-memories MCP server for me. Run these commands:
 
-1. Clone: git clone https://github.com/avisual/memories.git && cd memories && uv sync
+1. Clone: git clone https://github.com/avisual/memories-plugin.git && cd memories-plugin && uv sync
 2. Install Ollama if needed: brew install ollama && ollama serve &
 3. Pull embedding model: ollama pull nomic-embed-text
 4. Run setup: uv run python -m memories setup --non-interactive
@@ -118,8 +118,8 @@ This gives Claude explicit commands to run - no ambiguity, no recursion.
 ### 1. Clone and install
 
 ```bash
-git clone https://github.com/avisual/memories.git
-cd memories
+git clone https://github.com/avisual/memories-plugin.git
+cd memories-plugin
 uv sync
 ```
 
@@ -500,7 +500,7 @@ rm -rf ~/.memories/
 - Check diagnostics: `uv run python -m memories diagnose`
 - View stats: `uv run python -m memories stats`
 - Check health: `uv run python -m memories health`
-- Open an issue: https://github.com/avisual/memories/issues
+- Open an issue: https://github.com/avisual/memories-plugin/issues
 
 ## Documentation
 
@@ -527,6 +527,6 @@ MIT - see [LICENSE](LICENSE) file for details.
 
 - **PyPI**: Coming soon
 - **Documentation**: https://avisual.github.io/memories/
-- **GitHub**: https://github.com/avisual/memories
-- **Issues**: https://github.com/avisual/memories/issues
+- **GitHub**: https://github.com/avisual/memories-plugin
+- **Issues**: https://github.com/avisual/memories-plugin/issues
 - **Changelog**: [CHANGELOG.md](CHANGELOG.md)

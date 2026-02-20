@@ -127,4 +127,4 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - 0.7ms average FTS query time
 - 1545 recalls/sec
 
-[0.1.0]: https://github.com/avisual/memories/releases/tag/v0.1.0
+[0.1.0]: https://github.com/avisual/memories-plugin/releases/tag/v0.1.0

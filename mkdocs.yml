@@ -3,8 +3,8 @@ site_description: Brain-like memory system for AI agents with antipatterns
 site_author: avisual
 site_url: https://avisual.github.io/memories/
 
-repo_name: avisual/memories
-repo_url: https://github.com/avisual/memories
+repo_name: avisual/memories-plugin
+repo_url: https://github.com/avisual/memories-plugin
 edit_uri: edit/main/docs/
 
 theme:
@@ -84,7 +84,7 @@ plugins:
 extra:
   social:
     - icon: fontawesome/brands/github
-      link: https://github.com/avisual/memories
+      link: https://github.com/avisual/memories-plugin
     - icon: fontawesome/brands/python
       link: https://github.com/avisual/memories-plugin
 
