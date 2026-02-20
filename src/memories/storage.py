@@ -496,9 +496,12 @@ class Storage:
         hsa_info = conn.execute("PRAGMA table_info(hook_session_atoms)").fetchall()
         hsa_columns = {r[1] for r in hsa_info}
         if "accessed_at" not in hsa_columns:
+            # ALTER TABLE only supports constant defaults — use no default here.
+            # New rows get datetime('now') from the CREATE TABLE schema; existing
+            # rows get NULL, handled by atom_timestamps.get(id, 0.0) fallback.
             conn.execute(
                 "ALTER TABLE hook_session_atoms "
-                "ADD COLUMN accessed_at TEXT DEFAULT (datetime('now'))"
+                "ADD COLUMN accessed_at TEXT"
             )
             log.info("Migration: Added 'accessed_at' column to hook_session_atoms")
 
