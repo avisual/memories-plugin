@@ -86,6 +86,6 @@ extra:
     - icon: fontawesome/brands/github
       link: https://github.com/avisual/memories
     - icon: fontawesome/brands/python
-      link: https://pypi.org/project/avisual-memories/
+      link: https://github.com/avisual/memories-plugin
 
 copyright: Copyright &copy; 2026 avisual

@@ -30,14 +30,16 @@ Unlike basic RAG systems or commercial memory APIs, avisual memories is built li
 ## Quick Start
 
 ```bash
-# Install
-pip install avisual-memories
+# Clone and install
+git clone https://github.com/avisual/memories-plugin.git
+cd memories-plugin
+uv sync
 
 # Setup (interactive)
-avisual-memories setup --interactive
+uv run python -m memories setup --interactive
 
 # Verify
-avisual-memories diagnose
+uv run python -m memories diagnose
 ```
 
 Then restart your AI agent (Claude Code, Aider, etc.) and it will have persistent memory!
@@ -160,7 +162,7 @@ Tested with 1,000-atom datasets. See [benchmarks](https://github.com/avisual/mem
 
 - **GitHub Issues**: [github.com/avisual/memories/issues](https://github.com/avisual/memories/issues)
 - **Documentation**: [avisual.github.io/memories](https://avisual.github.io/memories)
-- **PyPI**: [pypi.org/project/avisual-memories](https://pypi.org/project/avisual-memories/)
+- **PyPI**: Coming soon
 
 ## License
 

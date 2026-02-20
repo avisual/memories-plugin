@@ -8,23 +8,11 @@
 
 ## Install avisual-memories
 
-### Option 1: pip (Recommended)
+> **Note:** PyPI package coming soon. For now, install from source.
 
 ```bash
-pip install avisual-memories
-```
-
-### Option 2: uv
-
-```bash
-uv tool install avisual-memories
-```
-
-### Option 3: From Source
-
-```bash
-git clone https://github.com/avisual/memories.git
-cd memories
+git clone https://github.com/avisual/memories-plugin.git
+cd memories-plugin
 uv sync
 ```
 
