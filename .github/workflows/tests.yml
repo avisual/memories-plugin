@@ -25,4 +25,5 @@ jobs:
         run: uv sync --frozen --extra dev
 
       - name: Run tests
-        run: uv run pytest tests/ -q --tb=short
+        run: uv run pytest tests/ -q --tb=short --ignore=tests/test_importance.py
+        # test_importance.py requires a live Ollama instance — run locally only
