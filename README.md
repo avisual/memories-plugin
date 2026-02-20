@@ -1,7 +1,7 @@
 # avisual memories
 
 [![Tests](https://github.com/avisual/memories-plugin/actions/workflows/tests.yml/badge.svg)](https://github.com/avisual/memories-plugin/actions/workflows/tests.yml)
-[![PyPI](https://img.shields.io/pypi/v/avisual-memories)](https://pypi.org/project/avisual-memories/)
+[![PyPI](https://img.shields.io/badge/PyPI-coming%20soon-lightgrey)](https://github.com/avisual/memories-plugin)
 [![Python 3.13+](https://img.shields.io/badge/python-3.13+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Tests](https://img.shields.io/badge/tests-935%20passing-success)](https://github.com/avisual/memories)
@@ -66,20 +66,7 @@ The system integrates with Claude Code through two channels:
 
 ## Quick Start
 
-### Option 1: Install from PyPI (Recommended)
-
-```bash
-# 1. Install
-pip install avisual-memories
-
-# or with uv:
-uv tool install avisual-memories
-
-# 2. Run interactive setup
-avisual-memories setup --interactive
-```
-
-### Option 2: Install from Source
+### Install from Source
 
 ```bash
 # 1. Clone and install
@@ -108,11 +95,11 @@ Start a new Claude Code session and memories will be active!
 ```
 Install the avisual-memories MCP server for me. Run these commands:
 
-1. Install: pip install avisual-memories
+1. Clone: git clone https://github.com/avisual/memories.git && cd memories && uv sync
 2. Install Ollama if needed: brew install ollama && ollama serve &
 3. Pull embedding model: ollama pull nomic-embed-text
-4. Run setup: avisual-memories setup --non-interactive
-5. Verify: avisual-memories diagnose
+4. Run setup: uv run python -m memories setup --non-interactive
+5. Verify: uv run python -m memories diagnose
 
 Then restart Claude Code and I'll have persistent memory!
 ```
@@ -531,7 +518,7 @@ MIT - see [LICENSE](LICENSE) file for details.
 
 ## Links
 
-- **PyPI**: https://pypi.org/project/avisual-memories/
+- **PyPI**: Coming soon
 - **Documentation**: https://avisual.github.io/memories/
 - **GitHub**: https://github.com/avisual/memories
 - **Issues**: https://github.com/avisual/memories/issues
