@@ -6,14 +6,24 @@ This module tests the importance field across the system:
 - Importance validation (0.0 to 1.0)
 - Importance in retrieval scoring
 - Migration for existing databases
+
+All tests use mocked embeddings so Ollama is not required.
 """
 
 from __future__ import annotations
+
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from memories.atoms import Atom, AtomManager, _validate_importance
 from memories.brain import Brain
+from memories.config import get_config
+from memories.context import ContextBudget
+from memories.retrieval import RetrievalEngine
+from memories.synapses import SynapseManager
+
+from tests.conftest import insert_atom
 
 
 class TestImportanceValidation:
@@ -154,20 +164,36 @@ class TestAtomManagerImportance:
 
 
 class TestBrainImportance:
-    """Test Brain.remember() and Brain.amend() with importance."""
+    """Test Brain.remember() and Brain.amend() with importance.
+
+    Uses Brain.__new__() pattern with mocked embeddings so Ollama is not required.
+    """
 
     @pytest.fixture
-    async def brain(self, tmp_path) -> Brain:
-        """Create and initialize a Brain instance."""
-        import os
-        os.environ["MEMORIES_DB_PATH"] = str(tmp_path / "test.db")
-        from memories.config import get_config
-        get_config(reload=True)
-        
-        brain = Brain()
-        await brain.initialize()
-        yield brain
-        await brain.shutdown()
+    async def brain(self, storage, mock_embeddings):
+        """Create a Brain with real AtomManager but mocked embeddings."""
+        b = Brain.__new__(Brain)
+        b._config = get_config()
+        b._storage = storage
+        b._embeddings = mock_embeddings
+        b._atoms = AtomManager(storage, mock_embeddings)
+        b._synapses = SynapseManager(storage)
+        b._context = MagicMock()
+
+        b._retrieval = MagicMock()
+        b._learning = MagicMock()
+        b._learning.suggest_region = AsyncMock(return_value="general")
+        b._learning.extract_antipattern_fields = AsyncMock(
+            return_value=("high", "use X instead")
+        )
+        b._learning.auto_link = AsyncMock(return_value=[])
+        b._learning.detect_antipattern_links = AsyncMock(return_value=0)
+        b._learning.detect_supersedes = AsyncMock(return_value=0)
+        b._consolidation = MagicMock()
+
+        b._current_session_id = "test-session-importance"
+        b._initialized = True
+        return b
 
     @pytest.mark.anyio
     async def test_remember_with_default_importance(self, brain: Brain) -> None:
@@ -203,38 +229,53 @@ class TestBrainImportance:
 
 
 class TestRetrievalImportanceScoring:
-    """Test that importance affects recall ranking."""
+    """Test that importance affects recall ranking.
+
+    Uses insert_atom() + real RetrievalEngine with mocked embeddings
+    so Ollama is not required.
+    """
 
     @pytest.fixture
-    async def brain_with_atoms(self, tmp_path) -> Brain:
-        """Create brain with test atoms of varying importance."""
-        import os
-        os.environ["MEMORIES_DB_PATH"] = str(tmp_path / "test.db")
-        from memories.config import get_config
-        get_config(reload=True)
-        
-        brain = Brain()
-        await brain.initialize()
+    async def brain_with_atoms(self, storage, mock_embeddings):
+        """Create brain with test atoms of varying importance via direct insert."""
+        atoms = AtomManager(storage, mock_embeddings)
+        synapses = SynapseManager(storage)
+        context = ContextBudget(storage)
+        retrieval = RetrievalEngine(storage, mock_embeddings, atoms, synapses, context)
 
-        # Create atoms with different importance levels
-        await brain.remember(
-            content="Redis is an in-memory database",
-            type="fact",
-            importance=0.3,  # Low importance
+        # Insert atoms directly (bypasses embeddings)
+        id_low = await insert_atom(
+            storage, "Redis is an in-memory database",
+            atom_type="fact", importance=0.3,
         )
-        await brain.remember(
-            content="Redis SCAN is O(N) over the full keyspace",
-            type="fact",
-            importance=0.9,  # High importance
+        id_high = await insert_atom(
+            storage, "Redis SCAN is O(N) over the full keyspace",
+            atom_type="fact", importance=0.9,
         )
-        await brain.remember(
-            content="Redis supports multiple data structures",
-            type="fact",
-            importance=0.5,  # Medium importance
+        id_med = await insert_atom(
+            storage, "Redis supports multiple data structures",
+            atom_type="fact", importance=0.5,
         )
 
-        yield brain
-        await brain.shutdown()
+        # Mock search_similar to return our atoms as seed results
+        mock_embeddings.search_similar = AsyncMock(
+            return_value=[(id_low, 0.3), (id_high, 0.2), (id_med, 0.25)]
+        )
+
+        # Build the brain
+        b = Brain.__new__(Brain)
+        b._config = get_config()
+        b._storage = storage
+        b._embeddings = mock_embeddings
+        b._atoms = atoms
+        b._synapses = synapses
+        b._context = context
+        b._retrieval = retrieval
+        b._learning = MagicMock()
+        b._consolidation = MagicMock()
+        b._current_session_id = None
+        b._initialized = True
+        return b
 
     @pytest.mark.anyio
     async def test_importance_affects_score_breakdown(
@@ -256,7 +297,7 @@ class TestRetrievalImportanceScoring:
         self, brain_with_atoms: Brain
     ) -> None:
         """Higher importance atoms should tend to rank higher.
-        
+
         Note: This is a probabilistic test since other factors
         (vector similarity, spread activation) also affect ranking.
         """
