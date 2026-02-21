@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed (2026-02-21)
+- SQLite migration: task_status ALTER TABLE no longer fails on SQLite 3.45+ due to CHECK constraint + prior NOT NULL column interaction
+- Documentation: removed premature PyPI CLI references (`avisual-memories` → `uv run python -m memories`)
+- Documentation: updated test count, hook descriptions, differentiated budgets, retrieval weights
+
+### Added (Context Injection — 2026-02-21)
+- **Cross-region recall**: prompt-submit now runs parallel project-scoped + global recalls, surfacing cross-project knowledge
+- **Pre-tool antipattern recall**: Bash/Task hooks recall antipattern warnings before command execution (0.5% budget)
+- **Session ID bridging**: Claude Code session ID now bridges to Brain, enabling contextual encoding and session priming through hooks
+- **Differentiated hook budgets**: session-start=3%, prompt-submit=2%, pre-tool=0.5% (previously flat 2%)
+- **Rich context formatting**: hook output includes confidence scores, atom IDs, structured antipattern metadata, and synapse pathways
+- **Framing preamble**: injected context wrapped with guidance for Claude to verify stale information
+- **Antipattern deduplication**: atoms appearing in both regular results and antipattern list are deduplicated at brain.recall() level
+
+### Changed (Context Injection — 2026-02-21)
+- Retrieval weights rebalanced: vector=0.30, spread=0.25, bm25=0.12, confidence=0.12, importance=0.11, recency=0.08, frequency=0.02
+- FTS5 minimum token length lowered from 3 to 2 characters (enables searching "Go", "CI", "DB", "UI")
+- Session-start query changed from meta-description to direct project name for better semantic matching
+
+### Fixed (Context Injection — 2026-02-21)
+- `encoded-with` synapse type weight was missing from retrieval tuple (fell back to 0.5 instead of configured 0.2)
+- Reconsolidation bidirectional query changed from OR-across-columns to UNION ALL for proper SQLite index usage
+- Contextual encoding query now ordered by `accessed_at DESC` so most recent atoms form encoding context
+- Importance protection factor now applied to power-law decay transition exponent
+- Encoded-with synapses get accelerated decay (base_decay * 0.85) to prevent stale contextual bindings
+
 ### Added (Wave 11 — 2026-02-20)
 - Bash error tightening: 4 specific error signatures now correctly classified
 - `_SKIP_TOOLS` set consolidated into a single canonical definition

@@ -43,20 +43,24 @@ async def _reset_singleton() -> None:
 
     Calls _reset_brain_singleton when available (post-implementation);
     falls back to direct attribute manipulation for the pre-implementation
-    failing tests.
+    failing tests.  Also forces a config reload so monkeypatched env vars
+    (like MEMORIES_DB_PATH) take effect for the next _get_brain() call.
     """
     import memories.cli as cli_mod
 
     # Post-implementation path: use the official reset helper.
     if hasattr(cli_mod, "_reset_brain_singleton"):
         await cli_mod._reset_brain_singleton()
-        return
+    else:
+        # Pre-implementation path: manually zero out whatever is there.
+        if hasattr(cli_mod, "_brain_instance"):
+            cli_mod._brain_instance = None
+        if hasattr(cli_mod, "_brain_lock"):
+            cli_mod._brain_lock = None
 
-    # Pre-implementation path: manually zero out whatever is there.
-    if hasattr(cli_mod, "_brain_instance"):
-        cli_mod._brain_instance = None
-    if hasattr(cli_mod, "_brain_lock"):
-        cli_mod._brain_lock = None
+    # Force config reload so monkeypatched env vars take effect.
+    from memories.config import get_config
+    get_config(reload=True)
 
 
 # ---------------------------------------------------------------------------

@@ -261,6 +261,48 @@ class Brain:
         # 5. Detect supersession.
         supersede_count = await self._learning.detect_supersedes(atom.id)
 
+        # 5b. Contextual encoding: create lightweight encoded-with synapses
+        # to atoms co-active in the current session.  Implements encoding
+        # specificity (Tulving & Thomson 1973) — memories encoded in a
+        # context are better recalled when that context reappears.
+        context_links = 0
+        if self._current_session_id and self._storage:
+            try:
+                context_rows = await self._storage.execute(
+                    "SELECT atom_id FROM hook_session_atoms WHERE claude_session_id = ? ORDER BY accessed_at DESC",
+                    (self._current_session_id,),
+                )
+                context_ids = [r["atom_id"] for r in context_rows if r["atom_id"] != atom.id]
+                # Cap to prevent explosion in large sessions.
+                _MAX_CONTEXT_LINKS = 10
+                capped_ids = context_ids[:_MAX_CONTEXT_LINKS]
+                if capped_ids:
+                    # Batch INSERT all encoded-with synapses in both directions
+                    # instead of per-atom create() calls (H2 fix).
+                    params_list: list[tuple[int, int]] = []
+                    for ctx_id in capped_ids:
+                        params_list.append((atom.id, ctx_id))
+                        params_list.append((ctx_id, atom.id))
+                    await self._storage.execute_many(
+                        """
+                        INSERT OR IGNORE INTO synapses
+                            (source_id, target_id, relationship, strength, bidirectional)
+                        VALUES (?, ?, 'encoded-with', 0.15, 1)
+                        """,
+                        params_list,
+                    )
+                    context_links = len(capped_ids)
+                    logger.debug(
+                        "Contextual encoding: created %d encoded-with links for atom %d",
+                        context_links,
+                        atom.id,
+                    )
+            except Exception:
+                # Contextual encoding is best-effort; never block remember().
+                logger.debug(
+                    "Contextual encoding failed for atom %d", atom.id, exc_info=True
+                )
+
         # Derive antipattern count from the synapses auto_link() created.
         antipattern_count = sum(
             1 for s in created_synapses if s.get("relationship") == "warns-against"
@@ -389,9 +431,16 @@ class Brain:
             session_atom_ids=session_atom_ids,
         )
 
+        # Deduplicate: remove antipatterns that already appear in atoms.
+        atom_ids = {a.get("id") for a in result.atoms if a.get("id") is not None}
+        deduped_antipatterns = [
+            ap for ap in result.antipatterns
+            if ap.get("id") not in atom_ids
+        ]
+
         return {
             "atoms": result.atoms,
-            "antipatterns": result.antipatterns,
+            "antipatterns": deduped_antipatterns,
             "pathways": result.pathways,
             "budget_used": result.budget_used,
             "budget_remaining": result.budget_remaining,
@@ -1218,18 +1267,20 @@ class Brain:
                 if syn.target_id != task_id:
                     linked_ids.add(syn.target_id)
 
-            # Reduce confidence of linked atoms.
-            for linked_id in linked_ids:
-                await self._storage.execute_write(
-                    """
+            # Reduce confidence of linked atoms (batch UPDATE).
+            if linked_ids:
+                placeholders = ",".join("?" * len(linked_ids))
+                flagged = await self._storage.execute_write_returning(
+                    f"""
                     UPDATE atoms
                     SET confidence = MAX(confidence - 0.1, 0.1),
                         updated_at = datetime('now')
-                    WHERE id = ? AND is_deleted = 0 AND type != 'task'
+                    WHERE id IN ({placeholders}) AND is_deleted = 0 AND type != 'task'
+                    RETURNING id
                     """,
-                    (linked_id,),
+                    tuple(linked_ids),
                 )
-                flagged_count += 1
+                flagged_count = len(flagged)
 
             logger.info(
                 "Task %d marked %s, flagged %d linked memories",

@@ -115,6 +115,7 @@ class ConsolidationResult:
     feedback_adjusted: int = 0
     abstracted: int = 0
     resolved: int = 0
+    reconsolidated: int = 0
     details: list[dict[str, Any]] = field(default_factory=list)
     dry_run: bool = False
 
@@ -137,6 +138,7 @@ class ConsolidationResult:
             "feedback_adjusted": self.feedback_adjusted,
             "abstracted": self.abstracted,
             "resolved": self.resolved,
+            "reconsolidated": self.reconsolidated,
             "dry_run": self.dry_run,
             "details": self.details,
         }
@@ -238,6 +240,7 @@ class ConsolidationEngine:
             await self._reclassify_antipatterns(result)
             await self._apply_feedback_signals(result)
             await self._resolve_contradictions(result)
+            await self._reconsolidate_superseded(result)
             # Decay before abstraction so stale atoms don't become cluster templates.
             await self._decay_atoms(result, scope)
             await self._decay_synapses(result)
@@ -245,6 +248,7 @@ class ConsolidationEngine:
             await self._prune_stale_warns_against(result)
             await self._apply_ltd(result)
             await self._prune_dormant_synapses(result)
+            await self._expire_stc_tags(result)
             # Integrate hub atom cleanup to cap over-connected nodes.
             if not dry_run:
                 hub_cleaned = await self._synapses.cleanup_hub_atoms()
@@ -509,7 +513,7 @@ class ConsolidationEngine:
                   s.last_activated_at IS NULL
                   OR s.last_activated_at < datetime('now', ?)
               )
-              AND s.relationship NOT IN ('contradicts', 'supersedes', 'warns-against')
+              AND s.relationship NOT IN ('contradicts', 'supersedes', 'warns-against', 'encoded-with')
               AND a1.is_deleted = 0
               AND a2.is_deleted = 0
               AND a1.last_accessed_at IS NOT NULL
@@ -644,6 +648,85 @@ class ConsolidationEngine:
                 total_pruned,
                 dormant_cutoff_days,
                 dormant_multiplier,
+            )
+
+    # ------------------------------------------------------------------
+    # Step 0b4: Synaptic Tagging and Capture (STC)
+    # ------------------------------------------------------------------
+
+    async def _expire_stc_tags(self, result: ConsolidationResult) -> None:
+        """Expire uncaptured synaptic tags and promote captured ones.
+
+        Implements Frey & Morris (1997) synaptic tagging and capture:
+
+        - **Expire**: delete tagged synapses whose capture window has elapsed
+          without Hebbian reinforcement (``activated_count <= 1``).
+        - **Promote**: clear the tag on synapses that WERE reinforced
+          (``activated_count > 1``), converting them into permanent synapses.
+
+        This ensures only associations validated by repeated co-activation
+        survive, reducing graph noise from one-time embedding similarity hits.
+        """
+        if result.dry_run:
+            expired_rows = await self._storage.execute(
+                """
+                SELECT COUNT(*) AS cnt FROM synapses
+                WHERE tag_expires_at IS NOT NULL
+                  AND tag_expires_at < datetime('now')
+                  AND activated_count <= 1
+                """,
+            )
+            promoted_rows = await self._storage.execute(
+                """
+                SELECT COUNT(*) AS cnt FROM synapses
+                WHERE tag_expires_at IS NOT NULL
+                  AND activated_count > 1
+                """,
+            )
+            expired_count = expired_rows[0]["cnt"] if expired_rows else 0
+            promoted_count = promoted_rows[0]["cnt"] if promoted_rows else 0
+            result.details.append({
+                "action": "stc_expire",
+                "would_expire": expired_count,
+                "would_promote": promoted_count,
+            })
+            return
+
+        # Delete expired, unreinforced tags.
+        deleted = await self._storage.execute_write_returning(
+            """
+            DELETE FROM synapses
+            WHERE tag_expires_at IS NOT NULL
+              AND tag_expires_at < datetime('now')
+              AND activated_count <= 1
+            RETURNING id
+            """,
+        )
+        expired_count = len(deleted)
+        result.pruned += expired_count
+
+        # Promote reinforced tags: clear tag_expires_at to make permanent.
+        promoted = await self._storage.execute_write_returning(
+            """
+            UPDATE synapses
+            SET tag_expires_at = NULL
+            WHERE tag_expires_at IS NOT NULL
+              AND activated_count > 1
+            RETURNING id
+            """,
+        )
+        promoted_count = len(promoted)
+
+        if expired_count or promoted_count:
+            result.details.append({
+                "action": "stc_expire",
+                "expired": expired_count,
+                "promoted": promoted_count,
+            })
+            logger.info(
+                "STC: expired %d uncaptured tags, promoted %d captured synapses",
+                expired_count,
+                promoted_count,
             )
 
     # ------------------------------------------------------------------
@@ -803,6 +886,7 @@ class ConsolidationEngine:
         """
         good_inc = self._cfg.feedback_good_increment
         bad_dec = self._cfg.feedback_bad_decrement
+        type_inertia = self._cfg.type_feedback_inertia
 
         rows = await self._storage.execute(
             """
@@ -840,6 +924,12 @@ class ConsolidationEngine:
             if atom is None:
                 # A4: atom deleted — will be marked processed below; skip delta.
                 continue
+
+            # Type-dependent feedback inertia: stable knowledge types
+            # (facts, skills) resist feedback changes; ephemeral types
+            # (experiences, tasks) respond readily.
+            inertia = type_inertia.get(atom.type, 0.0)
+            delta *= (1.0 - inertia)
 
             if abs(delta) < 1e-6:
                 continue  # no net change; still mark processed below
@@ -941,6 +1031,9 @@ class ConsolidationEngine:
             return
 
         seen_pairs: set[frozenset[int]] = set()
+        # Collect batch operations for all resolved contradictions.
+        loser_updates: list[tuple[float, int]] = []
+        supersede_inserts: list[tuple[int, int]] = []
 
         for row in rows:
             pair: frozenset[int] = frozenset([row["source_id"], row["target_id"]])
@@ -977,23 +1070,30 @@ class ConsolidationEngine:
             })
 
             if not result.dry_run:
-                await self._atoms.update(loser_id, confidence=new_confidence)
-                # Only create the supersedes synapse if one doesn't already
-                # exist. Repeated cycles would otherwise BCM-upsert the
-                # strength back to ~1.0, defeating decay.
-                existing = await self._synapses._fetch_by_triple(
-                    winner_id, loser_id, "supersedes"
-                )
-                if existing is None:
-                    await self._synapses.create(
-                        source_id=winner_id,
-                        target_id=loser_id,
-                        relationship="supersedes",
-                        strength=0.8,
-                        bidirectional=False,
-                    )
+                loser_updates.append((new_confidence, loser_id))
+                supersede_inserts.append((winner_id, loser_id))
 
             result.resolved += 1
+
+        # Batch-apply loser confidence reductions.
+        if loser_updates:
+            await self._storage.execute_many(
+                """
+                UPDATE atoms SET confidence = ?, updated_at = datetime('now')
+                WHERE id = ?
+                """,
+                loser_updates,
+            )
+        # Batch-create supersedes synapses (INSERT OR IGNORE skips existing).
+        if supersede_inserts:
+            await self._storage.execute_many(
+                """
+                INSERT OR IGNORE INTO synapses
+                    (source_id, target_id, relationship, strength, bidirectional)
+                VALUES (?, ?, 'supersedes', 0.8, 0)
+                """,
+                supersede_inserts,
+            )
 
         if result.resolved:
             logger.info(
@@ -1328,6 +1428,7 @@ class ConsolidationEngine:
         # ------------------------------------------------------------------
 
         # Link cluster members to existing facts (reuse path).
+        reuse_link_params: list[tuple[int, int]] = []
         for cluster, existing_fact in reuse_items:
             cluster_template = max(cluster, key=lambda a: a.access_count)
             result.details.append({
@@ -1339,13 +1440,16 @@ class ConsolidationEngine:
             })
             if not result.dry_run:
                 for exp in cluster:
-                    await self._synapses.create(
-                        source_id=exp.id,
-                        target_id=existing_fact.id,
-                        relationship="part-of",
-                        strength=0.8,
-                        bidirectional=False,
-                    )
+                    reuse_link_params.append((exp.id, existing_fact.id))
+        if reuse_link_params:
+            await self._storage.execute_many(
+                """
+                INSERT OR IGNORE INTO synapses
+                    (source_id, target_id, relationship, strength, bidirectional)
+                VALUES (?, ?, 'part-of', 0.8, 0)
+                """,
+                reuse_link_params,
+            )
 
         # Create new facts using distilled (or verbatim) content.
         for (cluster, template, fact_confidence, fact_importance), fact_content in zip(
@@ -1371,15 +1475,16 @@ class ConsolidationEngine:
                     source_project=template.source_project,
                     source_session=template.source_session,
                 )
-                # Link each experience → new fact so future cycles skip them.
-                for exp in cluster:
-                    await self._synapses.create(
-                        source_id=exp.id,
-                        target_id=fact.id,
-                        relationship="part-of",
-                        strength=0.8,
-                        bidirectional=False,
-                    )
+                # Batch-link all cluster members → new fact.
+                link_params = [(exp.id, fact.id) for exp in cluster]
+                await self._storage.execute_many(
+                    """
+                    INSERT OR IGNORE INTO synapses
+                        (source_id, target_id, relationship, strength, bidirectional)
+                    VALUES (?, ?, 'part-of', 0.8, 0)
+                    """,
+                    link_params,
+                )
 
             result.abstracted += 1
 
@@ -1390,6 +1495,165 @@ class ConsolidationEngine:
                 result.abstracted,
                 min_cluster,
                 min_similarity,
+            )
+
+    # ------------------------------------------------------------------
+    # Step 0e: Reconsolidation of superseded atoms
+    # ------------------------------------------------------------------
+
+    async def _reconsolidate_superseded(
+        self,
+        result: ConsolidationResult,
+    ) -> None:
+        """Transfer synapse context from superseded atoms to their superseder.
+
+        When atom B supersedes atom A, the old atom A may still hold valuable
+        synapses to other atoms in the graph.  Reconsolidation (Nader et al.
+        2000) transfers those network connections to the newer atom B so that
+        the updated information inherits the old version's graph position.
+
+        Criteria for reconsolidation:
+
+        - A ``supersedes`` synapse exists from B (superseder) to A (superseded).
+        - The superseded atom A has been accessed within the last 30 days
+          (reconsolidation is triggered by re-access making the trace labile).
+        - The superseded atom A has outgoing ``related-to`` synapses that the
+          superseder B lacks.
+
+        Actions:
+
+        1. For each ``related-to`` synapse from A to neighbor N, if B has no
+           synapse to N, create a weak ``related-to`` synapse B→N at 50% of
+           A→N's strength.
+        2. Weaken A's outgoing ``related-to`` synapses by 30%.
+        """
+        # Find superseded atoms that were recently accessed (labile state).
+        rows = await self._storage.execute(
+            """
+            SELECT s.source_id AS superseder_id,
+                   s.target_id AS superseded_id
+            FROM synapses s
+            JOIN atoms a ON a.id = s.target_id
+            WHERE s.relationship = 'supersedes'
+              AND s.strength > 0.5
+              AND a.is_deleted = 0
+              AND a.last_accessed_at IS NOT NULL
+              AND a.last_accessed_at > datetime('now', '-30 days')
+            """,
+        )
+        if not rows:
+            return
+
+        if result.dry_run:
+            result.details.append({
+                "action": "reconsolidate",
+                "would_process": len(rows),
+            })
+            return
+
+        # Batch-fetch all related-to synapses for all superseded AND
+        # superseder atoms in 2 queries instead of 2*N per-pair queries.
+        all_superseded_ids = [row["superseded_id"] for row in rows]
+        all_superseder_ids = [row["superseder_id"] for row in rows]
+        all_ids = list(set(all_superseded_ids + all_superseder_ids))
+
+        if not all_ids:
+            return
+
+        placeholders = ",".join("?" * len(all_ids))
+        # Use UNION ALL instead of OR so SQLite can use indexes on each
+        # branch independently (perf M4 — OR across columns skips indexes).
+        all_related = await self._storage.execute(
+            f"""
+            SELECT source_id, target_id, strength, bidirectional FROM synapses
+            WHERE source_id IN ({placeholders}) AND relationship = 'related-to'
+            UNION ALL
+            SELECT source_id, target_id, strength, bidirectional FROM synapses
+            WHERE target_id IN ({placeholders}) AND bidirectional = 1
+              AND relationship = 'related-to'
+              AND source_id NOT IN ({placeholders})
+            """,
+            tuple(all_ids) + tuple(all_ids) + tuple(all_ids),
+        )
+
+        # Build lookup: atom_id → list of (neighbor_id, strength).
+        # For bidirectional synapses, index in both directions so that
+        # incoming connections on the superseded atom are also transferred.
+        neighbors_by_source: dict[int, list[tuple[int, float]]] = {}
+        existing_targets_by_source: dict[int, set[int]] = {}
+        for r in all_related:
+            src = r["source_id"]
+            tgt = r["target_id"]
+            strength = r["strength"]
+            # Forward direction: source → target
+            neighbors_by_source.setdefault(src, []).append((tgt, strength))
+            existing_targets_by_source.setdefault(src, set()).add(tgt)
+            # Reverse direction for bidirectional synapses: target → source
+            if r["bidirectional"]:
+                neighbors_by_source.setdefault(tgt, []).append((src, strength))
+                existing_targets_by_source.setdefault(tgt, set()).add(src)
+
+        transferred = 0
+        all_new_synapses: list[tuple[int, int, float]] = []
+        weakened_ids: list[tuple[int,]] = []
+
+        for row in rows:
+            superseder_id = row["superseder_id"]
+            superseded_id = row["superseded_id"]
+
+            old_neighbors = [
+                (tid, s) for tid, s in neighbors_by_source.get(superseded_id, [])
+                if s > 0.1
+            ]
+            if not old_neighbors:
+                continue
+
+            existing_targets = existing_targets_by_source.get(superseder_id, set())
+
+            for neighbor_id, strength in old_neighbors:
+                if neighbor_id in existing_targets or neighbor_id == superseder_id:
+                    continue
+                new_strength = min(1.0, strength * 0.5)
+                all_new_synapses.append((superseder_id, neighbor_id, new_strength))
+
+            weakened_ids.append((superseded_id,))
+
+        # Single batch INSERT for all new synapses.
+        if all_new_synapses:
+            await self._storage.execute_many(
+                """
+                INSERT OR IGNORE INTO synapses
+                    (source_id, target_id, relationship, strength, bidirectional)
+                VALUES (?, ?, 'related-to', ?, 1)
+                """,
+                all_new_synapses,
+            )
+            transferred = len(all_new_synapses)
+
+        # Single batch UPDATE to weaken all superseded atoms' related-to synapses.
+        if weakened_ids:
+            weakened_set = list({wid[0] for wid in weakened_ids})
+            ph = ",".join("?" * len(weakened_set))
+            await self._storage.execute_write(
+                f"""
+                UPDATE synapses
+                SET strength = strength * 0.7
+                WHERE source_id IN ({ph})
+                  AND relationship = 'related-to'
+                """,
+                tuple(weakened_set),
+            )
+
+        if transferred:
+            result.details.append({
+                "action": "reconsolidate",
+                "synapses_transferred": transferred,
+                "pairs_processed": len(rows),
+            })
+            logger.info(
+                "Reconsolidation: transferred %d synapses from %d superseded atoms",
+                transferred,
+                len(rows),
             )
 
     # ------------------------------------------------------------------
@@ -1426,6 +1690,13 @@ class ConsolidationEngine:
         decay_rate = self._cfg.decay_rate
         decay_after_days = self._cfg.decay_after_days
         type_decay = self._cfg.type_decay_multipliers
+        transition_days = self._cfg.hybrid_decay_transition_days
+        power_exponent = self._cfg.hybrid_decay_power_exponent
+        ltp_tiers = self._cfg.ltp_tiers
+        # Pre-sort LTP thresholds descending so we can break on first match
+        # (highest qualifying tier).  Hoisted outside the loop to avoid
+        # re-sorting on every atom.
+        ltp_thresholds = sorted(ltp_tiers.keys(), reverse=True)
         affected_ids: list[int] = []
         confidence_updates: list[tuple[float, int]] = []
         now = datetime.now(tz=timezone.utc)
@@ -1448,10 +1719,45 @@ class ConsolidationEngine:
                 days_since = decay_after_days
 
             exponent = days_since / decay_after_days
+
+            # Multi-scale LTP: frequently accessed atoms are protected from
+            # decay.  Higher access_count → lower protection factor → smaller
+            # effective exponent → slower decay.  Iterates highest threshold
+            # first and breaks on match to pick the strongest qualifying tier.
+            ltp_factor = 1.0
+            for threshold in ltp_thresholds:
+                if atom.access_count >= threshold:
+                    ltp_factor = ltp_tiers[threshold]
+                    break
+            exponent *= ltp_factor
+
+            # Importance-modulated decay: high-importance atoms decay more
+            # slowly.  Maps importance [0, 1] to a protection factor [0.5, 1.0]
+            # so the most important atoms (importance=1.0) have their exponent
+            # halved — dramatically slower decay — while unimportant atoms
+            # (importance=0.0) decay at full rate.  Implements amygdala
+            # modulation of hippocampal consolidation (McGaugh 2004).
+            importance_protection = 1.0 - (atom.importance * 0.5)
+            exponent *= importance_protection
+
             # B1: Per-type decay multiplier — skills/facts decay slowly,
             # experiences decay faster.
             effective_rate = decay_rate * type_decay.get(atom.type, 1.0)
-            new_confidence = atom.confidence * (effective_rate ** exponent)
+
+            # Hybrid decay: use max(exponential, power-law) so we always
+            # pick the more favorable (slower) decay curve.
+            # - Short-term: exponential is more favorable.
+            # - Long-term: power-law is more favorable (heavy tail).
+            # Implements Wixted & Ebbesen (1991) dual-process forgetting.
+            exp_confidence = atom.confidence * (effective_rate ** exponent)
+            if days_since > transition_days:
+                transition_exponent = (transition_days / decay_after_days) * ltp_factor * importance_protection
+                exp_part = effective_rate ** transition_exponent
+                power_part = (transition_days / days_since) ** power_exponent
+                power_confidence = atom.confidence * exp_part * power_part
+                new_confidence = max(exp_confidence, power_confidence)
+            else:
+                new_confidence = exp_confidence
 
             # Enforce confidence floor.
             new_confidence = max(_CONFIDENCE_FLOOR, new_confidence)
@@ -1514,16 +1820,19 @@ class ConsolidationEngine:
             stats = await self._synapses.get_stats()
             total = stats.get("total", 0)
             related_to_count = stats.get("by_relationship", {}).get("related-to", 0)
+            encoded_with_count = stats.get("by_relationship", {}).get("encoded-with", 0)
             result.details.append({
                 "action": "decay_synapses",
-                "note": f"Would decay {total} synapses (related-to: {related_to_count} at accelerated rate)",
+                "note": f"Would decay {total} synapses (related-to: {related_to_count}, encoded-with: {encoded_with_count} at accelerated rates)",
                 "total_synapses": total,
                 "related_to_count": related_to_count,
+                "encoded_with_count": encoded_with_count,
             })
             return
 
         base_decay = self._cfg.decay_rate
         related_to_decay = base_decay * 0.9  # 10% extra decay for generic connections
+        encoded_with_decay = base_decay * 0.85  # 15% extra decay for contextual bindings
 
         # First, apply extra decay to "related-to" synapses
         await self._storage.execute_write(
@@ -1535,13 +1844,25 @@ class ConsolidationEngine:
             (related_to_decay,),
         )
 
-        # Then apply normal decay to all other synapses (exempt supersedes —
-        # provenance pointers that must never decay).
+        # Accelerated decay for "encoded-with" contextual bindings — these are
+        # session-temporal links that should fade faster than semantic links
+        # (Tulving encoding specificity: context drifts over time).
         await self._storage.execute_write(
             """
             UPDATE synapses
             SET strength = strength * ?
-            WHERE relationship NOT IN ('related-to', 'supersedes')
+            WHERE relationship = 'encoded-with'
+            """,
+            (encoded_with_decay,),
+        )
+
+        # Then apply normal decay to all other synapses (exempt supersedes —
+        # provenance pointers that must never decay, and already-decayed types).
+        await self._storage.execute_write(
+            """
+            UPDATE synapses
+            SET strength = strength * ?
+            WHERE relationship NOT IN ('related-to', 'encoded-with', 'supersedes')
             """,
             (base_decay,),
         )
@@ -1553,6 +1874,7 @@ class ConsolidationEngine:
             "action": "decay_synapses",
             "base_factor": base_decay,
             "related_to_factor": related_to_decay,
+            "encoded_with_factor": encoded_with_decay,
             "synapses_pruned_by_decay": pruned_by_decay,
         })
 
@@ -1560,9 +1882,10 @@ class ConsolidationEngine:
         result.pruned += pruned_by_decay
 
         logger.info(
-            "Synapse decay applied (base=%.2f, related-to=%.2f): %d pruned",
+            "Synapse decay applied (base=%.2f, related-to=%.2f, encoded-with=%.2f): %d pruned",
             base_decay,
             related_to_decay,
+            encoded_with_decay,
             pruned_by_decay,
         )
 

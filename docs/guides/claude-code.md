@@ -119,15 +119,19 @@ Add to `~/.claude/settings.json`:
 
 ### Session start (`SessionStart` hook)
 - Registers the session and detects parent session for sub-agents
-- Recalls up to `MEMORIES_HOOK_BUDGET_PCT` tokens of project-specific memories
+- Bridges the Claude Code session ID to the Brain for contextual encoding and session priming
+- Recalls up to 3% of context window tokens of project-specific memories
 - Injects them as a `system-reminder` block before Claude's first response
 
 ### Each prompt (`UserPromptSubmit` hook)
 - Uses the user's prompt as a recall query
+- Runs two parallel recalls: project-scoped (2% budget) + cross-project global (half budget), then merges and deduplicates results
+- Output includes confidence scores, atom IDs, and synapse pathways so Claude can assess reliability
 - Returns relevant atoms + antipattern warnings as a `system-reminder`
 - Claude sees this context before generating a response
 
 ### Before tools (`PreToolUse` hook — Task and Bash only)
+- Recalls antipattern warnings relevant to the command about to run (0.5% budget, antipatterns only)
 - Captures Claude's intent (sub-agent prompts, Bash descriptions) as `insight`/`experience` atoms
 - Novelty-gated: only stores if the content is sufficiently different from existing atoms
 

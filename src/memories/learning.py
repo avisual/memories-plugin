@@ -182,7 +182,11 @@ class LearningEngine:
             return []
 
         threshold = self._cfg.learning.auto_link_threshold
+        stc_strength = self._cfg.learning.stc_tagged_strength
+        stc_window = self._cfg.learning.stc_capture_window_days
         created_synapses: list[dict] = []
+        # H3: Collect STC-tagged synapses for batch tag expiry setting.
+        stc_tagged_triples: list[tuple[int, int, int, str]] = []
 
         # Collect all candidate IDs that pass the basic filters (not self, above
         # threshold) before fetching atoms, so we can do a single batch read.
@@ -247,15 +251,30 @@ class LearningEngine:
                         continue
                     outbound_budget -= 1
 
+                # STC: related-to synapses start at tagged strength and must
+                # be reinforced within the capture window.  Typed semantic
+                # links (caused-by, elaborates, part-of) use full similarity
+                # since they carry explicit evidence.
+                use_tagged = relationship == "related-to"
+                initial_strength = stc_strength if use_tagged else similarity
+
                 synapse = await self._safe_create_synapse(
                     source_id=atom_id,
                     target_id=candidate_id,
                     relationship=relationship,
-                    strength=similarity,
+                    strength=initial_strength,
                     bidirectional=bidirectional,
                 )
                 if synapse is not None:
                     created_synapses.append(synapse)
+                    # Collect for batch tag expiry setting.
+                    if use_tagged:
+                        stc_tagged_triples.append((
+                            stc_window,
+                            synapse["source_id"],
+                            synapse["target_id"],
+                            synapse["relationship"],
+                        ))
 
             # --- (b) warns-against for antipatterns -----------------------
             if candidate.type == "antipattern":
@@ -281,7 +300,7 @@ class LearningEngine:
                 if ap_synapse is not None:
                     created_synapses.append(ap_synapse)
 
-            # --- (c) contradiction detection ------------------------------
+            # --- (c) contradiction detection + retroactive interference -----
             if self._is_potential_contradiction(atom, candidate, similarity):
                 contra_synapse = await self._safe_create_synapse(
                     source_id=atom_id,
@@ -292,6 +311,49 @@ class LearningEngine:
                 )
                 if contra_synapse is not None:
                     created_synapses.append(contra_synapse)
+                    # Retroactive interference: weaken the older atom's
+                    # confidence immediately.  New competing memories
+                    # interfere with older conflicting ones upon detection,
+                    # rather than waiting for consolidation-time resolution.
+                    #
+                    # Safeguards:
+                    # - Confidence floor (0.1) prevents auto-destruction
+                    # - Atomic SQL prevents lost-update races
+                    # - Floor guard prevents stacking from multiple calls
+                    _INTERFERENCE_FLOOR = 0.1
+                    penalty = self._cfg.learning.interference_confidence_penalty
+                    if penalty > 0 and candidate.created_at <= atom.created_at:
+                        await self._storage.execute_write(
+                            """
+                            UPDATE atoms
+                            SET confidence = MAX(?, confidence - ?),
+                                updated_at = datetime('now')
+                            WHERE id = ? AND confidence > ?
+                            """,
+                            (_INTERFERENCE_FLOOR, penalty,
+                             candidate_id, _INTERFERENCE_FLOOR),
+                        )
+                        logger.info(
+                            "Retroactive interference: atom %d "
+                            "confidence reduced by %.2f "
+                            "(contradicted by new atom %d)",
+                            candidate_id,
+                            penalty,
+                            atom_id,
+                        )
+
+        # H3: Batch-set STC tag expiry for all tagged synapses at once.
+        if stc_tagged_triples:
+            await self._storage.execute_many(
+                """
+                UPDATE synapses
+                SET tag_expires_at = datetime('now', '+' || ? || ' days')
+                WHERE source_id = ? AND target_id = ? AND relationship = ?
+                  AND tag_expires_at IS NULL
+                  AND activated_count <= 1
+                """,
+                stc_tagged_triples,
+            )
 
         logger.info(
             "auto_link created %d synapses for atom %d",
@@ -849,6 +911,29 @@ class LearningEngine:
 
         # Generic fallback — bidirectional topical association.
         return "related-to", True
+
+    async def _set_tag_expiry(
+        self,
+        source_id: int,
+        target_id: int,
+        relationship: str,
+        window_days: int,
+    ) -> None:
+        """Set the STC tag expiry timestamp on a newly created synapse.
+
+        Only sets the tag if the synapse does not already have one (i.e. it
+        is truly new, not an existing synapse that was strengthened via upsert).
+        """
+        await self._storage.execute_write(
+            """
+            UPDATE synapses
+            SET tag_expires_at = datetime('now', '+' || ? || ' days')
+            WHERE source_id = ? AND target_id = ? AND relationship = ?
+              AND tag_expires_at IS NULL
+              AND activated_count <= 1
+            """,
+            (window_days, source_id, target_id, relationship),
+        )
 
     async def _safe_create_synapse(
         self,

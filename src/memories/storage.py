@@ -134,12 +134,13 @@ CREATE TABLE IF NOT EXISTS synapses (
     target_id INTEGER NOT NULL REFERENCES atoms(id),
     relationship TEXT NOT NULL CHECK(relationship IN (
         'related-to','caused-by','part-of','contradicts',
-        'supersedes','elaborates','warns-against'
+        'supersedes','elaborates','warns-against','encoded-with'
     )),
     strength REAL NOT NULL DEFAULT 0.5,
     bidirectional INTEGER NOT NULL DEFAULT 1,
     activated_count INTEGER NOT NULL DEFAULT 0,
     last_activated_at TEXT,
+    tag_expires_at TEXT,
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     UNIQUE(source_id, target_id, relationship)
 );
@@ -280,6 +281,10 @@ CREATE INDEX IF NOT EXISTS idx_synapses_source_strength
     ON synapses(source_id, strength DESC);
 CREATE INDEX IF NOT EXISTS idx_synapses_target_strength
     ON synapses(target_id, strength DESC);
+CREATE INDEX IF NOT EXISTS idx_synapses_tag_expires
+    ON synapses(tag_expires_at) WHERE tag_expires_at IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_synapses_relationship
+    ON synapses(relationship);
 CREATE INDEX IF NOT EXISTS idx_feedback_atom_processed
     ON atom_feedback(atom_id, processed_at);
 """
@@ -407,10 +412,15 @@ class Storage:
             log.info("Migration: Added 'importance' column to atoms table")
 
         # Migration 2: Add task_status column for task atoms (v1.2.0)
+        # NOTE: We intentionally omit the CHECK constraint from the ALTER TABLE
+        # because SQLite 3.45+ raises a spurious "NOT NULL constraint failed"
+        # when ADD COLUMN with CHECK follows an earlier ADD COLUMN with NOT NULL
+        # DEFAULT on the same table.  The CHECK is already in _SCHEMA_SQL for
+        # newly-created databases; migrated databases rely on application
+        # validation.
         if "task_status" not in columns:
             conn.execute(
-                "ALTER TABLE atoms ADD COLUMN task_status TEXT "
-                "CHECK(task_status IN ('pending','active','done','archived') OR task_status IS NULL)"
+                "ALTER TABLE atoms ADD COLUMN task_status TEXT"
             )
             log.info("Migration: Added 'task_status' column to atoms table")
 
@@ -613,6 +623,84 @@ class Storage:
                 DROP TABLE hook_stats_old;
             """)
             log.info("Migration: Added task-completed + notification to hook_stats CHECK constraint")
+
+        # Migration 11: Add tag_expires_at + encoded-with relationship for STC (v1.11.0)
+        syn_info = conn.execute("PRAGMA table_info(synapses)").fetchall()
+        syn_columns = {col[1] for col in syn_info}
+        if "tag_expires_at" not in syn_columns:
+            # Need both the new column and the updated CHECK constraint.
+            conn.executescript("""
+                ALTER TABLE synapses RENAME TO synapses_old;
+
+                CREATE TABLE IF NOT EXISTS synapses (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    source_id INTEGER NOT NULL REFERENCES atoms(id),
+                    target_id INTEGER NOT NULL REFERENCES atoms(id),
+                    relationship TEXT NOT NULL CHECK(relationship IN (
+                        'related-to','caused-by','part-of','contradicts',
+                        'supersedes','elaborates','warns-against','encoded-with'
+                    )),
+                    strength REAL NOT NULL DEFAULT 0.5,
+                    bidirectional INTEGER NOT NULL DEFAULT 1,
+                    activated_count INTEGER NOT NULL DEFAULT 0,
+                    last_activated_at TEXT,
+                    tag_expires_at TEXT,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    UNIQUE(source_id, target_id, relationship)
+                );
+
+                INSERT INTO synapses (id, source_id, target_id, relationship,
+                    strength, bidirectional, activated_count, last_activated_at,
+                    created_at)
+                SELECT id, source_id, target_id, relationship,
+                    strength, bidirectional, activated_count, last_activated_at,
+                    created_at
+                FROM synapses_old;
+
+                DROP TABLE synapses_old;
+
+                CREATE INDEX IF NOT EXISTS idx_synapses_source ON synapses(source_id);
+                CREATE INDEX IF NOT EXISTS idx_synapses_target ON synapses(target_id);
+                CREATE INDEX IF NOT EXISTS idx_synapses_strength ON synapses(strength DESC);
+            """)
+            log.info(
+                "Migration: Recreated synapses table with tag_expires_at "
+                "and encoded-with relationship"
+            )
+        else:
+            # tag_expires_at exists but encoded-with may not be in CHECK.
+            row = conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='synapses'"
+            ).fetchone()
+            if row and "encoded-with" not in row[0]:
+                conn.executescript("""
+                    ALTER TABLE synapses RENAME TO synapses_old;
+
+                    CREATE TABLE IF NOT EXISTS synapses (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        source_id INTEGER NOT NULL REFERENCES atoms(id),
+                        target_id INTEGER NOT NULL REFERENCES atoms(id),
+                        relationship TEXT NOT NULL CHECK(relationship IN (
+                            'related-to','caused-by','part-of','contradicts',
+                            'supersedes','elaborates','warns-against','encoded-with'
+                        )),
+                        strength REAL NOT NULL DEFAULT 0.5,
+                        bidirectional INTEGER NOT NULL DEFAULT 1,
+                        activated_count INTEGER NOT NULL DEFAULT 0,
+                        last_activated_at TEXT,
+                        tag_expires_at TEXT,
+                        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                        UNIQUE(source_id, target_id, relationship)
+                    );
+
+                    INSERT INTO synapses SELECT * FROM synapses_old;
+                    DROP TABLE synapses_old;
+
+                    CREATE INDEX IF NOT EXISTS idx_synapses_source ON synapses(source_id);
+                    CREATE INDEX IF NOT EXISTS idx_synapses_target ON synapses(target_id);
+                    CREATE INDEX IF NOT EXISTS idx_synapses_strength ON synapses(strength DESC);
+                """)
+                log.info("Migration: Added 'encoded-with' to synapses CHECK constraint")
 
     def _probe_vec_support(self) -> bool:
         """Check whether sqlite-vec can be loaded in this environment.

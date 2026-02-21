@@ -61,6 +61,7 @@ RELATIONSHIP_TYPES: tuple[str, ...] = (
     "supersedes",
     "elaborates",
     "warns-against",
+    "encoded-with",
 )
 """Allowed values for the ``synapses.relationship`` column."""
 
@@ -129,6 +130,7 @@ class Synapse:
     activated_count: int
     last_activated_at: str | None
     created_at: str
+    tag_expires_at: str | None = None
 
     # ------------------------------------------------------------------
     # Factory helpers
@@ -161,6 +163,7 @@ class Synapse:
             activated_count=row["activated_count"],
             last_activated_at=row["last_activated_at"],
             created_at=row["created_at"],
+            tag_expires_at=row["tag_expires_at"] if "tag_expires_at" in row.keys() else None,
         )
 
     # ------------------------------------------------------------------
@@ -184,6 +187,7 @@ class Synapse:
             "bidirectional": self.bidirectional,
             "activated_count": self.activated_count,
             "last_activated_at": self.last_activated_at,
+            "tag_expires_at": self.tag_expires_at,
             "created_at": self.created_at,
         }
 
@@ -696,10 +700,11 @@ class SynapseManager:
         temporal_window = self._cfg.learning.temporal_window_seconds
         placeholders = ",".join("?" * len(unique_ids))
 
-        # Inhibitory relationship types must never be strengthened on co-activation.
+        # Relationship types excluded from Hebbian strengthening.
         # Co-activating two atoms that contradict/supersede/warn-against each other
-        # should not reinforce those negative associations.
-        _INHIBITORY = frozenset({"contradicts", "supersedes", "warns-against"})
+        # should not reinforce those negative associations.  Encoded-with links
+        # are passive context markers and should not be strengthened by Hebbian.
+        _INHIBITORY = frozenset({"contradicts", "supersedes", "warns-against", "encoded-with"})
 
         # Step 1: Pre-fetch all existing synapses where both endpoints are in
         # the session atom set (any relationship type, either direction).
@@ -778,6 +783,28 @@ class SynapseManager:
                 else:
                     pair_increment = increment
                 new_pairs.append((id_a, id_b, _NEW_SYNAPSE_DEFAULT_STRENGTH, pair_increment))
+
+        # Step 3b: Cue overload protection — cap new synapse creation.
+        # Large sessions generate O(n^2) candidate pairs; capping prevents the
+        # fan effect where hundreds of weak associations dilute the learning
+        # signal.  Pairs are prioritised by temporal proximity when timestamps
+        # are available (closer = stronger signal).
+        max_new = self._cfg.learning.max_new_pairs_per_session
+        if len(new_pairs) > max_new:
+            total_candidates = len(new_pairs)
+            if atom_timestamps:
+                new_pairs.sort(
+                    key=lambda p: abs(
+                        atom_timestamps.get(p[0], 0.0)
+                        - atom_timestamps.get(p[1], 0.0)
+                    )
+                )
+            new_pairs = new_pairs[:max_new]
+            log.debug(
+                "Cue overload cap: limited new pairs to %d (from %d candidates)",
+                max_new,
+                total_candidates,
+            )
 
         # Step 4: Batch-strengthen all non-inhibitory existing synapses in one UPDATE.
         # H2: BCM multiplicative increment — delta = increment * (1 - strength) — so

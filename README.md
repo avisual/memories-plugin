@@ -1,10 +1,10 @@
 # avisual memories
 
 [![Tests](https://github.com/avisual/memories-plugin/actions/workflows/tests.yml/badge.svg)](https://github.com/avisual/memories-plugin/actions/workflows/tests.yml)
-[![PyPI](https://img.shields.io/badge/PyPI-coming%20soon-lightgrey)](https://github.com/avisual/memories-plugin)
+[![Install from source](https://img.shields.io/badge/install-from%20source-blue)](https://github.com/avisual/memories-plugin)
 [![Python 3.13+](https://img.shields.io/badge/python-3.13+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Tests](https://img.shields.io/badge/tests-935%20passing-success)](https://github.com/avisual/memories-plugin)
+[![Tests](https://img.shields.io/badge/tests-1037%20passing-success)](https://github.com/avisual/memories-plugin)
 
 > **The only AI memory system that prevents mistakes _before_ they happen.**
 
@@ -93,7 +93,7 @@ Start a new Claude Code session and memories will be active!
 **Copy and paste this prompt to Claude Code:**
 
 ```
-Install the avisual-memories MCP server for me. Run these commands:
+Install the memories MCP server for me. Run these commands:
 
 1. Clone: git clone https://github.com/avisual/memories-plugin.git && cd memories-plugin && uv sync
 2. Install Ollama if needed: brew install ollama && ollama serve &
@@ -269,8 +269,8 @@ Hooks run automatically during Claude Code sessions:
 | Hook | Event | What it does |
 |------|-------|-------------|
 | `session-start` | SessionStart | Initializes brain, starts session, recalls project-specific memories |
-| `prompt-submit` | UserPromptSubmit | Recalls relevant memories and injects them as context before every prompt |
-| `pre-tool` | PreToolUse | Captures intent before tool execution (Task and Bash with descriptions) |
+| `prompt-submit` | UserPromptSubmit | Recalls relevant memories (project-scoped + cross-project) and injects them as context before every prompt |
+| `pre-tool` | PreToolUse | Recalls antipattern warnings before Bash/Task execution; captures intent as atoms |
 | `post-tool` | PostToolUse | Learns from Bash errors, file edits, and tool outputs (novelty-gated before storing) |
 | `post-tool-failure` | PostToolUseFailure | Captures tool failures as antipatterns or experiences |
 | `stop` | Stop | Reads session transcript, applies Hebbian learning, propagates sub-agent atoms to parent session |
@@ -297,9 +297,9 @@ All settings use environment variables with the `MEMORIES_` prefix:
 | `MEMORIES_EMBEDDING_DIMS` | `768` | Embedding dimensions |
 | `MEMORIES_DB_PATH` | `~/.memories/memories.db` | Database file path |
 | `MEMORIES_CONTEXT_WINDOW_TOKENS` | `200000` | Model context window size |
-| `MEMORIES_HOOK_BUDGET_PCT` | `0.02` | Hook injection budget (% of context window) |
+| `MEMORIES_HOOK_BUDGET_PCT` | `0.02` | Default hook injection budget (% of context window). Session-start uses 3%, prompt-submit 2%, pre-tool 0.5%. |
 | `MEMORIES_DEDUP_THRESHOLD` | `0.92` | Cosine similarity above which a new atom is skipped as a near-duplicate |
-| `MEMORIES_REGION_DIVERSITY_CAP` | `5` | Maximum atoms per project returned in a single retrieval pass |
+| `MEMORIES_REGION_DIVERSITY_CAP` | `2` | Maximum atoms per project returned in a single retrieval pass |
 | `MEMORIES_DISTILL_THINKING` | `false` | Use a local LLM to extract atomic facts from Claude thinking blocks |
 | `MEMORIES_DISTILL_MODEL` | `llama3.2:3b` | Ollama model used for fact extraction (any generative model works) |
 
@@ -516,7 +516,7 @@ Contributions welcome! Please:
 1. Fork the repo
 2. Create a feature branch
 3. Add tests for new features
-4. Ensure all 935 tests pass: `uv run pytest`
+4. Ensure all tests pass: `uv run pytest`
 5. Submit a PR
 
 ## License
@@ -525,7 +525,6 @@ MIT - see [LICENSE](LICENSE) file for details.
 
 ## Links
 
-- **PyPI**: Coming soon
 - **Documentation**: https://avisual.github.io/memories/
 - **GitHub**: https://github.com/avisual/memories-plugin
 - **Issues**: https://github.com/avisual/memories-plugin/issues

@@ -48,6 +48,47 @@ _BASH_REAL_ERROR_SIGS: tuple[str, ...] = (
 )
 
 
+def _format_atom_line(atom: dict[str, Any]) -> str:
+    """Format a single atom for hook output injection.
+
+    Includes type, confidence, atom ID, and content.  Antipatterns
+    additionally show severity and "instead" fields when present.
+    """
+    content = atom.get("content", "")
+    atom_type = atom.get("type", "unknown")
+    confidence = atom.get("confidence", 1.0)
+    atom_id = atom.get("id", "")
+
+    line = f"  [{atom_type}|{confidence:.1f}] {content}"
+    if atom_id:
+        line += f"  (id:{atom_id})"
+
+    # Structured antipattern metadata.
+    if atom_type == "antipattern":
+        severity = atom.get("severity")
+        instead = atom.get("instead")
+        if severity:
+            line += f"\n    severity: {severity}"
+        if instead:
+            line += f"\n    instead: {instead}"
+
+    return line
+
+
+def _format_pathways(pathways: list[dict[str, Any]]) -> list[str]:
+    """Format pathways between result atoms for context injection."""
+    if not pathways:
+        return []
+    lines = ["  connections:"]
+    for pw in pathways[:5]:  # cap at 5 to stay compact
+        rel = pw.get("relationship", "related-to")
+        src = pw.get("source_id", "?")
+        tgt = pw.get("target_id", "?")
+        strength = pw.get("strength", 0.0)
+        lines.append(f"    {src} --[{rel}|{strength:.2f}]--> {tgt}")
+    return lines
+
+
 def _read_stdin_json() -> dict[str, Any]:
     """Read and parse JSON from stdin (non-blocking, UTF-8)."""
     raw: str = ""
@@ -75,11 +116,23 @@ def _project_name(cwd: str | None) -> str | None:
     return Path(cwd).name or None
 
 
-def _hook_budget() -> int:
-    """Calculate the hook token budget from config (default 5% of context)."""
+def _hook_budget(hook_type: str = "prompt-submit") -> int:
+    """Calculate the hook token budget, differentiated by hook type.
+
+    Session-start gets a larger budget (one-time cost at session open).
+    Prompt-submit uses the default budget.
+    Pre-tool uses a minimal budget (must be fast, only for warnings).
+    """
     from memories.config import get_config
     cfg = get_config()
-    return int(cfg.context_window_tokens * cfg.hook_budget_pct)
+    base = cfg.context_window_tokens
+    multipliers = {
+        "session-start": 0.03,   # 3% — one-time, can be generous
+        "prompt-submit": 0.02,   # 2% — per-prompt, standard
+        "pre-tool": 0.005,       # 0.5% — must be fast, warnings only
+    }
+    pct = multipliers.get(hook_type, cfg.hook_budget_pct)
+    return int(base * pct)
 
 
 _brain_instance: "Brain | None" = None
@@ -291,6 +344,12 @@ async def _hook_session_start(data: dict[str, Any]) -> str:
         brain = await _get_brain()
         assert brain._storage is not None
 
+        # Bridge the Claude Code session_id to the Brain's internal session
+        # tracking so that session priming (recall) and contextual encoding
+        # (remember) work correctly through the hook path.
+        if session_id:
+            brain._current_session_id = session_id
+
         # Register this session and detect sub-agent lineage.
         if session_id:
             await brain._storage.execute_write(
@@ -320,14 +379,17 @@ async def _hook_session_start(data: dict[str, Any]) -> str:
                         "session-start: detected sub-agent; parent=%s", parent_id
                     )
 
-        query = f"project context for {project}" if project else None
         result = None
 
         # Recall project-specific memories if we have a project context.
+        # Use the project name itself as the query (not a meta-description
+        # like "project context for X") — this has better semantic overlap
+        # with actual stored content that mentions the project.
         if project:
+            query = project
             result = await brain.recall(
                 query=query,
-                budget_tokens=_hook_budget(),
+                budget_tokens=_hook_budget("session-start"),
                 region=f"project:{project}",
             )
 
@@ -340,11 +402,13 @@ async def _hook_session_start(data: dict[str, Any]) -> str:
 
             atoms = result.get("atoms", [])
             if atoms:
-                lines = [f"[memories] {len(atoms)} memories for {project}:"]
+                lines = [
+                    f"[memories] {len(atoms)} recalled memories for {project}"
+                    " (verify before acting on stale information):"
+                ]
                 for atom in atoms:
-                    content = atom.get("content", "")
-                    atom_type = atom.get("type", "unknown")
-                    lines.append(f"  [{atom_type}] {content}")
+                    lines.append(_format_atom_line(atom))
+                lines.extend(_format_pathways(result.get("pathways", [])))
 
                 return "\n".join(lines)
         else:
@@ -382,38 +446,79 @@ async def _hook_prompt_submit(data: dict[str, Any]) -> str:
         project = _project_name(cwd)
         session_id = data.get("session_id", "")
 
-        result = await brain.recall(
-            query=prompt,
-            budget_tokens=_hook_budget(),
-            region=f"project:{project}" if project else None,
-        )
+        budget = _hook_budget("prompt-submit")
+        global_result = None
+
+        # A2: Run project-scoped and global recalls concurrently to halve
+        # latency (perf M3).  The global recall surfaces cross-project
+        # knowledge without adding to the hook's wall-clock time.
+        if project:
+            global_budget = max(budget // 3, 500)
+            result, global_result = await asyncio.gather(
+                brain.recall(
+                    query=prompt,
+                    budget_tokens=budget,
+                    region=f"project:{project}",
+                ),
+                brain.recall(
+                    query=prompt,
+                    budget_tokens=global_budget,
+                    region=None,
+                ),
+            )
+        else:
+            result = await brain.recall(
+                query=prompt,
+                budget_tokens=budget,
+                region=None,
+            )
+
+        atoms = result.get("atoms", [])
+        antipatterns = result.get("antipatterns", [])
+
+        # Merge global results, deduplicating by ID.
+        if global_result:
+            seen_ids = {a.get("id") for a in atoms} | {a.get("id") for a in antipatterns}
+            for ga in global_result.get("atoms", []):
+                if ga.get("id") not in seen_ids:
+                    atoms.append(ga)
+                    seen_ids.add(ga.get("id"))
+            for gap in global_result.get("antipatterns", []):
+                if gap.get("id") not in seen_ids:
+                    antipatterns.append(gap)
+                    seen_ids.add(gap.get("id"))
 
         latency_ms = int((time.monotonic() - t0) * 1000)
         await _record_hook_stat(
             brain, "prompt-submit", latency_ms,
             project=project, query=prompt, result=result,
         )
+        # M1: Save atoms from both results for Hebbian learning.
         await _save_hook_atoms(brain, session_id, result)
-
-        atoms = result.get("atoms", [])
-        antipatterns = result.get("antipatterns", [])
+        if global_result:
+            await _save_hook_atoms(brain, session_id, global_result)
 
         if not atoms and not antipatterns:
             return "Success"
 
+        # A4: Deduplicate — remove antipatterns that already appear in atoms.
+        atom_ids = {a.get("id") for a in atoms}
+        antipatterns = [ap for ap in antipatterns if ap.get("id") not in atom_ids]
+
         lines = []
         if atoms:
-            lines.append(f"[memories] {len(atoms)} relevant memories:")
+            lines.append(
+                f"[memories] {len(atoms)} recalled memories"
+                " (verify before acting on stale information):"
+            )
             for atom in atoms:
-                content = atom.get("content", "")
-                atom_type = atom.get("type", "unknown")
-                lines.append(f"  [{atom_type}] {content}")
+                lines.append(_format_atom_line(atom))
+            lines.extend(_format_pathways(result.get("pathways", [])))
 
         if antipatterns:
             lines.append(f"[memories] {len(antipatterns)} warnings:")
             for ap in antipatterns:
-                content = ap.get("content", "")
-                lines.append(f"  [warning] {content}")
+                lines.append(_format_atom_line(ap))
 
         return "\n".join(lines)
 
@@ -1535,7 +1640,8 @@ async def _hook_pre_tool_use(data: dict[str, Any]) -> str:
     ``Bash`` (with a descriptive description) are processed -- other tools
     are either noisy, low-signal, or better captured by PostToolUse.
 
-    Returns an empty string so the tool always proceeds.
+    For Bash commands, also performs a fast antipattern-only recall to
+    surface relevant warnings before execution.
     """
     t0 = time.monotonic()
     tool_name = data.get("tool_name", "")
@@ -1548,8 +1654,38 @@ async def _hook_pre_tool_use(data: dict[str, Any]) -> str:
     if not content or len(content) < 20:
         return ""
 
+    output_lines: list[str] = []
+
     try:
         brain = await _get_brain()
+
+        # A3: Pre-tool antipattern recall — surface relevant warnings
+        # before Bash/Task execution.  Uses a small budget and restricts
+        # to antipattern type for speed.
+        if tool_name == "Bash":
+            cwd = data.get("cwd", "")
+            project = _project_name(cwd)
+            warning_result = await brain.recall(
+                query=content[:300],
+                budget_tokens=500,
+                region=f"project:{project}" if project else None,
+                types=["antipattern"],
+                include_antipatterns=True,
+            )
+            warnings = warning_result.get("atoms", []) + warning_result.get("antipatterns", [])
+            if warnings:
+                # Deduplicate by ID.
+                seen: set[int] = set()
+                unique_warnings: list[dict[str, Any]] = []
+                for w in warnings:
+                    wid = w.get("id")
+                    if wid not in seen:
+                        unique_warnings.append(w)
+                        seen.add(wid)
+                output_lines.append(f"[memories] {len(unique_warnings)} relevant warnings:")
+                for w in unique_warnings[:3]:  # cap at 3
+                    output_lines.append(_format_atom_line(w))
+
         is_novel = await brain._learning.assess_novelty(content)
         novelty = "pass" if is_novel else "fail"
 
@@ -1579,7 +1715,7 @@ async def _hook_pre_tool_use(data: dict[str, Any]) -> str:
     except Exception as exc:
         log.error("pre-tool hook: unexpected error: %s", exc, exc_info=True)
 
-    return ""
+    return "\n".join(output_lines) if output_lines else ""
 
 
 # ------------------------------------------------------------------

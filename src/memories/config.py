@@ -44,6 +44,7 @@ class SynapseTypeWeights:
     contradicts: float = 0.7    # Conflicting info - important but needs care
     part_of: float = 0.7        # Compositional - useful for navigation
     related_to: float = 0.4     # Generic embedding similarity - heavily discounted
+    encoded_with: float = 0.2   # Contextual binding - weak but enables context-dependent recall
 
 
 @dataclass(frozen=True, slots=True)
@@ -53,13 +54,13 @@ class RetrievalWeights:
     All weights should sum to approximately 1.0 for normalised scoring.
     """
 
-    vector_similarity: float = 0.35
+    vector_similarity: float = 0.30
     spread_activation: float = 0.25
-    recency: float = 0.10
-    confidence: float = 0.07
-    frequency: float = 0.07
+    recency: float = 0.08
+    confidence: float = 0.12
+    frequency: float = 0.02
     importance: float = 0.11
-    bm25: float = 0.05
+    bm25: float = 0.12
 
 
 @dataclass(frozen=True, slots=True)
@@ -88,6 +89,33 @@ class LearningConfig:
 
     Pairs accessed within this window receive the full Hebbian increment;
     pairs accessed further apart receive ``increment * 0.5``."""
+
+    interference_confidence_penalty: float = 0.1
+    """Confidence reduction applied to an older atom when a new atom is
+    detected as contradicting it (retroactive interference).
+
+    This implements the neuroscience principle that new competing memories
+    weaken older conflicting ones immediately upon detection, rather than
+    waiting for consolidation-time contradiction resolution."""
+
+    max_new_pairs_per_session: int = 50
+    """Maximum number of new synapses created per Hebbian session update.
+
+    Large sessions (30+ atoms) generate O(n^2) candidate pairs.  Capping
+    new synapse creation prevents the *fan effect* (Anderson 1974) where
+    too many weak associations dilute the learning signal.  Pairs are
+    prioritised by temporal proximity when timestamps are available."""
+
+    stc_tagged_strength: float = 0.25
+    """Initial strength for new auto-linked synapses under Synaptic Tagging
+    and Capture.  New synapses start weak ("tagged") and must be reinforced
+    by Hebbian co-activation within ``stc_capture_window_days`` to survive.
+    Implements Frey & Morris (1997) synaptic tagging and capture."""
+
+    stc_capture_window_days: int = 14
+    """Days within which a tagged synapse must be Hebbian-reinforced to
+    survive.  Tags that expire without reinforcement are deleted during
+    consolidation.  Reinforced tags have their tag cleared (captured)."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -169,6 +197,53 @@ class ConsolidationConfig:
     """Per-type multiplier applied on top of the base decay_rate.
     Skills and facts decay slowly (long-lived knowledge); experiences decay
     faster (episodic, likely superseded by later experiences)."""
+
+    hybrid_decay_transition_days: int = 90
+    """Days of staleness after which decay transitions from exponential to
+    power-law.  Atoms stale for fewer days than this use pure exponential
+    decay; beyond this they transition to a slower power-law curve.
+
+    Based on Wixted & Ebbesen (1991): short-term forgetting is exponential,
+    long-term forgetting follows a power law (heavy-tail preservation)."""
+
+    hybrid_decay_power_exponent: float = 0.5
+    """Power-law exponent for the long-term decay phase.  Lower values
+    produce slower long-term decay (heavier tail).  At the transition
+    point the two curves are continuous."""
+
+    type_feedback_inertia: dict[str, float] = field(
+        default_factory=lambda: {
+            "fact": 0.85,
+            "skill": 0.85,
+            "antipattern": 0.40,
+            "preference": 0.50,
+            "insight": 0.60,
+            "experience": 0.30,
+            "task": 0.20,
+        }
+    )
+    """Per-type inertia for feedback-driven importance adjustments.
+
+    Higher values mean the type resists feedback changes more.  Facts and
+    skills are well-established knowledge that shouldn't flip easily;
+    experiences and tasks are ephemeral and should respond quickly.
+    Applied as: ``delta *= (1.0 - inertia)``."""
+
+    ltp_tiers: dict[int, float] = field(
+        default_factory=lambda: {
+            5: 0.5,
+            10: 0.33,
+            20: 0.1,
+        }
+    )
+    """Multi-scale long-term potentiation tiers.
+
+    Maps access_count thresholds to decay protection factors.  An atom
+    with access_count >= threshold gets its decay exponent multiplied by
+    the factor — lower factors mean stronger protection.
+
+    Example: an atom accessed 25 times qualifies for the ``20: 0.1`` tier,
+    reducing its effective decay exponent to 10% (near-immunity)."""
 
 
 @dataclass(frozen=True, slots=True)

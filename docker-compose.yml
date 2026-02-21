@@ -2,8 +2,6 @@
 # Usage: docker compose up -d
 # This sets up memories + Ollama for a complete local deployment
 
-version: "3.9"
-
 services:
   # Main memory service
   memories:
@@ -45,8 +43,6 @@ services:
       timeout: 10s
       retries: 3
       start_period: 30s
-    # Pull the embedding model on first run
-    # Run manually: docker exec ollama ollama pull nomic-embed-text
 
 volumes:
   memories-data:
@@ -55,10 +51,15 @@ volumes:
     driver: local
 
 # Usage notes:
-# 
+#
 # First time setup:
 #   docker compose up -d
-#   docker exec ollama ollama pull nomic-embed-text
+#   docker compose exec ollama ollama pull nomic-embed-text
+#
+# Run integration tests (with Docker Ollama):
+#   docker compose up -d ollama
+#   docker compose exec ollama ollama pull nomic-embed-text
+#   uv run pytest tests/ -m integration -v
 #
 # Check logs:
 #   docker compose logs -f memories

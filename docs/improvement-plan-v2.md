@@ -407,8 +407,8 @@ async def _get_brain():
 
 | Iteration | Status | Notes |
 |-----------|--------|-------|
-| 1 | IN PROGRESS | Waves 1-4 planned above |
-| 2 | PENDING | Round-2 architect review (architects use recall-first prompts) |
-| 3 | PENDING | |
-| 4 | PENDING | |
-| 5 | PENDING | Final — ship after this regardless |
+| 1 | COMPLETE | Waves 1-4 implemented |
+| 2 | COMPLETE | Round-2 architect review — all PASS |
+| 3 | COMPLETE | Context injection iterations 1-7 (see docs/context-improvement-plan.md) |
+| 4 | COMPLETE | Final architect reviews (Perf + Hebbian) both PASS |
+| 5 | COMPLETE | Migration fix, documentation updates |
