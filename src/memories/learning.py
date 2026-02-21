@@ -185,6 +185,8 @@ class LearningEngine:
         stc_strength = self._cfg.learning.stc_tagged_strength
         stc_window = self._cfg.learning.stc_capture_window_days
         created_synapses: list[dict] = []
+        # H3: Collect STC-tagged synapses for batch tag expiry setting.
+        stc_tagged_triples: list[tuple[int, int, int, str]] = []
 
         # Collect all candidate IDs that pass the basic filters (not self, above
         # threshold) before fetching atoms, so we can do a single batch read.
@@ -265,14 +267,14 @@ class LearningEngine:
                 )
                 if synapse is not None:
                     created_synapses.append(synapse)
-                    # Set tag expiry for STC-tagged synapses.
+                    # Collect for batch tag expiry setting.
                     if use_tagged:
-                        await self._set_tag_expiry(
+                        stc_tagged_triples.append((
+                            stc_window,
                             synapse["source_id"],
                             synapse["target_id"],
                             synapse["relationship"],
-                            stc_window,
-                        )
+                        ))
 
             # --- (b) warns-against for antipatterns -----------------------
             if candidate.type == "antipattern":
@@ -339,6 +341,19 @@ class LearningEngine:
                             penalty,
                             atom_id,
                         )
+
+        # H3: Batch-set STC tag expiry for all tagged synapses at once.
+        if stc_tagged_triples:
+            await self._storage.execute_many(
+                """
+                UPDATE synapses
+                SET tag_expires_at = datetime('now', '+' || ? || ' days')
+                WHERE source_id = ? AND target_id = ? AND relationship = ?
+                  AND tag_expires_at IS NULL
+                  AND activated_count <= 1
+                """,
+                stc_tagged_triples,
+            )
 
         logger.info(
             "auto_link created %d synapses for atom %d",

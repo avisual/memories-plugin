@@ -706,18 +706,16 @@ class ConsolidationEngine:
         result.pruned += expired_count
 
         # Promote reinforced tags: clear tag_expires_at to make permanent.
-        await self._storage.execute_write(
+        promoted = await self._storage.execute_write_returning(
             """
             UPDATE synapses
             SET tag_expires_at = NULL
             WHERE tag_expires_at IS NOT NULL
               AND activated_count > 1
+            RETURNING id
             """,
         )
-        promoted_rows = await self._storage.execute(
-            "SELECT changes() AS cnt",
-        )
-        promoted_count = promoted_rows[0]["cnt"] if promoted_rows else 0
+        promoted_count = len(promoted)
 
         if expired_count or promoted_count:
             result.details.append({
@@ -1033,6 +1031,9 @@ class ConsolidationEngine:
             return
 
         seen_pairs: set[frozenset[int]] = set()
+        # Collect batch operations for all resolved contradictions.
+        loser_updates: list[tuple[float, int]] = []
+        supersede_inserts: list[tuple[int, int]] = []
 
         for row in rows:
             pair: frozenset[int] = frozenset([row["source_id"], row["target_id"]])
@@ -1069,23 +1070,30 @@ class ConsolidationEngine:
             })
 
             if not result.dry_run:
-                await self._atoms.update(loser_id, confidence=new_confidence)
-                # Only create the supersedes synapse if one doesn't already
-                # exist. Repeated cycles would otherwise BCM-upsert the
-                # strength back to ~1.0, defeating decay.
-                existing = await self._synapses._fetch_by_triple(
-                    winner_id, loser_id, "supersedes"
-                )
-                if existing is None:
-                    await self._synapses.create(
-                        source_id=winner_id,
-                        target_id=loser_id,
-                        relationship="supersedes",
-                        strength=0.8,
-                        bidirectional=False,
-                    )
+                loser_updates.append((new_confidence, loser_id))
+                supersede_inserts.append((winner_id, loser_id))
 
             result.resolved += 1
+
+        # Batch-apply loser confidence reductions.
+        if loser_updates:
+            await self._storage.execute_many(
+                """
+                UPDATE atoms SET confidence = ?, updated_at = datetime('now')
+                WHERE id = ?
+                """,
+                loser_updates,
+            )
+        # Batch-create supersedes synapses (INSERT OR IGNORE skips existing).
+        if supersede_inserts:
+            await self._storage.execute_many(
+                """
+                INSERT OR IGNORE INTO synapses
+                    (source_id, target_id, relationship, strength, bidirectional)
+                VALUES (?, ?, 'supersedes', 0.8, 0)
+                """,
+                supersede_inserts,
+            )
 
         if result.resolved:
             logger.info(
@@ -1420,6 +1428,7 @@ class ConsolidationEngine:
         # ------------------------------------------------------------------
 
         # Link cluster members to existing facts (reuse path).
+        reuse_link_params: list[tuple[int, int]] = []
         for cluster, existing_fact in reuse_items:
             cluster_template = max(cluster, key=lambda a: a.access_count)
             result.details.append({
@@ -1431,13 +1440,16 @@ class ConsolidationEngine:
             })
             if not result.dry_run:
                 for exp in cluster:
-                    await self._synapses.create(
-                        source_id=exp.id,
-                        target_id=existing_fact.id,
-                        relationship="part-of",
-                        strength=0.8,
-                        bidirectional=False,
-                    )
+                    reuse_link_params.append((exp.id, existing_fact.id))
+        if reuse_link_params:
+            await self._storage.execute_many(
+                """
+                INSERT OR IGNORE INTO synapses
+                    (source_id, target_id, relationship, strength, bidirectional)
+                VALUES (?, ?, 'part-of', 0.8, 0)
+                """,
+                reuse_link_params,
+            )
 
         # Create new facts using distilled (or verbatim) content.
         for (cluster, template, fact_confidence, fact_importance), fact_content in zip(
@@ -1463,15 +1475,16 @@ class ConsolidationEngine:
                     source_project=template.source_project,
                     source_session=template.source_session,
                 )
-                # Link each experience → new fact so future cycles skip them.
-                for exp in cluster:
-                    await self._synapses.create(
-                        source_id=exp.id,
-                        target_id=fact.id,
-                        relationship="part-of",
-                        strength=0.8,
-                        bidirectional=False,
-                    )
+                # Batch-link all cluster members → new fact.
+                link_params = [(exp.id, fact.id) for exp in cluster]
+                await self._storage.execute_many(
+                    """
+                    INSERT OR IGNORE INTO synapses
+                        (source_id, target_id, relationship, strength, bidirectional)
+                    VALUES (?, ?, 'part-of', 0.8, 0)
+                    """,
+                    link_params,
+                )
 
             result.abstracted += 1
 
@@ -1538,63 +1551,84 @@ class ConsolidationEngine:
             })
             return
 
+        # Batch-fetch all related-to synapses for all superseded AND
+        # superseder atoms in 2 queries instead of 2*N per-pair queries.
+        all_superseded_ids = [row["superseded_id"] for row in rows]
+        all_superseder_ids = [row["superseder_id"] for row in rows]
+        all_ids = list(set(all_superseded_ids + all_superseder_ids))
+
+        if not all_ids:
+            return
+
+        placeholders = ",".join("?" * len(all_ids))
+        all_related = await self._storage.execute(
+            f"""
+            SELECT source_id, target_id, strength FROM synapses
+            WHERE source_id IN ({placeholders})
+              AND relationship = 'related-to'
+            """,
+            tuple(all_ids),
+        )
+
+        # Build lookup: source_id → list of (target_id, strength)
+        neighbors_by_source: dict[int, list[tuple[int, float]]] = {}
+        existing_targets_by_source: dict[int, set[int]] = {}
+        for r in all_related:
+            src = r["source_id"]
+            neighbors_by_source.setdefault(src, []).append(
+                (r["target_id"], r["strength"])
+            )
+            existing_targets_by_source.setdefault(src, set()).add(r["target_id"])
+
         transferred = 0
+        all_new_synapses: list[tuple[int, int, float]] = []
+        weakened_ids: list[tuple[int,]] = []
+
         for row in rows:
             superseder_id = row["superseder_id"]
             superseded_id = row["superseded_id"]
 
-            # Get superseded atom's outgoing related-to synapses.
-            old_neighbors = await self._storage.execute(
-                """
-                SELECT target_id, strength FROM synapses
-                WHERE source_id = ?
-                  AND relationship = 'related-to'
-                  AND strength > 0.1
-                """,
-                (superseded_id,),
-            )
+            old_neighbors = [
+                (tid, s) for tid, s in neighbors_by_source.get(superseded_id, [])
+                if s > 0.1
+            ]
             if not old_neighbors:
                 continue
 
-            # Get superseder's existing connections to avoid duplicates.
-            existing = await self._storage.execute(
-                """
-                SELECT target_id FROM synapses
-                WHERE source_id = ? AND relationship = 'related-to'
-                """,
-                (superseder_id,),
-            )
-            existing_targets = {r["target_id"] for r in existing}
+            existing_targets = existing_targets_by_source.get(superseder_id, set())
 
-            # Transfer: create weak synapses from superseder to old neighbors.
-            new_synapses: list[tuple[int, int, float]] = []
-            for neighbor_row in old_neighbors:
-                neighbor_id = neighbor_row["target_id"]
+            for neighbor_id, strength in old_neighbors:
                 if neighbor_id in existing_targets or neighbor_id == superseder_id:
                     continue
-                new_strength = min(1.0, neighbor_row["strength"] * 0.5)
-                new_synapses.append((superseder_id, neighbor_id, new_strength))
+                new_strength = min(1.0, strength * 0.5)
+                all_new_synapses.append((superseder_id, neighbor_id, new_strength))
 
-            if new_synapses:
-                await self._storage.execute_many(
-                    """
-                    INSERT OR IGNORE INTO synapses
-                        (source_id, target_id, relationship, strength, bidirectional)
-                    VALUES (?, ?, 'related-to', ?, 1)
-                    """,
-                    new_synapses,
-                )
-                transferred += len(new_synapses)
+            weakened_ids.append((superseded_id,))
 
-            # Weaken superseded atom's outgoing related-to synapses.
-            await self._storage.execute_write(
+        # Single batch INSERT for all new synapses.
+        if all_new_synapses:
+            await self._storage.execute_many(
                 """
+                INSERT OR IGNORE INTO synapses
+                    (source_id, target_id, relationship, strength, bidirectional)
+                VALUES (?, ?, 'related-to', ?, 1)
+                """,
+                all_new_synapses,
+            )
+            transferred = len(all_new_synapses)
+
+        # Single batch UPDATE to weaken all superseded atoms' related-to synapses.
+        if weakened_ids:
+            weakened_set = list({wid[0] for wid in weakened_ids})
+            ph = ",".join("?" * len(weakened_set))
+            await self._storage.execute_write(
+                f"""
                 UPDATE synapses
                 SET strength = strength * 0.7
-                WHERE source_id = ?
+                WHERE source_id IN ({ph})
                   AND relationship = 'related-to'
                 """,
-                (superseded_id,),
+                tuple(weakened_set),
             )
 
         if transferred:

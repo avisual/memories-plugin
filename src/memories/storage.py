@@ -281,6 +281,10 @@ CREATE INDEX IF NOT EXISTS idx_synapses_source_strength
     ON synapses(source_id, strength DESC);
 CREATE INDEX IF NOT EXISTS idx_synapses_target_strength
     ON synapses(target_id, strength DESC);
+CREATE INDEX IF NOT EXISTS idx_synapses_tag_expires
+    ON synapses(tag_expires_at) WHERE tag_expires_at IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_synapses_relationship
+    ON synapses(relationship);
 CREATE INDEX IF NOT EXISTS idx_feedback_atom_processed
     ON atom_feedback(atom_id, processed_at);
 """

@@ -275,20 +275,23 @@ class Brain:
                 context_ids = [r["atom_id"] for r in context_rows if r["atom_id"] != atom.id]
                 # Cap to prevent explosion in large sessions.
                 _MAX_CONTEXT_LINKS = 10
-                for ctx_id in context_ids[:_MAX_CONTEXT_LINKS]:
-                    try:
-                        syn = await self._synapses.create(
-                            source_id=atom.id,
-                            target_id=ctx_id,
-                            relationship="encoded-with",
-                            strength=0.15,
-                            bidirectional=True,
-                        )
-                        if syn is not None:
-                            context_links += 1
-                    except (ValueError, RuntimeError):
-                        pass
-                if context_links:
+                capped_ids = context_ids[:_MAX_CONTEXT_LINKS]
+                if capped_ids:
+                    # Batch INSERT all encoded-with synapses in both directions
+                    # instead of per-atom create() calls (H2 fix).
+                    params_list: list[tuple[int, int]] = []
+                    for ctx_id in capped_ids:
+                        params_list.append((atom.id, ctx_id))
+                        params_list.append((ctx_id, atom.id))
+                    await self._storage.execute_many(
+                        """
+                        INSERT OR IGNORE INTO synapses
+                            (source_id, target_id, relationship, strength, bidirectional)
+                        VALUES (?, ?, 'encoded-with', 0.15, 1)
+                        """,
+                        params_list,
+                    )
+                    context_links = len(capped_ids)
                     logger.debug(
                         "Contextual encoding: created %d encoded-with links for atom %d",
                         context_links,
@@ -296,7 +299,9 @@ class Brain:
                     )
             except Exception:
                 # Contextual encoding is best-effort; never block remember().
-                pass
+                logger.debug(
+                    "Contextual encoding failed for atom %d", atom.id, exc_info=True
+                )
 
         # Derive antipattern count from the synapses auto_link() created.
         antipattern_count = sum(
@@ -1255,18 +1260,20 @@ class Brain:
                 if syn.target_id != task_id:
                     linked_ids.add(syn.target_id)
 
-            # Reduce confidence of linked atoms.
-            for linked_id in linked_ids:
-                await self._storage.execute_write(
-                    """
+            # Reduce confidence of linked atoms (batch UPDATE).
+            if linked_ids:
+                placeholders = ",".join("?" * len(linked_ids))
+                flagged = await self._storage.execute_write_returning(
+                    f"""
                     UPDATE atoms
                     SET confidence = MAX(confidence - 0.1, 0.1),
                         updated_at = datetime('now')
-                    WHERE id = ? AND is_deleted = 0 AND type != 'task'
+                    WHERE id IN ({placeholders}) AND is_deleted = 0 AND type != 'task'
+                    RETURNING id
                     """,
-                    (linked_id,),
+                    tuple(linked_ids),
                 )
-                flagged_count += 1
+                flagged_count = len(flagged)
 
             logger.info(
                 "Task %d marked %s, flagged %d linked memories",
