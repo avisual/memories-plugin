@@ -89,15 +89,24 @@ creating coherent working-memory-like behaviour within a session.
 """Score multiplier for antipattern atoms connected to result atoms."""
 
 
+_FTS5_KEYWORDS: frozenset[str] = frozenset({
+    "and", "or", "not", "near",
+})
+"""FTS5 operator keywords that must be excluded from MATCH queries."""
+
+
 def _sanitize_fts_query(query: str) -> str:
     """Convert a natural language query into a safe FTS5 MATCH expression.
 
-    Extracts alphanumeric tokens of three or more characters (avoiding
-    FTS5 operator keywords and punctuation that would cause syntax errors)
-    and joins them with implicit AND.  Returns an empty string when no
-    usable tokens are found.
+    Extracts alphanumeric tokens of two or more characters (allowing short
+    technical abbreviations like "Go", "CI", "DB", "UI"), excludes FTS5
+    operator keywords, and joins them with implicit AND.  Returns an empty
+    string when no usable tokens are found.
     """
-    words = re.findall(r"[a-zA-Z0-9_]{3,}", query)[:20]
+    words = [
+        w for w in re.findall(r"[a-zA-Z0-9_]{2,}", query)[:20]
+        if w.lower() not in _FTS5_KEYWORDS
+    ]
     return " ".join(words) if words else ""
 
 

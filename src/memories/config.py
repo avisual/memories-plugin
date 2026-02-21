@@ -54,13 +54,13 @@ class RetrievalWeights:
     All weights should sum to approximately 1.0 for normalised scoring.
     """
 
-    vector_similarity: float = 0.35
+    vector_similarity: float = 0.30
     spread_activation: float = 0.25
-    recency: float = 0.10
-    confidence: float = 0.07
-    frequency: float = 0.07
+    recency: float = 0.08
+    confidence: float = 0.12
+    frequency: float = 0.02
     importance: float = 0.11
-    bm25: float = 0.05
+    bm25: float = 0.12
 
 
 @dataclass(frozen=True, slots=True)
