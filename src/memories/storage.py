@@ -134,7 +134,7 @@ CREATE TABLE IF NOT EXISTS synapses (
     target_id INTEGER NOT NULL REFERENCES atoms(id),
     relationship TEXT NOT NULL CHECK(relationship IN (
         'related-to','caused-by','part-of','contradicts',
-        'supersedes','elaborates','warns-against'
+        'supersedes','elaborates','warns-against','encoded-with'
     )),
     strength REAL NOT NULL DEFAULT 0.5,
     bidirectional INTEGER NOT NULL DEFAULT 1,
@@ -615,14 +615,83 @@ class Storage:
             """)
             log.info("Migration: Added task-completed + notification to hook_stats CHECK constraint")
 
-        # Migration 11: Add tag_expires_at for synaptic tagging and capture (v1.11.0)
+        # Migration 11: Add tag_expires_at + encoded-with relationship for STC (v1.11.0)
         syn_info = conn.execute("PRAGMA table_info(synapses)").fetchall()
         syn_columns = {col[1] for col in syn_info}
         if "tag_expires_at" not in syn_columns:
-            conn.execute(
-                "ALTER TABLE synapses ADD COLUMN tag_expires_at TEXT"
+            # Need both the new column and the updated CHECK constraint.
+            conn.executescript("""
+                ALTER TABLE synapses RENAME TO synapses_old;
+
+                CREATE TABLE IF NOT EXISTS synapses (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    source_id INTEGER NOT NULL REFERENCES atoms(id),
+                    target_id INTEGER NOT NULL REFERENCES atoms(id),
+                    relationship TEXT NOT NULL CHECK(relationship IN (
+                        'related-to','caused-by','part-of','contradicts',
+                        'supersedes','elaborates','warns-against','encoded-with'
+                    )),
+                    strength REAL NOT NULL DEFAULT 0.5,
+                    bidirectional INTEGER NOT NULL DEFAULT 1,
+                    activated_count INTEGER NOT NULL DEFAULT 0,
+                    last_activated_at TEXT,
+                    tag_expires_at TEXT,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    UNIQUE(source_id, target_id, relationship)
+                );
+
+                INSERT INTO synapses (id, source_id, target_id, relationship,
+                    strength, bidirectional, activated_count, last_activated_at,
+                    created_at)
+                SELECT id, source_id, target_id, relationship,
+                    strength, bidirectional, activated_count, last_activated_at,
+                    created_at
+                FROM synapses_old;
+
+                DROP TABLE synapses_old;
+
+                CREATE INDEX IF NOT EXISTS idx_synapses_source ON synapses(source_id);
+                CREATE INDEX IF NOT EXISTS idx_synapses_target ON synapses(target_id);
+                CREATE INDEX IF NOT EXISTS idx_synapses_strength ON synapses(strength DESC);
+            """)
+            log.info(
+                "Migration: Recreated synapses table with tag_expires_at "
+                "and encoded-with relationship"
             )
-            log.info("Migration: Added 'tag_expires_at' column to synapses table")
+        else:
+            # tag_expires_at exists but encoded-with may not be in CHECK.
+            row = conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='synapses'"
+            ).fetchone()
+            if row and "encoded-with" not in row[0]:
+                conn.executescript("""
+                    ALTER TABLE synapses RENAME TO synapses_old;
+
+                    CREATE TABLE IF NOT EXISTS synapses (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        source_id INTEGER NOT NULL REFERENCES atoms(id),
+                        target_id INTEGER NOT NULL REFERENCES atoms(id),
+                        relationship TEXT NOT NULL CHECK(relationship IN (
+                            'related-to','caused-by','part-of','contradicts',
+                            'supersedes','elaborates','warns-against','encoded-with'
+                        )),
+                        strength REAL NOT NULL DEFAULT 0.5,
+                        bidirectional INTEGER NOT NULL DEFAULT 1,
+                        activated_count INTEGER NOT NULL DEFAULT 0,
+                        last_activated_at TEXT,
+                        tag_expires_at TEXT,
+                        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                        UNIQUE(source_id, target_id, relationship)
+                    );
+
+                    INSERT INTO synapses SELECT * FROM synapses_old;
+                    DROP TABLE synapses_old;
+
+                    CREATE INDEX IF NOT EXISTS idx_synapses_source ON synapses(source_id);
+                    CREATE INDEX IF NOT EXISTS idx_synapses_target ON synapses(target_id);
+                    CREATE INDEX IF NOT EXISTS idx_synapses_strength ON synapses(strength DESC);
+                """)
+                log.info("Migration: Added 'encoded-with' to synapses CHECK constraint")
 
     def _probe_vec_support(self) -> bool:
         """Check whether sqlite-vec can be loaded in this environment.

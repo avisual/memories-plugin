@@ -44,6 +44,7 @@ class SynapseTypeWeights:
     contradicts: float = 0.7    # Conflicting info - important but needs care
     part_of: float = 0.7        # Compositional - useful for navigation
     related_to: float = 0.4     # Generic embedding similarity - heavily discounted
+    encoded_with: float = 0.2   # Contextual binding - weak but enables context-dependent recall
 
 
 @dataclass(frozen=True, slots=True)

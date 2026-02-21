@@ -61,6 +61,7 @@ RELATIONSHIP_TYPES: tuple[str, ...] = (
     "supersedes",
     "elaborates",
     "warns-against",
+    "encoded-with",
 )
 """Allowed values for the ``synapses.relationship`` column."""
 
@@ -699,10 +700,11 @@ class SynapseManager:
         temporal_window = self._cfg.learning.temporal_window_seconds
         placeholders = ",".join("?" * len(unique_ids))
 
-        # Inhibitory relationship types must never be strengthened on co-activation.
+        # Relationship types excluded from Hebbian strengthening.
         # Co-activating two atoms that contradict/supersede/warn-against each other
-        # should not reinforce those negative associations.
-        _INHIBITORY = frozenset({"contradicts", "supersedes", "warns-against"})
+        # should not reinforce those negative associations.  Encoded-with links
+        # are passive context markers and should not be strengthened by Hebbian.
+        _INHIBITORY = frozenset({"contradicts", "supersedes", "warns-against", "encoded-with"})
 
         # Step 1: Pre-fetch all existing synapses where both endpoints are in
         # the session atom set (any relationship type, either direction).

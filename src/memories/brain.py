@@ -261,6 +261,39 @@ class Brain:
         # 5. Detect supersession.
         supersede_count = await self._learning.detect_supersedes(atom.id)
 
+        # 5b. Contextual encoding: create lightweight encoded-with synapses
+        # to atoms co-active in the current session.  Implements encoding
+        # specificity (Tulving & Thomson 1973) — memories encoded in a
+        # context are better recalled when that context reappears.
+        context_links = 0
+        if self._current_session_id and self._storage:
+            context_rows = await self._storage.execute(
+                "SELECT atom_id FROM hook_session_atoms WHERE claude_session_id = ?",
+                (self._current_session_id,),
+            )
+            context_ids = [r["atom_id"] for r in context_rows if r["atom_id"] != atom.id]
+            # Cap to prevent explosion in large sessions.
+            _MAX_CONTEXT_LINKS = 10
+            for ctx_id in context_ids[:_MAX_CONTEXT_LINKS]:
+                try:
+                    syn = await self._synapses.create(
+                        source_id=atom.id,
+                        target_id=ctx_id,
+                        relationship="encoded-with",
+                        strength=0.15,
+                        bidirectional=True,
+                    )
+                    if syn is not None:
+                        context_links += 1
+                except (ValueError, RuntimeError):
+                    pass
+            if context_links:
+                logger.debug(
+                    "Contextual encoding: created %d encoded-with links for atom %d",
+                    context_links,
+                    atom.id,
+                )
+
         # Derive antipattern count from the synapses auto_link() created.
         antipattern_count = sum(
             1 for s in created_synapses if s.get("relationship") == "warns-against"

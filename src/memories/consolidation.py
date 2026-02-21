@@ -513,7 +513,7 @@ class ConsolidationEngine:
                   s.last_activated_at IS NULL
                   OR s.last_activated_at < datetime('now', ?)
               )
-              AND s.relationship NOT IN ('contradicts', 'supersedes', 'warns-against')
+              AND s.relationship NOT IN ('contradicts', 'supersedes', 'warns-against', 'encoded-with')
               AND a1.is_deleted = 0
               AND a2.is_deleted = 0
               AND a1.last_accessed_at IS NOT NULL
