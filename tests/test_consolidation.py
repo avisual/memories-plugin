@@ -114,8 +114,12 @@ class TestAtomDecay:
         new_conf = rows[0]["confidence"]
 
         # Default decay_rate is 0.95; "fact" type has multiplier 0.995 (B1).
-        # effective_rate = 0.95 * 0.995 = 0.94525; 0.8 * 0.94525 ≈ 0.7562.
-        assert abs(new_conf - 0.8 * 0.95 * 0.995) < 1e-4
+        # effective_rate = 0.95 * 0.995 = 0.94525.
+        # Importance-modulated decay: default importance=0.5 gives
+        # protection = 1.0 - 0.5*0.5 = 0.75, so exponent = 1.0 * 0.75 = 0.75.
+        # expected = 0.8 * (0.95 * 0.995) ^ 0.75
+        expected = 0.8 * (0.95 * 0.995) ** 0.75
+        assert abs(new_conf - expected) < 1e-4
         assert result.decayed >= 1
 
     async def test_confidence_floor_respected(self, storage: Storage) -> None:
@@ -908,9 +912,12 @@ class TestTimeAwareDecay:
 
         # exponent = decay_after / decay_after = 1.0 → effective_rate ** 1.0.
         # B1: "fact" type has multiplier 0.995, so effective_rate = rate * 0.995.
+        # Importance-modulated: default importance=0.5 → protection=0.75,
+        # so effective exponent = 1.0 * 0.75 = 0.75.
         type_multiplier = cfg.type_decay_multipliers.get("fact", 1.0)
         effective_rate = rate * type_multiplier
-        expected = max(_CONFIDENCE_FLOOR, 0.8 * (effective_rate ** 1.0))
+        importance_protection = 1.0 - 0.5 * 0.5  # default importance = 0.5
+        expected = max(_CONFIDENCE_FLOOR, 0.8 * (effective_rate ** (1.0 * importance_protection)))
         assert abs(new_conf - expected) < 1e-4, (
             f"Just-stale atom should decay by effective_rate^1: expected {expected:.4f}, got {new_conf:.4f}"
         )
@@ -947,9 +954,12 @@ class TestTimeAwareDecay:
 
         # exponent = (2 * decay_after) / decay_after = 2.0.
         # B1: "fact" type has multiplier 0.995, so effective_rate = rate * 0.995.
+        # Importance-modulated: default importance=0.5 → protection=0.75,
+        # so effective exponent = 2.0 * 0.75 = 1.5.
         type_multiplier = cfg.type_decay_multipliers.get("fact", 1.0)
         effective_rate = rate * type_multiplier
-        expected = max(_CONFIDENCE_FLOOR, 0.8 * (effective_rate ** 2.0))
+        importance_protection = 1.0 - 0.5 * 0.5  # default importance = 0.5
+        expected = max(_CONFIDENCE_FLOOR, 0.8 * (effective_rate ** (2.0 * importance_protection)))
         assert abs(new_conf - expected) < 1e-4, (
             f"Twice-stale atom should decay by effective_rate^2: expected {expected:.4f}, got {new_conf:.4f}"
         )

@@ -779,6 +779,28 @@ class SynapseManager:
                     pair_increment = increment
                 new_pairs.append((id_a, id_b, _NEW_SYNAPSE_DEFAULT_STRENGTH, pair_increment))
 
+        # Step 3b: Cue overload protection — cap new synapse creation.
+        # Large sessions generate O(n^2) candidate pairs; capping prevents the
+        # fan effect where hundreds of weak associations dilute the learning
+        # signal.  Pairs are prioritised by temporal proximity when timestamps
+        # are available (closer = stronger signal).
+        max_new = self._cfg.learning.max_new_pairs_per_session
+        if len(new_pairs) > max_new:
+            total_candidates = len(new_pairs)
+            if atom_timestamps:
+                new_pairs.sort(
+                    key=lambda p: abs(
+                        atom_timestamps.get(p[0], 0.0)
+                        - atom_timestamps.get(p[1], 0.0)
+                    )
+                )
+            new_pairs = new_pairs[:max_new]
+            log.debug(
+                "Cue overload cap: limited new pairs to %d (from %d candidates)",
+                max_new,
+                total_candidates,
+            )
+
         # Step 4: Batch-strengthen all non-inhibitory existing synapses in one UPDATE.
         # H2: BCM multiplicative increment — delta = increment * (1 - strength) — so
         # already-strong synapses saturate more slowly than weak ones.

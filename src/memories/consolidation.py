@@ -1474,6 +1474,15 @@ class ConsolidationEngine:
                     break
             exponent *= ltp_factor
 
+            # Importance-modulated decay: high-importance atoms decay more
+            # slowly.  Maps importance [0, 1] to a protection factor [0.5, 1.0]
+            # so the most important atoms (importance=1.0) have their exponent
+            # halved — dramatically slower decay — while unimportant atoms
+            # (importance=0.0) decay at full rate.  Implements amygdala
+            # modulation of hippocampal consolidation (McGaugh 2004).
+            importance_protection = 1.0 - (atom.importance * 0.5)
+            exponent *= importance_protection
+
             # B1: Per-type decay multiplier — skills/facts decay slowly,
             # experiences decay faster.
             effective_rate = decay_rate * type_decay.get(atom.type, 1.0)

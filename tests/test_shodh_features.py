@@ -136,7 +136,10 @@ class TestHybridDecay:
         # Should use exponential: conf * (rate ** exponent)
         # With default decay_rate=0.95, decay_after_days=30, exponent=45/30=1.5
         # effective_rate for facts = 0.95 * 0.995 = 0.94525
-        expected = 0.8 * (0.94525 ** 1.5)
+        # Importance-modulated: default importance=0.5 → protection=0.75,
+        # so effective exponent = 1.5 * 0.75 = 1.125.
+        importance_protection = 1.0 - 0.5 * 0.5
+        expected = 0.8 * (0.94525 ** (1.5 * importance_protection))
         assert abs(new_conf - expected) < 0.01, (
             f"Expected ~{expected:.4f}, got {new_conf:.4f}"
         )
@@ -541,8 +544,9 @@ class TestMultiScaleLTP:
 
         # Without LTP, the decay should proceed at full rate
         # effective_rate for fact = 0.95 * 0.995 = 0.94525
-        # exponent = 60/30 = 2
-        expected = 0.8 * (0.94525 ** 2)
+        # exponent = 60/30 = 2, importance_protection = 1.0 - 0.5*0.5 = 0.75
+        importance_protection = 1.0 - 0.5 * 0.5
+        expected = 0.8 * (0.94525 ** (2 * importance_protection))
         assert abs(conf - expected) < 0.02, (
             f"Zero-access atom should decay at full rate: "
             f"expected ~{expected:.4f}, got {conf:.4f}"
@@ -735,3 +739,178 @@ class TestConfigDefaults:
         sorted_thresholds = sorted(tiers.keys())
         for i in range(len(sorted_thresholds) - 1):
             assert tiers[sorted_thresholds[i]] > tiers[sorted_thresholds[i + 1]]
+
+    def test_max_new_pairs_per_session_config_exists(self) -> None:
+        """LearningConfig should have max_new_pairs_per_session."""
+        cfg = LearningConfig()
+        assert hasattr(cfg, "max_new_pairs_per_session")
+        assert cfg.max_new_pairs_per_session == 50
+
+
+# =======================================================================
+# 5. Importance-Modulated Decay
+# =======================================================================
+
+
+class TestImportanceModulatedDecay:
+    """Verify that atom importance modulates decay rate."""
+
+    async def test_high_importance_decays_slower(self, storage: Storage) -> None:
+        """A high-importance atom should retain more confidence than a low-importance one."""
+        stale_date = (datetime.now(tz=timezone.utc) - timedelta(days=60)).isoformat()
+
+        high_id = await _insert_atom(
+            storage, content="very important memory",
+            confidence=0.8, importance=0.9, last_accessed_at=stale_date,
+        )
+        low_id = await _insert_atom(
+            storage, content="not important memory",
+            confidence=0.8, importance=0.1, last_accessed_at=stale_date,
+        )
+
+        engine = _make_consolidation_engine(storage)
+        await engine.reflect()
+
+        high_rows = await storage.execute(
+            "SELECT confidence FROM atoms WHERE id = ?", (high_id,)
+        )
+        low_rows = await storage.execute(
+            "SELECT confidence FROM atoms WHERE id = ?", (low_id,)
+        )
+
+        high_conf = high_rows[0]["confidence"]
+        low_conf = low_rows[0]["confidence"]
+
+        # High importance should retain significantly more confidence
+        assert high_conf > low_conf, (
+            f"High-importance atom ({high_conf:.4f}) should decay slower "
+            f"than low-importance atom ({low_conf:.4f})"
+        )
+        # The difference should be meaningful
+        assert high_conf - low_conf > 0.01, (
+            f"Importance modulation should create a meaningful difference: "
+            f"high={high_conf:.4f}, low={low_conf:.4f}"
+        )
+
+    async def test_importance_protection_formula(self, storage: Storage) -> None:
+        """Verify the importance protection factor is correctly applied."""
+        stale_date = (datetime.now(tz=timezone.utc) - timedelta(days=60)).isoformat()
+
+        atom_id = await _insert_atom(
+            storage, content="importance formula test",
+            confidence=0.8, importance=1.0, last_accessed_at=stale_date,
+        )
+
+        engine = _make_consolidation_engine(storage)
+        await engine.reflect()
+
+        rows = await storage.execute(
+            "SELECT confidence FROM atoms WHERE id = ?", (atom_id,)
+        )
+        conf = rows[0]["confidence"]
+
+        # importance=1.0 → protection=1.0-0.5*1.0=0.5 → exponent halved
+        # For importance=1.0: exponent = (60/30) * 0.5 = 1.0
+        # effective_rate = 0.95 * 0.995 = 0.94525
+        # expected = 0.8 * 0.94525^1.0
+        expected = 0.8 * (0.94525 ** 1.0)
+        assert abs(conf - expected) < 0.01, (
+            f"importance=1.0 should give protection=1.0 (no extra protection): "
+            f"expected ~{expected:.4f}, got {conf:.4f}"
+        )
+
+    async def test_zero_importance_no_protection(self, storage: Storage) -> None:
+        """Importance=0.0 gives protection factor 1.0 (no protection, full decay)."""
+        stale_date = (datetime.now(tz=timezone.utc) - timedelta(days=60)).isoformat()
+
+        atom_id = await _insert_atom(
+            storage, content="zero importance test",
+            confidence=0.8, importance=0.0, last_accessed_at=stale_date,
+        )
+
+        engine = _make_consolidation_engine(storage)
+        await engine.reflect()
+
+        rows = await storage.execute(
+            "SELECT confidence FROM atoms WHERE id = ?", (atom_id,)
+        )
+        conf = rows[0]["confidence"]
+
+        # importance=0.0 → protection=1.0-0.0=1.0 → exponent unchanged
+        # For importance=0.0: exponent = (60/30) * 1.0 = 2.0
+        # effective_rate = 0.95 * 0.995 = 0.94525
+        # expected = 0.8 * 0.94525^2.0
+        expected = 0.8 * (0.94525 ** 2.0)
+        assert abs(conf - expected) < 0.01, (
+            f"importance=0.0 should give protection=1.0 (no protection): "
+            f"expected ~{expected:.4f}, got {conf:.4f}"
+        )
+
+
+# =======================================================================
+# 6. Cue Overload Protection
+# =======================================================================
+
+
+class TestCueOverloadProtection:
+    """Verify that Hebbian update caps new synapse creation per session."""
+
+    async def test_caps_new_pairs_when_exceeded(self, storage: Storage) -> None:
+        """When session has many atoms, new pairs should be capped."""
+        from memories.config import LearningConfig, MemoriesConfig
+
+        # Create a config with a small cap for testing.
+        test_cfg = MemoriesConfig(
+            learning=LearningConfig(
+                max_new_pairs_per_session=10,
+                min_accesses_for_hebbian=0,  # Allow all pairs
+            )
+        )
+
+        # Insert many atoms to create lots of potential pairs
+        # With 20 atoms, there are C(20,2) = 190 pairs
+        atom_ids = []
+        for i in range(20):
+            aid = await storage.execute_write(
+                """
+                INSERT INTO atoms (content, type, region, confidence, importance,
+                                   access_count, created_at)
+                VALUES (?, 'fact', 'general', 1.0, 0.5, 5, datetime('now'))
+                """,
+                (f"overload test atom {i}",),
+            )
+            atom_ids.append(aid)
+
+        mgr = SynapseManager(storage)
+
+        # Patch the full config so the frozen dataclass is respected.
+        with patch("memories.synapses.get_config", return_value=test_cfg):
+            mgr._cfg = test_cfg
+            total = await mgr.hebbian_update(atom_ids)
+
+        # Should have created at most 10 new synapses (the cap)
+        assert total <= 10, (
+            f"Expected at most 10 new pairs (cap), got {total}"
+        )
+
+    async def test_no_cap_when_under_limit(self, storage: Storage) -> None:
+        """When session has few atoms, no capping occurs."""
+        atom_ids = []
+        for i in range(5):
+            aid = await storage.execute_write(
+                """
+                INSERT INTO atoms (content, type, region, confidence, importance,
+                                   access_count, created_at)
+                VALUES (?, 'fact', 'general', 1.0, 0.5, 5, datetime('now'))
+                """,
+                (f"small session atom {i}",),
+            )
+            atom_ids.append(aid)
+
+        mgr = SynapseManager(storage)
+        total = await mgr.hebbian_update(atom_ids)
+
+        # C(5,2) = 10 pairs, default cap is 50, so no capping
+        assert total == 10, (
+            f"Expected all 10 pairs to be created, got {total}"
+        )

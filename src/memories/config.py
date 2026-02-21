@@ -97,6 +97,14 @@ class LearningConfig:
     weaken older conflicting ones immediately upon detection, rather than
     waiting for consolidation-time contradiction resolution."""
 
+    max_new_pairs_per_session: int = 50
+    """Maximum number of new synapses created per Hebbian session update.
+
+    Large sessions (30+ atoms) generate O(n^2) candidate pairs.  Capping
+    new synapse creation prevents the *fan effect* (Anderson 1974) where
+    too many weak associations dilute the learning signal.  Pairs are
+    prioritised by temporal proximity when timestamps are available."""
+
 
 @dataclass(frozen=True, slots=True)
 class ConsolidationConfig:
