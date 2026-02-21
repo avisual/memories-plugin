@@ -411,11 +411,8 @@ Use `--dry-run` to preview without making changes.
 # Install with dev dependencies
 uv sync --group dev
 
-# Run tests
-uv run pytest
-
-# Run tests with coverage
-uv run pytest -v
+# Run unit tests (no external services needed)
+uv run pytest -m "not integration"
 
 # Run a specific test file
 uv run pytest tests/test_retrieval.py
@@ -423,6 +420,36 @@ uv run pytest tests/test_retrieval.py
 # Health check
 uv run python -m memories health
 ```
+
+### Integration tests
+
+Integration tests run against a real Ollama server with `nomic-embed-text` and
+are executed automatically in CI. To run them locally:
+
+```bash
+# Start Ollama and pull the embedding model
+ollama serve &
+ollama pull nomic-embed-text
+
+# Run integration tests only
+uv run pytest -m integration -v
+
+# Run everything (unit + integration)
+uv run pytest
+```
+
+The integration suite (`tests/test_integration_recall.py`) covers:
+
+- **Embedding quality** — dimensionality, cache consistency, semantic similarity
+- **Vector & FTS search** — relevance ranking, latency
+- **Full recall pipeline** — spreading activation, antipattern surfacing, region filters
+- **Learning pipeline** — auto_link synapse creation, supersession detection, warns-against
+- **Consolidation** — near-duplicate merging with real embedding similarity
+- **Dedup** — pre-insertion deduplication in `remember()`
+- **Batch operations** — batch vs single embedding consistency, vector updates
+- **Larger graph recall** — 15-atom, 3-cluster graph with cross-cluster hub activation
+
+Tests are auto-skipped when Ollama is unavailable.
 
 ## Troubleshooting
 
