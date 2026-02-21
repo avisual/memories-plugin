@@ -115,6 +115,7 @@ class ConsolidationResult:
     feedback_adjusted: int = 0
     abstracted: int = 0
     resolved: int = 0
+    reconsolidated: int = 0
     details: list[dict[str, Any]] = field(default_factory=list)
     dry_run: bool = False
 
@@ -137,6 +138,7 @@ class ConsolidationResult:
             "feedback_adjusted": self.feedback_adjusted,
             "abstracted": self.abstracted,
             "resolved": self.resolved,
+            "reconsolidated": self.reconsolidated,
             "dry_run": self.dry_run,
             "details": self.details,
         }
@@ -238,6 +240,7 @@ class ConsolidationEngine:
             await self._reclassify_antipatterns(result)
             await self._apply_feedback_signals(result)
             await self._resolve_contradictions(result)
+            await self._reconsolidate_superseded(result)
             # Decay before abstraction so stale atoms don't become cluster templates.
             await self._decay_atoms(result, scope)
             await self._decay_synapses(result)
@@ -1479,6 +1482,131 @@ class ConsolidationEngine:
                 result.abstracted,
                 min_cluster,
                 min_similarity,
+            )
+
+    # ------------------------------------------------------------------
+    # Step 0e: Reconsolidation of superseded atoms
+    # ------------------------------------------------------------------
+
+    async def _reconsolidate_superseded(
+        self,
+        result: ConsolidationResult,
+    ) -> None:
+        """Transfer synapse context from superseded atoms to their superseder.
+
+        When atom B supersedes atom A, the old atom A may still hold valuable
+        synapses to other atoms in the graph.  Reconsolidation (Nader et al.
+        2000) transfers those network connections to the newer atom B so that
+        the updated information inherits the old version's graph position.
+
+        Criteria for reconsolidation:
+
+        - A ``supersedes`` synapse exists from B (superseder) to A (superseded).
+        - The superseded atom A has been accessed within the last 30 days
+          (reconsolidation is triggered by re-access making the trace labile).
+        - The superseded atom A has outgoing ``related-to`` synapses that the
+          superseder B lacks.
+
+        Actions:
+
+        1. For each ``related-to`` synapse from A to neighbor N, if B has no
+           synapse to N, create a weak ``related-to`` synapse B→N at 50% of
+           A→N's strength.
+        2. Weaken A's outgoing ``related-to`` synapses by 30%.
+        """
+        # Find superseded atoms that were recently accessed (labile state).
+        rows = await self._storage.execute(
+            """
+            SELECT s.source_id AS superseder_id,
+                   s.target_id AS superseded_id
+            FROM synapses s
+            JOIN atoms a ON a.id = s.target_id
+            WHERE s.relationship = 'supersedes'
+              AND s.strength > 0.5
+              AND a.is_deleted = 0
+              AND a.last_accessed_at IS NOT NULL
+              AND a.last_accessed_at > datetime('now', '-30 days')
+            """,
+        )
+        if not rows:
+            return
+
+        if result.dry_run:
+            result.details.append({
+                "action": "reconsolidate",
+                "would_process": len(rows),
+            })
+            return
+
+        transferred = 0
+        for row in rows:
+            superseder_id = row["superseder_id"]
+            superseded_id = row["superseded_id"]
+
+            # Get superseded atom's outgoing related-to synapses.
+            old_neighbors = await self._storage.execute(
+                """
+                SELECT target_id, strength FROM synapses
+                WHERE source_id = ?
+                  AND relationship = 'related-to'
+                  AND strength > 0.1
+                """,
+                (superseded_id,),
+            )
+            if not old_neighbors:
+                continue
+
+            # Get superseder's existing connections to avoid duplicates.
+            existing = await self._storage.execute(
+                """
+                SELECT target_id FROM synapses
+                WHERE source_id = ? AND relationship = 'related-to'
+                """,
+                (superseder_id,),
+            )
+            existing_targets = {r["target_id"] for r in existing}
+
+            # Transfer: create weak synapses from superseder to old neighbors.
+            new_synapses: list[tuple[int, int, float]] = []
+            for neighbor_row in old_neighbors:
+                neighbor_id = neighbor_row["target_id"]
+                if neighbor_id in existing_targets or neighbor_id == superseder_id:
+                    continue
+                new_strength = min(1.0, neighbor_row["strength"] * 0.5)
+                new_synapses.append((superseder_id, neighbor_id, new_strength))
+
+            if new_synapses:
+                await self._storage.execute_many(
+                    """
+                    INSERT OR IGNORE INTO synapses
+                        (source_id, target_id, relationship, strength, bidirectional)
+                    VALUES (?, ?, 'related-to', ?, 1)
+                    """,
+                    new_synapses,
+                )
+                transferred += len(new_synapses)
+
+            # Weaken superseded atom's outgoing related-to synapses.
+            await self._storage.execute_write(
+                """
+                UPDATE synapses
+                SET strength = strength * 0.7
+                WHERE source_id = ?
+                  AND relationship = 'related-to'
+                """,
+                (superseded_id,),
+            )
+
+        if transferred:
+            result.details.append({
+                "action": "reconsolidate",
+                "synapses_transferred": transferred,
+                "pairs_processed": len(rows),
+            })
+            logger.info(
+                "Reconsolidation: transferred %d synapses from %d superseded atoms",
+                transferred,
+                len(rows),
             )
 
     # ------------------------------------------------------------------

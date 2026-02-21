@@ -1056,3 +1056,116 @@ class TestSynapticTaggingAndCapture:
         )
         assert len(rows) == 1, "Non-expired tagged synapse should survive"
         assert rows[0]["tag_expires_at"] is not None
+
+
+# =======================================================================
+# 8. Reconsolidation of Superseded Atoms
+# =======================================================================
+
+
+class TestReconsolidation:
+    """Verify that superseded atoms transfer synapse context to their superseder."""
+
+    async def test_transfers_synapses_to_superseder(self, storage: Storage) -> None:
+        """Superseded atom's neighbors should be linked to the superseder."""
+        # Create atoms: old_fact is superseded by new_fact, and old_fact
+        # has a neighbor that new_fact doesn't know about.
+        old_fact = await _insert_atom(
+            storage, content="old version of fact",
+            last_accessed_at=(
+                datetime.now(tz=timezone.utc) - timedelta(days=5)
+            ).isoformat(),
+        )
+        new_fact = await _insert_atom(storage, content="new version of fact")
+        neighbor = await _insert_atom(storage, content="related topic")
+
+        # new_fact supersedes old_fact.
+        await _insert_synapse(
+            storage, new_fact, old_fact,
+            relationship="supersedes", strength=0.9,
+        )
+        # old_fact has a related-to synapse to neighbor.
+        await _insert_synapse(
+            storage, old_fact, neighbor,
+            relationship="related-to", strength=0.6,
+        )
+
+        engine = _make_consolidation_engine(storage)
+        await engine.reflect()
+
+        # new_fact should now have a synapse to neighbor (transferred).
+        rows = await storage.execute(
+            """
+            SELECT strength FROM synapses
+            WHERE source_id = ? AND target_id = ? AND relationship = 'related-to'
+            """,
+            (new_fact, neighbor),
+        )
+        assert len(rows) == 1, "Superseder should inherit neighbor synapse"
+        # Transferred at 50% of original strength.
+        assert abs(rows[0]["strength"] - 0.3) < 0.05
+
+    async def test_weakens_superseded_atom_synapses(self, storage: Storage) -> None:
+        """Superseded atom's outgoing synapses should be weakened."""
+        old_fact = await _insert_atom(
+            storage, content="outdated fact",
+            last_accessed_at=(
+                datetime.now(tz=timezone.utc) - timedelta(days=5)
+            ).isoformat(),
+        )
+        new_fact = await _insert_atom(storage, content="updated fact")
+        neighbor = await _insert_atom(storage, content="some neighbor")
+
+        await _insert_synapse(
+            storage, new_fact, old_fact,
+            relationship="supersedes", strength=0.9,
+        )
+        synapse_id = await _insert_synapse(
+            storage, old_fact, neighbor,
+            relationship="related-to", strength=0.8,
+        )
+
+        engine = _make_consolidation_engine(storage)
+        await engine.reflect()
+
+        rows = await storage.execute(
+            "SELECT strength FROM synapses WHERE id = ?", (synapse_id,)
+        )
+        if rows:
+            # Weakened by 30%: 0.8 * 0.7 = 0.56
+            assert rows[0]["strength"] < 0.8, (
+                "Superseded atom's synapses should be weakened"
+            )
+
+    async def test_skips_non_recently_accessed(self, storage: Storage) -> None:
+        """Superseded atoms not recently accessed should not be reconsolidated."""
+        old_fact = await _insert_atom(
+            storage, content="ancient fact",
+            last_accessed_at="2020-01-01 00:00:00",
+        )
+        new_fact = await _insert_atom(storage, content="newer fact")
+        neighbor = await _insert_atom(storage, content="neighbor topic")
+
+        await _insert_synapse(
+            storage, new_fact, old_fact,
+            relationship="supersedes", strength=0.9,
+        )
+        await _insert_synapse(
+            storage, old_fact, neighbor,
+            relationship="related-to", strength=0.6,
+        )
+
+        engine = _make_consolidation_engine(storage)
+        await engine.reflect()
+
+        # No synapse should be transferred (old_fact not recently accessed).
+        rows = await storage.execute(
+            """
+            SELECT id FROM synapses
+            WHERE source_id = ? AND target_id = ? AND relationship = 'related-to'
+            """,
+            (new_fact, neighbor),
+        )
+        assert len(rows) == 0, (
+            "Non-recently-accessed superseded atom should not be reconsolidated"
+        )
