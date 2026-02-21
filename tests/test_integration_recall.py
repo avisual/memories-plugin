@@ -615,3 +615,796 @@ class TestRememberThenRecallIntegration:
             assert r2["atom_id"] == r1["atom_id"], (
                 "Near-identical content should be deduplicated to the same atom"
             )
+
+
+# ---------------------------------------------------------------------------
+# NEW SMOKE TESTS — Learning pipeline with real Ollama embeddings
+# ---------------------------------------------------------------------------
+
+
+class TestAutoLinkRealEmbeddings:
+    """Verify auto_link creates semantically correct synapses with real embeddings."""
+
+    @pytest.fixture
+    async def brain_and_learning(self, integration_storage, real_embeddings):
+        """Brain + LearningEngine with real embeddings."""
+        from memories.learning import LearningEngine
+
+        storage = integration_storage
+        embeddings = real_embeddings
+        atoms = AtomManager(storage, embeddings)
+        synapses = SynapseManager(storage)
+        context = ContextBudget(storage)
+        retrieval = RetrievalEngine(storage, embeddings, atoms, synapses, context)
+        learning = LearningEngine(storage, embeddings, atoms, synapses)
+
+        b = Brain.__new__(Brain)
+        b._config = get_config()
+        b._storage = storage
+        b._embeddings = embeddings
+        b._atoms = atoms
+        b._synapses = synapses
+        b._context = context
+        b._retrieval = retrieval
+        b._learning = learning
+        b._consolidation = None
+        b._current_session_id = "integration-autolink"
+        b._initialized = True
+
+        await storage.execute_write(
+            "INSERT INTO sessions (id, project) VALUES (?, ?)",
+            ("integration-autolink", None),
+        )
+
+        return b, learning, storage
+
+    async def test_auto_link_creates_related_to_synapse(
+        self, brain_and_learning,
+    ) -> None:
+        """Two related Redis facts should be linked by a related-to synapse."""
+        brain, learning, storage = brain_and_learning
+
+        r1 = await brain.remember(
+            content=(
+                "Redis SCAN iterates the keyspace incrementally using a cursor. "
+                "Each call returns a small batch of keys."
+            ),
+            type="fact",
+            region="project:redis",
+        )
+        r2 = await brain.remember(
+            content=(
+                "Redis KEYS command returns all keys matching a pattern. "
+                "It blocks the server during execution."
+            ),
+            type="fact",
+            region="project:redis",
+        )
+
+        # Check that a synapse was created between the two atoms.
+        rows = await storage.execute(
+            "SELECT source_id, target_id, relationship, strength "
+            "FROM synapses WHERE "
+            "(source_id = ? AND target_id = ?) OR "
+            "(source_id = ? AND target_id = ?)",
+            (r1["atom_id"], r2["atom_id"], r2["atom_id"], r1["atom_id"]),
+        )
+
+        assert len(rows) >= 1, (
+            f"Expected a synapse between atom {r1['atom_id']} and {r2['atom_id']}"
+        )
+        # At least one should be a related-to or more specific type.
+        relationships = {r["relationship"] for r in rows}
+        valid_types = {"related-to", "caused-by", "elaborates", "part-of"}
+        assert relationships & valid_types, (
+            f"Expected a topical synapse, got: {relationships}"
+        )
+
+    async def test_auto_link_skips_unrelated_atoms(
+        self, brain_and_learning,
+    ) -> None:
+        """A Redis fact and a cooking recipe should NOT be linked."""
+        brain, learning, storage = brain_and_learning
+
+        r1 = await brain.remember(
+            content=(
+                "Redis SET command stores a string value associated with a key. "
+                "It supports optional expiration time in seconds."
+            ),
+            type="fact",
+            region="project:redis",
+        )
+        r2 = await brain.remember(
+            content=(
+                "To make a classic French omelette, whisk three eggs with salt, "
+                "cook in butter over medium-low heat, and fold gently."
+            ),
+            type="fact",
+            region="personal",
+        )
+
+        rows = await storage.execute(
+            "SELECT relationship FROM synapses WHERE "
+            "(source_id = ? AND target_id = ?) OR "
+            "(source_id = ? AND target_id = ?)",
+            (r1["atom_id"], r2["atom_id"], r2["atom_id"], r1["atom_id"]),
+        )
+
+        topical = {r["relationship"] for r in rows} & {
+            "related-to", "caused-by", "elaborates", "part-of",
+        }
+        assert not topical, (
+            f"Unrelated atoms should not share a topical synapse, got: {topical}"
+        )
+
+    async def test_auto_link_warns_against_for_antipattern(
+        self, brain_and_learning,
+    ) -> None:
+        """An antipattern about Redis should create a warns-against synapse."""
+        brain, learning, storage = brain_and_learning
+
+        r1 = await brain.remember(
+            content=(
+                "Redis KEYS command returns all matching keys in a single call. "
+                "Useful for debugging small databases."
+            ),
+            type="fact",
+            region="project:redis",
+        )
+        r2 = await brain.remember(
+            content=(
+                "Never use the Redis KEYS command in production. "
+                "It blocks the server for the entire scan duration."
+            ),
+            type="antipattern",
+            region="project:redis",
+            severity="high",
+            instead="Use SCAN with a cursor instead",
+        )
+
+        rows = await storage.execute(
+            "SELECT source_id, target_id, relationship FROM synapses WHERE "
+            "relationship = 'warns-against' AND "
+            "((source_id = ? AND target_id = ?) OR "
+            " (source_id = ? AND target_id = ?))",
+            (r2["atom_id"], r1["atom_id"], r1["atom_id"], r2["atom_id"]),
+        )
+        assert len(rows) >= 1, (
+            "Expected a warns-against synapse between antipattern and related fact"
+        )
+
+    async def test_auto_link_strength_reflects_similarity(
+        self, brain_and_learning,
+    ) -> None:
+        """Highly related atoms should get stronger synapses than loosely related ones."""
+        brain, learning, storage = brain_and_learning
+
+        base = await brain.remember(
+            content=(
+                "Redis Cluster shards data across multiple nodes "
+                "using hash slots for horizontal scalability."
+            ),
+            type="fact",
+            region="project:redis",
+        )
+        highly_related = await brain.remember(
+            content=(
+                "Redis hash slots are divided into 16384 slots. "
+                "Each master node in a Redis Cluster owns a range of slots."
+            ),
+            type="fact",
+            region="project:redis",
+        )
+        somewhat_related = await brain.remember(
+            content=(
+                "Database sharding distributes rows across multiple servers. "
+                "Common strategies include range-based and hash-based partitioning."
+            ),
+            type="fact",
+            region="project:general",
+        )
+
+        # Gather synapse strengths from the base atom.
+        rows = await storage.execute(
+            "SELECT source_id, target_id, strength FROM synapses WHERE "
+            "relationship IN ('related-to', 'caused-by', 'elaborates', 'part-of') "
+            "AND ((source_id = ? OR target_id = ?))",
+            (base["atom_id"], base["atom_id"]),
+        )
+
+        def _strength_for(atom_id: int) -> float:
+            for r in rows:
+                other = r["target_id"] if r["source_id"] == base["atom_id"] else r["source_id"]
+                if other == atom_id:
+                    return float(r["strength"])
+            return 0.0
+
+        s_high = _strength_for(highly_related["atom_id"])
+        s_moderate = _strength_for(somewhat_related["atom_id"])
+
+        # At minimum the highly related pair should have a synapse.
+        assert s_high > 0, "Expected a synapse to the highly related atom"
+        # If both have synapses, the highly related one should be stronger.
+        if s_moderate > 0:
+            assert s_high >= s_moderate, (
+                f"Highly related strength ({s_high:.3f}) should >= "
+                f"somewhat related ({s_moderate:.3f})"
+            )
+
+
+class TestSupersessionRealEmbeddings:
+    """Verify detect_supersedes() correctly identifies near-duplicate content."""
+
+    @pytest.fixture
+    async def brain_and_learning(self, integration_storage, real_embeddings):
+        from memories.learning import LearningEngine
+
+        storage = integration_storage
+        embeddings = real_embeddings
+        atoms = AtomManager(storage, embeddings)
+        synapses = SynapseManager(storage)
+        context = ContextBudget(storage)
+        retrieval = RetrievalEngine(storage, embeddings, atoms, synapses, context)
+        learning = LearningEngine(storage, embeddings, atoms, synapses)
+
+        b = Brain.__new__(Brain)
+        b._config = get_config()
+        b._storage = storage
+        b._embeddings = embeddings
+        b._atoms = atoms
+        b._synapses = synapses
+        b._context = context
+        b._retrieval = retrieval
+        b._learning = learning
+        b._consolidation = None
+        b._current_session_id = "integration-supersede"
+        b._initialized = True
+
+        await storage.execute_write(
+            "INSERT INTO sessions (id, project) VALUES (?, ?)",
+            ("integration-supersede", None),
+        )
+
+        return b, learning, storage
+
+    async def test_supersedes_near_duplicate(self, brain_and_learning) -> None:
+        """A slightly reworded duplicate should create a supersedes synapse."""
+        brain, learning, storage = brain_and_learning
+
+        r1 = await brain.remember(
+            content="PostgreSQL VACUUM reclaims storage from dead tuples",
+            type="fact",
+            region="project:postgres",
+        )
+
+        # Slightly reworded — should be very high similarity.
+        r2 = await brain.remember(
+            content="PostgreSQL VACUUM reclaims disk space occupied by dead tuples",
+            type="fact",
+            region="project:postgres",
+        )
+
+        rows = await storage.execute(
+            "SELECT source_id, target_id, relationship, strength "
+            "FROM synapses WHERE relationship = 'supersedes' "
+            "AND source_id = ? AND target_id = ?",
+            (r2["atom_id"], r1["atom_id"]),
+        )
+        assert len(rows) >= 1, (
+            "Expected a supersedes synapse from the newer atom to the older one"
+        )
+        # Strength should reflect high similarity.
+        assert float(rows[0]["strength"]) > 0.85, (
+            f"Supersedes strength {rows[0]['strength']:.3f} should reflect high similarity"
+        )
+
+    async def test_no_supersedes_for_different_content(
+        self, brain_and_learning,
+    ) -> None:
+        """Genuinely different facts should NOT create a supersedes link."""
+        brain, learning, storage = brain_and_learning
+
+        r1 = await brain.remember(
+            content=(
+                "PostgreSQL VACUUM reclaims storage occupied by dead tuples "
+                "after UPDATE and DELETE operations"
+            ),
+            type="fact",
+            region="project:postgres",
+        )
+        r2 = await brain.remember(
+            content=(
+                "PostgreSQL indexes can become bloated over time. "
+                "REINDEX rebuilds them from scratch to reclaim space."
+            ),
+            type="fact",
+            region="project:postgres",
+        )
+
+        rows = await storage.execute(
+            "SELECT * FROM synapses WHERE relationship = 'supersedes' AND "
+            "((source_id = ? AND target_id = ?) OR "
+            " (source_id = ? AND target_id = ?))",
+            (r1["atom_id"], r2["atom_id"], r2["atom_id"], r1["atom_id"]),
+        )
+        assert len(rows) == 0, (
+            "Different content should NOT create a supersedes synapse"
+        )
+
+
+class TestConsolidationMergeRealEmbeddings:
+    """Verify consolidation correctly merges near-duplicates with real embeddings."""
+
+    @pytest.fixture
+    async def consolidation_env(self, integration_storage, real_embeddings):
+        from memories.consolidation import ConsolidationEngine
+        from memories.learning import LearningEngine
+
+        storage = integration_storage
+        embeddings = real_embeddings
+        atoms = AtomManager(storage, embeddings)
+        synapses = SynapseManager(storage)
+        consolidation = ConsolidationEngine(storage, embeddings, atoms, synapses)
+
+        return storage, embeddings, atoms, consolidation
+
+    async def test_merge_near_duplicate_atoms(self, consolidation_env) -> None:
+        """Near-identical atoms should be merged during consolidation."""
+        storage, embeddings, atoms, consolidation = consolidation_env
+        now = datetime.now(tz=timezone.utc).isoformat()
+
+        # Insert 3 nearly identical atoms about the same topic.
+        contents = [
+            "Always close database connections after use to prevent connection leaks",
+            "Always close database connections after use to avoid connection leaks",
+            "Always close DB connections after use to prevent connection pool leaks",
+        ]
+        atom_ids = []
+        for content in contents:
+            aid = await storage.execute_write(
+                """INSERT INTO atoms
+                   (content, type, region, confidence, importance,
+                    access_count, last_accessed_at, is_deleted)
+                   VALUES (?, 'fact', 'general', 0.9, 0.5, 5, ?, 0)""",
+                (content, now),
+            )
+            atom_ids.append(aid)
+            await embeddings.embed_and_store(aid, content)
+
+        result = await consolidation.reflect()
+
+        # At least one pair should have been merged.
+        merge_actions = [
+            d for d in result.details if d.get("action") == "merge"
+        ]
+        assert len(merge_actions) >= 1, (
+            f"Expected at least one merge, got {len(merge_actions)}. "
+            f"Details: {result.details}"
+        )
+
+        # Verify the duplicate is soft-deleted.
+        for merge in merge_actions:
+            dup_rows = await storage.execute(
+                "SELECT is_deleted FROM atoms WHERE id = ?",
+                (merge["duplicate_id"],),
+            )
+            assert dup_rows[0]["is_deleted"] == 1, (
+                f"Duplicate atom {merge['duplicate_id']} should be soft-deleted"
+            )
+
+    async def test_no_merge_for_distinct_atoms(self, consolidation_env) -> None:
+        """Clearly distinct atoms should NOT be merged."""
+        storage, embeddings, atoms, consolidation = consolidation_env
+        now = datetime.now(tz=timezone.utc).isoformat()
+
+        contents = [
+            "Redis Cluster shards data across nodes using 16384 hash slots",
+            "Python asyncio event loop runs coroutines cooperatively",
+            "CSS Grid provides two-dimensional layout with rows and columns",
+        ]
+        for content in contents:
+            aid = await storage.execute_write(
+                """INSERT INTO atoms
+                   (content, type, region, confidence, importance,
+                    access_count, last_accessed_at, is_deleted)
+                   VALUES (?, 'fact', 'general', 0.9, 0.5, 5, ?, 0)""",
+                (content, now),
+            )
+            await embeddings.embed_and_store(aid, content)
+
+        result = await consolidation.reflect()
+
+        merge_actions = [
+            d for d in result.details if d.get("action") == "merge"
+        ]
+        assert len(merge_actions) == 0, (
+            f"Distinct atoms should not be merged, got: {merge_actions}"
+        )
+
+
+class TestRememberDedupIntegration:
+    """Verify remember() pre-insertion dedup with real embeddings."""
+
+    @pytest.fixture
+    async def full_brain(self, integration_storage, real_embeddings):
+        from memories.learning import LearningEngine
+
+        storage = integration_storage
+        embeddings = real_embeddings
+        atoms_mgr = AtomManager(storage, embeddings)
+        synapses = SynapseManager(storage)
+        context = ContextBudget(storage)
+        retrieval = RetrievalEngine(storage, embeddings, atoms_mgr, synapses, context)
+        learning = LearningEngine(storage, embeddings, atoms_mgr, synapses)
+
+        b = Brain.__new__(Brain)
+        b._config = get_config()
+        b._storage = storage
+        b._embeddings = embeddings
+        b._atoms = atoms_mgr
+        b._synapses = synapses
+        b._context = context
+        b._retrieval = retrieval
+        b._learning = learning
+        b._consolidation = None
+        b._current_session_id = "integration-dedup"
+        b._initialized = True
+
+        await storage.execute_write(
+            "INSERT INTO sessions (id, project) VALUES (?, ?)",
+            ("integration-dedup", None),
+        )
+
+        return b
+
+    async def test_dedup_blocks_identical_content(self, full_brain) -> None:
+        """Remembering identical content twice returns the same atom_id."""
+        r1 = await full_brain.remember(
+            content="Use SSH keys instead of passwords for server authentication",
+            type="skill",
+            region="security",
+        )
+        r2 = await full_brain.remember(
+            content="Use SSH keys instead of passwords for server authentication",
+            type="skill",
+            region="security",
+        )
+
+        assert r2.get("deduplicated") is True, (
+            "Identical content should be deduplicated"
+        )
+        assert r2["atom_id"] == r1["atom_id"]
+
+    async def test_dedup_allows_different_content(self, full_brain) -> None:
+        """Genuinely different content should NOT be deduplicated."""
+        r1 = await full_brain.remember(
+            content="Use SSH keys instead of passwords for server authentication",
+            type="skill",
+            region="security",
+        )
+        r2 = await full_brain.remember(
+            content=(
+                "Python virtual environments isolate project dependencies. "
+                "Create one with python -m venv .venv"
+            ),
+            type="skill",
+            region="python",
+        )
+
+        assert r1["atom_id"] != r2["atom_id"], (
+            "Different content should produce different atom IDs"
+        )
+
+
+class TestBatchEmbeddingOps:
+    """Verify batch embedding operations with real Ollama."""
+
+    @pytest.fixture(autouse=True)
+    async def seed(self, integration_storage, real_embeddings):
+        self.storage = integration_storage
+        self.embeddings = real_embeddings
+
+    async def test_embed_batch_consistency(self) -> None:
+        """Batch-embedded vectors should match individually-embedded vectors."""
+        texts = [
+            "Redis SCAN iterates keyspace",
+            "PostgreSQL VACUUM reclaims space",
+            "Python asyncio runs coroutines",
+            "Docker containers use cgroups",
+            "Kubernetes pods group containers",
+        ]
+
+        # Embed individually.
+        individual = []
+        for t in texts:
+            vec = await self.embeddings.embed_text(t)
+            individual.append(vec)
+
+        # Clear cache so batch actually hits Ollama.
+        self.embeddings._cache.clear()
+
+        batch = await self.embeddings.embed_batch(texts)
+        assert len(batch) == len(texts)
+
+        for i, (single, batched) in enumerate(zip(individual, batch)):
+            sim = self.embeddings.cosine_similarity(single, batched)
+            assert sim > 0.99, (
+                f"Text {i} batch/single similarity {sim:.4f} should be > 0.99"
+            )
+
+    async def test_embed_and_store_updates_existing(self) -> None:
+        """Re-embedding an atom should update the stored vector."""
+        now = datetime.now(tz=timezone.utc).isoformat()
+        atom_id = await self.storage.execute_write(
+            """INSERT INTO atoms
+               (content, type, region, confidence, importance,
+                access_count, last_accessed_at, is_deleted)
+               VALUES ('original content about Redis', 'fact', 'general',
+                       0.9, 0.5, 1, ?, 0)""",
+            (now,),
+        )
+
+        # Store original embedding.
+        await self.embeddings.embed_and_store(atom_id, "original content about Redis")
+
+        # Search should find this atom for a Redis query.
+        results1 = await self.embeddings.search_similar("Redis topic", k=5)
+        ids1 = {aid for aid, _ in results1}
+        assert atom_id in ids1, "Atom should be findable after initial embed"
+
+        # Re-embed with completely different content.
+        await self.embeddings.embed_and_store(
+            atom_id, "French cooking techniques for soufflé preparation"
+        )
+
+        # Now a cooking query should find it.
+        results2 = await self.embeddings.search_similar(
+            "French cooking soufflé", k=5,
+        )
+        ids2 = {aid for aid, _ in results2}
+        assert atom_id in ids2, (
+            "Atom should be findable by new content after re-embed"
+        )
+
+
+class TestRecallLargerGraph:
+    """Test recall on a richer 15-atom graph with real embeddings."""
+
+    _GRAPH_ATOMS = {
+        # --- Redis cluster (5 atoms) ---
+        "redis_scan": {
+            "content": "Redis SCAN iterates the keyspace incrementally with a cursor",
+            "type": "fact", "region": "project:redis",
+        },
+        "redis_keys": {
+            "content": "Redis KEYS blocks the server while scanning all keys",
+            "type": "fact", "region": "project:redis",
+        },
+        "redis_cluster": {
+            "content": "Redis Cluster uses 16384 hash slots to shard data across nodes",
+            "type": "fact", "region": "project:redis",
+        },
+        "redis_sentinel": {
+            "content": "Redis Sentinel provides high availability with automatic failover",
+            "type": "fact", "region": "project:redis",
+        },
+        "redis_antipattern": {
+            "content": "Never use KEYS in production. Use SCAN with cursor instead.",
+            "type": "antipattern", "region": "project:redis",
+        },
+        # --- Python async cluster (5 atoms) ---
+        "py_asyncio": {
+            "content": "Python asyncio event loop runs coroutines cooperatively",
+            "type": "skill", "region": "project:web-api",
+        },
+        "py_await": {
+            "content": "Use await for I/O-bound tasks in Python async code",
+            "type": "skill", "region": "project:web-api",
+        },
+        "py_gather": {
+            "content": "asyncio.gather runs multiple coroutines concurrently",
+            "type": "skill", "region": "project:web-api",
+        },
+        "py_sleep_bad": {
+            "content": (
+                "Never use time.sleep() in async code because it blocks "
+                "the event loop. Use asyncio.sleep() instead."
+            ),
+            "type": "antipattern", "region": "project:web-api",
+        },
+        "py_experience": {
+            "content": (
+                "Migrated the API from synchronous Flask to async FastAPI. "
+                "Throughput improved 3x for I/O-heavy endpoints."
+            ),
+            "type": "experience", "region": "project:web-api",
+        },
+        # --- SQL cluster (5 atoms) ---
+        "sql_index": {
+            "content": "SQL indexes speed up SELECT queries but slow down INSERT and UPDATE",
+            "type": "fact", "region": "project:postgres",
+        },
+        "sql_explain": {
+            "content": "Use EXPLAIN ANALYZE to understand query plans in PostgreSQL",
+            "type": "skill", "region": "project:postgres",
+        },
+        "sql_vacuum": {
+            "content": "PostgreSQL VACUUM reclaims storage occupied by dead tuples",
+            "type": "fact", "region": "project:postgres",
+        },
+        "sql_injection": {
+            "content": (
+                "Never concatenate user input into SQL strings. "
+                "Use parameterized queries to prevent SQL injection."
+            ),
+            "type": "antipattern", "region": "project:postgres",
+        },
+        "sql_connection_pool": {
+            "content": (
+                "Use connection pooling (PgBouncer) to reduce overhead of "
+                "creating new PostgreSQL connections for every request."
+            ),
+            "type": "skill", "region": "project:postgres",
+        },
+    }
+
+    @pytest.fixture
+    async def large_brain(self, integration_storage, real_embeddings):
+        """Build a Brain with a 15-atom graph across three topic clusters."""
+        storage = integration_storage
+        embeddings = real_embeddings
+        atoms = AtomManager(storage, embeddings)
+        synapses = SynapseManager(storage)
+        context = ContextBudget(storage)
+        retrieval = RetrievalEngine(storage, embeddings, atoms, synapses, context)
+
+        now = datetime.now(tz=timezone.utc).isoformat()
+        atom_ids: dict[str, int] = {}
+
+        for key, data in self._GRAPH_ATOMS.items():
+            atom_id = await storage.execute_write(
+                """INSERT INTO atoms
+                   (content, type, region, confidence, importance,
+                    access_count, last_accessed_at, is_deleted)
+                   VALUES (?, ?, ?, 0.9, 0.7, 5, ?, 0)""",
+                (data["content"], data["type"], data["region"], now),
+            )
+            atom_ids[key] = atom_id
+            await embeddings.embed_and_store(atom_id, data["content"])
+
+        # Create intra-cluster synapses (Redis cluster).
+        redis_keys_list = ["redis_scan", "redis_keys", "redis_cluster", "redis_sentinel"]
+        for i in range(len(redis_keys_list) - 1):
+            await storage.execute_write(
+                """INSERT INTO synapses
+                   (source_id, target_id, relationship, strength, bidirectional)
+                   VALUES (?, ?, 'related-to', 0.8, 1)""",
+                (atom_ids[redis_keys_list[i]], atom_ids[redis_keys_list[i + 1]]),
+            )
+        # warns-against from antipattern.
+        await storage.execute_write(
+            """INSERT INTO synapses
+               (source_id, target_id, relationship, strength, bidirectional)
+               VALUES (?, ?, 'warns-against', 0.9, 0)""",
+            (atom_ids["redis_antipattern"], atom_ids["redis_keys"]),
+        )
+
+        # Python cluster chain.
+        py_keys = ["py_asyncio", "py_await", "py_gather", "py_experience"]
+        for i in range(len(py_keys) - 1):
+            await storage.execute_write(
+                """INSERT INTO synapses
+                   (source_id, target_id, relationship, strength, bidirectional)
+                   VALUES (?, ?, 'related-to', 0.8, 1)""",
+                (atom_ids[py_keys[i]], atom_ids[py_keys[i + 1]]),
+            )
+        await storage.execute_write(
+            """INSERT INTO synapses
+               (source_id, target_id, relationship, strength, bidirectional)
+               VALUES (?, ?, 'warns-against', 0.9, 0)""",
+            (atom_ids["py_sleep_bad"], atom_ids["py_asyncio"]),
+        )
+
+        # SQL cluster chain.
+        sql_keys = ["sql_index", "sql_explain", "sql_vacuum", "sql_connection_pool"]
+        for i in range(len(sql_keys) - 1):
+            await storage.execute_write(
+                """INSERT INTO synapses
+                   (source_id, target_id, relationship, strength, bidirectional)
+                   VALUES (?, ?, 'related-to', 0.8, 1)""",
+                (atom_ids[sql_keys[i]], atom_ids[sql_keys[i + 1]]),
+            )
+        await storage.execute_write(
+            """INSERT INTO synapses
+               (source_id, target_id, relationship, strength, bidirectional)
+               VALUES (?, ?, 'warns-against', 0.9, 0)""",
+            (atom_ids["sql_injection"], atom_ids["sql_index"]),
+        )
+
+        # Cross-cluster hub: link py_experience → sql_connection_pool
+        # (both relate to API performance).
+        await storage.execute_write(
+            """INSERT INTO synapses
+               (source_id, target_id, relationship, strength, bidirectional)
+               VALUES (?, ?, 'related-to', 0.7, 1)""",
+            (atom_ids["py_experience"], atom_ids["sql_connection_pool"]),
+        )
+
+        b = Brain.__new__(Brain)
+        b._config = get_config()
+        b._storage = storage
+        b._embeddings = embeddings
+        b._atoms = atoms
+        b._synapses = synapses
+        b._context = context
+        b._retrieval = retrieval
+        b._learning = None
+        b._consolidation = None
+        b._current_session_id = None
+        b._initialized = True
+
+        return b, atom_ids
+
+    async def test_recall_15_atom_graph_returns_relevant(
+        self, large_brain,
+    ) -> None:
+        """A Redis query should return Redis-cluster atoms in the top results."""
+        brain, ids = large_brain
+        result = await brain.recall(query="Redis SCAN cursor", budget_tokens=4000)
+
+        top_ids = {a["id"] for a in result["atoms"][:3]}
+        redis_ids = {
+            ids["redis_scan"], ids["redis_keys"],
+            ids["redis_cluster"], ids["redis_sentinel"],
+        }
+        assert top_ids & redis_ids, (
+            f"Expected Redis atoms in top 3, got IDs: {top_ids}"
+        )
+
+    async def test_recall_spreading_through_hub(self, large_brain) -> None:
+        """Query about Python async should activate the cross-cluster hub
+        and potentially reach SQL atoms via spreading activation."""
+        brain, ids = large_brain
+        result = await brain.recall(
+            query="migrating from Flask to FastAPI async performance",
+            budget_tokens=8000,
+        )
+
+        all_ids = {a["id"] for a in result["atoms"]}
+        all_ids.update(a["id"] for a in result["antipatterns"])
+
+        # The experience atom should definitely appear.
+        assert ids["py_experience"] in all_ids, (
+            "py_experience should be retrieved for a Flask→FastAPI query"
+        )
+
+        # With a generous budget, spreading through the hub should bring in
+        # at least one SQL atom (sql_connection_pool is linked to py_experience).
+        sql_ids = {
+            ids["sql_connection_pool"], ids["sql_index"],
+            ids["sql_explain"], ids["sql_vacuum"],
+        }
+        # This is a soft check — spreading activation is probabilistic.
+        if not (all_ids & sql_ids):
+            # Acceptable if the budget was consumed before reaching SQL atoms.
+            assert len(all_ids) >= 3, (
+                f"Expected at least 3 atoms for a generous-budget recall, got {len(all_ids)}"
+            )
+
+    async def test_recall_antipatterns_from_larger_graph(
+        self, large_brain,
+    ) -> None:
+        """Antipattern atoms should appear in the dedicated antipatterns list."""
+        brain, ids = large_brain
+        result = await brain.recall(
+            query="Redis KEYS command blocking server",
+            budget_tokens=4000,
+        )
+
+        antipattern_ids = {a["id"] for a in result["antipatterns"]}
+        all_ids = {a["id"] for a in result["atoms"]} | antipattern_ids
+
+        # The Redis antipattern should surface either in atoms or antipatterns.
+        assert ids["redis_antipattern"] in all_ids, (
+            "Redis antipattern should be surfaced for a KEYS-related query"
+        )
