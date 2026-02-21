@@ -89,6 +89,14 @@ class LearningConfig:
     Pairs accessed within this window receive the full Hebbian increment;
     pairs accessed further apart receive ``increment * 0.5``."""
 
+    interference_confidence_penalty: float = 0.1
+    """Confidence reduction applied to an older atom when a new atom is
+    detected as contradicting it (retroactive interference).
+
+    This implements the neuroscience principle that new competing memories
+    weaken older conflicting ones immediately upon detection, rather than
+    waiting for consolidation-time contradiction resolution."""
+
 
 @dataclass(frozen=True, slots=True)
 class ConsolidationConfig:
@@ -169,6 +177,53 @@ class ConsolidationConfig:
     """Per-type multiplier applied on top of the base decay_rate.
     Skills and facts decay slowly (long-lived knowledge); experiences decay
     faster (episodic, likely superseded by later experiences)."""
+
+    hybrid_decay_transition_days: int = 90
+    """Days of staleness after which decay transitions from exponential to
+    power-law.  Atoms stale for fewer days than this use pure exponential
+    decay; beyond this they transition to a slower power-law curve.
+
+    Based on Wixted & Ebbesen (1991): short-term forgetting is exponential,
+    long-term forgetting follows a power law (heavy-tail preservation)."""
+
+    hybrid_decay_power_exponent: float = 0.5
+    """Power-law exponent for the long-term decay phase.  Lower values
+    produce slower long-term decay (heavier tail).  At the transition
+    point the two curves are continuous."""
+
+    type_feedback_inertia: dict[str, float] = field(
+        default_factory=lambda: {
+            "fact": 0.85,
+            "skill": 0.85,
+            "antipattern": 0.90,
+            "preference": 0.50,
+            "insight": 0.60,
+            "experience": 0.30,
+            "task": 0.20,
+        }
+    )
+    """Per-type inertia for feedback-driven importance adjustments.
+
+    Higher values mean the type resists feedback changes more.  Facts and
+    skills are well-established knowledge that shouldn't flip easily;
+    experiences and tasks are ephemeral and should respond quickly.
+    Applied as: ``delta *= (1.0 - inertia)``."""
+
+    ltp_tiers: dict[int, float] = field(
+        default_factory=lambda: {
+            5: 0.5,
+            10: 0.33,
+            20: 0.1,
+        }
+    )
+    """Multi-scale long-term potentiation tiers.
+
+    Maps access_count thresholds to decay protection factors.  An atom
+    with access_count >= threshold gets its decay exponent multiplied by
+    the factor — lower factors mean stronger protection.
+
+    Example: an atom accessed 25 times qualifies for the ``20: 0.1`` tier,
+    reducing its effective decay exponent to 10% (near-immunity)."""
 
 
 @dataclass(frozen=True, slots=True)

@@ -281,7 +281,7 @@ class LearningEngine:
                 if ap_synapse is not None:
                     created_synapses.append(ap_synapse)
 
-            # --- (c) contradiction detection ------------------------------
+            # --- (c) contradiction detection + retroactive interference -----
             if self._is_potential_contradiction(atom, candidate, similarity):
                 contra_synapse = await self._safe_create_synapse(
                     source_id=atom_id,
@@ -292,6 +292,24 @@ class LearningEngine:
                 )
                 if contra_synapse is not None:
                     created_synapses.append(contra_synapse)
+                    # Retroactive interference: weaken the older atom's
+                    # confidence immediately.  New competing memories
+                    # interfere with older conflicting ones upon detection,
+                    # rather than waiting for consolidation-time resolution.
+                    penalty = self._cfg.learning.interference_confidence_penalty
+                    if penalty > 0 and candidate.created_at <= atom.created_at:
+                        new_conf = max(0.0, candidate.confidence - penalty)
+                        await self._atoms.update(
+                            candidate_id, confidence=new_conf
+                        )
+                        logger.info(
+                            "Retroactive interference: atom %d confidence "
+                            "%.2f -> %.2f (contradicted by new atom %d)",
+                            candidate_id,
+                            candidate.confidence,
+                            new_conf,
+                            atom_id,
+                        )
 
         logger.info(
             "auto_link created %d synapses for atom %d",

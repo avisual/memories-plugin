@@ -803,6 +803,7 @@ class ConsolidationEngine:
         """
         good_inc = self._cfg.feedback_good_increment
         bad_dec = self._cfg.feedback_bad_decrement
+        type_inertia = self._cfg.type_feedback_inertia
 
         rows = await self._storage.execute(
             """
@@ -840,6 +841,12 @@ class ConsolidationEngine:
             if atom is None:
                 # A4: atom deleted — will be marked processed below; skip delta.
                 continue
+
+            # Type-dependent feedback inertia: stable knowledge types
+            # (facts, skills) resist feedback changes; ephemeral types
+            # (experiences, tasks) respond readily.
+            inertia = type_inertia.get(atom.type, 0.0)
+            delta *= (1.0 - inertia)
 
             if abs(delta) < 1e-6:
                 continue  # no net change; still mark processed below
@@ -1426,6 +1433,9 @@ class ConsolidationEngine:
         decay_rate = self._cfg.decay_rate
         decay_after_days = self._cfg.decay_after_days
         type_decay = self._cfg.type_decay_multipliers
+        transition_days = self._cfg.hybrid_decay_transition_days
+        power_exponent = self._cfg.hybrid_decay_power_exponent
+        ltp_tiers = self._cfg.ltp_tiers
         affected_ids: list[int] = []
         confidence_updates: list[tuple[float, int]] = []
         now = datetime.now(tz=timezone.utc)
@@ -1448,10 +1458,34 @@ class ConsolidationEngine:
                 days_since = decay_after_days
 
             exponent = days_since / decay_after_days
+
+            # Multi-scale LTP: frequently accessed atoms are protected from
+            # decay.  Higher access_count → lower protection factor → smaller
+            # effective exponent → slower decay.
+            ltp_factor = 1.0
+            for threshold in sorted(ltp_tiers.keys()):
+                if atom.access_count >= threshold:
+                    ltp_factor = ltp_tiers[threshold]
+            exponent *= ltp_factor
+
             # B1: Per-type decay multiplier — skills/facts decay slowly,
             # experiences decay faster.
             effective_rate = decay_rate * type_decay.get(atom.type, 1.0)
-            new_confidence = atom.confidence * (effective_rate ** exponent)
+
+            # Hybrid decay: use max(exponential, power-law) so we always
+            # pick the more favorable (slower) decay curve.
+            # - Short-term: exponential is more favorable.
+            # - Long-term: power-law is more favorable (heavy tail).
+            # Implements Wixted & Ebbesen (1991) dual-process forgetting.
+            exp_confidence = atom.confidence * (effective_rate ** exponent)
+            if days_since > transition_days:
+                transition_exponent = (transition_days / decay_after_days) * ltp_factor
+                exp_part = effective_rate ** transition_exponent
+                power_part = (transition_days / days_since) ** power_exponent
+                power_confidence = atom.confidence * exp_part * power_part
+                new_confidence = max(exp_confidence, power_confidence)
+            else:
+                new_confidence = exp_confidence
 
             # Enforce confidence floor.
             new_confidence = max(_CONFIDENCE_FLOOR, new_confidence)
