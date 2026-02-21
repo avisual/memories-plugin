@@ -256,6 +256,77 @@ class TestRetroactiveInterference:
             f"Old atom confidence should be reduced from 0.9, got {old_conf}"
         )
 
+    async def test_interference_respects_confidence_floor(self, storage: Storage) -> None:
+        """Interference should not push confidence below the system floor (0.1)."""
+        old_date = (datetime.now(tz=timezone.utc) - timedelta(days=60)).isoformat()
+        old_id = await _insert_atom(
+            storage, content="Always use tabs for indentation",
+            atom_type="preference", confidence=0.15,
+            last_accessed_at=old_date, created_at=old_date,
+        )
+
+        now = datetime.now(tz=timezone.utc).isoformat()
+        new_id = await _insert_atom(
+            storage, content="Never use tabs for indentation, use spaces",
+            atom_type="preference", confidence=1.0,
+            last_accessed_at=now, created_at=now,
+        )
+
+        mock_emb = MagicMock(spec=EmbeddingEngine)
+        mock_emb.search_similar = AsyncMock(return_value=[
+            (old_id, 0.1),
+        ])
+        mock_emb.embed_and_store = AsyncMock()
+
+        engine = _make_learning_engine(storage, embeddings=mock_emb)
+        await engine.auto_link(new_id)
+
+        rows = await storage.execute(
+            "SELECT confidence FROM atoms WHERE id = ?", (old_id,)
+        )
+        old_conf = rows[0]["confidence"]
+        # With penalty 0.1 from starting 0.15, floor should prevent going to 0.05
+        assert old_conf >= 0.1, (
+            f"Confidence should respect floor 0.1, got {old_conf}"
+        )
+
+    async def test_interference_cascade_protection(self, storage: Storage) -> None:
+        """Multiple contradictions should not destroy an atom below floor."""
+        old_date = (datetime.now(tz=timezone.utc) - timedelta(days=60)).isoformat()
+        old_id = await _insert_atom(
+            storage, content="Always use tabs for indentation",
+            atom_type="preference", confidence=0.5,
+            last_accessed_at=old_date, created_at=old_date,
+        )
+
+        now = datetime.now(tz=timezone.utc).isoformat()
+        # Create multiple contradicting atoms
+        for i in range(5):
+            new_id = await _insert_atom(
+                storage,
+                content=f"Never use tabs, use spaces variant {i}",
+                atom_type="preference", confidence=1.0,
+                last_accessed_at=now, created_at=now,
+            )
+
+            mock_emb = MagicMock(spec=EmbeddingEngine)
+            mock_emb.search_similar = AsyncMock(return_value=[
+                (old_id, 0.1),
+            ])
+            mock_emb.embed_and_store = AsyncMock()
+
+            engine = _make_learning_engine(storage, embeddings=mock_emb)
+            await engine.auto_link(new_id)
+
+        rows = await storage.execute(
+            "SELECT confidence FROM atoms WHERE id = ?", (old_id,)
+        )
+        old_conf = rows[0]["confidence"]
+        # Even after 5 contradictions, should never go below floor
+        assert old_conf >= 0.1, (
+            f"After 5 contradictions, confidence should stay >= 0.1, got {old_conf}"
+        )
+
     async def test_no_interference_without_contradiction(self, storage: Storage) -> None:
         """Non-contradicting similar atoms don't trigger interference."""
         old_date = (datetime.now(tz=timezone.utc) - timedelta(days=60)).isoformat()
@@ -511,6 +582,111 @@ class TestMultiScaleLTP:
         assert confidences[10] < confidences[25], (
             f"25 accesses ({confidences[25]:.4f}) should retain more "
             f"than 10 ({confidences[10]:.4f})"
+        )
+
+    async def test_ltp_with_power_law_combined(self, storage: Storage) -> None:
+        """LTP protection should work with the power-law branch (>90 days)."""
+        stale_date = (datetime.now(tz=timezone.utc) - timedelta(days=150)).isoformat()
+
+        # High-access atom beyond power-law transition
+        high_id = await _insert_atom(
+            storage, content="well known fact beyond transition",
+            confidence=0.8, access_count=25,
+            last_accessed_at=stale_date,
+        )
+        # Low-access atom beyond power-law transition
+        low_id = await _insert_atom(
+            storage, content="obscure fact beyond transition",
+            confidence=0.8, access_count=0,
+            last_accessed_at=stale_date,
+        )
+
+        engine = _make_consolidation_engine(storage)
+        await engine.reflect()
+
+        high_row = await storage.execute(
+            "SELECT confidence FROM atoms WHERE id = ?", (high_id,)
+        )
+        low_row = await storage.execute(
+            "SELECT confidence FROM atoms WHERE id = ?", (low_id,)
+        )
+
+        high_conf = high_row[0]["confidence"]
+        low_conf = low_row[0]["confidence"]
+
+        # LTP protection should still work even in the power-law phase
+        assert high_conf > low_conf, (
+            f"LTP + power-law: high-access ({high_conf:.4f}) should retain "
+            f"more than low-access ({low_conf:.4f})"
+        )
+        # The difference should be substantial
+        assert high_conf - low_conf > 0.1, (
+            f"LTP protection should be meaningful in power-law phase: "
+            f"diff={high_conf - low_conf:.4f}"
+        )
+
+
+# =======================================================================
+# Additional feedback inertia tests
+# =======================================================================
+
+
+class TestFeedbackInertiaAdditional:
+    """Additional tests for feedback inertia from architect review."""
+
+    async def test_good_feedback_with_inertia(self, storage: Storage) -> None:
+        """Good feedback for high-inertia types should also be reduced."""
+        fact_id = await _insert_atom(
+            storage, content="PostgreSQL supports JSONB columns",
+            atom_type="fact", importance=0.5,
+        )
+
+        await storage.execute_write(
+            "INSERT INTO atom_feedback (atom_id, signal) VALUES (?, 'good')",
+            (fact_id,),
+        )
+
+        engine = _make_consolidation_engine(storage)
+        await engine.reflect()
+
+        rows = await storage.execute(
+            "SELECT importance FROM atoms WHERE id = ?", (fact_id,)
+        )
+        fact_imp = rows[0]["importance"]
+
+        # Without inertia: delta = 0.02 → importance = 0.52
+        # With inertia (0.85): delta = 0.02 * 0.15 = 0.003 → importance ≈ 0.503
+        assert fact_imp < 0.51, (
+            f"Good feedback on fact should be muted by inertia, got {fact_imp:.4f}"
+        )
+        assert fact_imp > 0.5, (
+            f"Good feedback should still slightly increase importance, got {fact_imp:.4f}"
+        )
+
+    async def test_antipattern_responds_to_feedback(self, storage: Storage) -> None:
+        """Antipatterns (reduced inertia 0.40) should respond to feedback."""
+        ap_id = await _insert_atom(
+            storage, content="Never use eval() in production code",
+            atom_type="antipattern", importance=0.5,
+        )
+
+        await storage.execute_write(
+            "INSERT INTO atom_feedback (atom_id, signal) VALUES (?, 'bad')",
+            (ap_id,),
+        )
+
+        engine = _make_consolidation_engine(storage)
+        await engine.reflect()
+
+        rows = await storage.execute(
+            "SELECT importance FROM atoms WHERE id = ?", (ap_id,)
+        )
+        ap_imp = rows[0]["importance"]
+
+        # With inertia 0.40: delta = -0.03 * 1.5 * 0.60 = -0.027
+        # importance = 0.5 - 0.027 = 0.473
+        assert ap_imp < 0.48, (
+            f"Antipattern should respond meaningfully to bad feedback, got {ap_imp:.4f}"
         )
 
 

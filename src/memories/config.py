@@ -195,7 +195,7 @@ class ConsolidationConfig:
         default_factory=lambda: {
             "fact": 0.85,
             "skill": 0.85,
-            "antipattern": 0.90,
+            "antipattern": 0.40,
             "preference": 0.50,
             "insight": 0.60,
             "experience": 0.30,

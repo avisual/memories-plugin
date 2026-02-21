@@ -1436,6 +1436,10 @@ class ConsolidationEngine:
         transition_days = self._cfg.hybrid_decay_transition_days
         power_exponent = self._cfg.hybrid_decay_power_exponent
         ltp_tiers = self._cfg.ltp_tiers
+        # Pre-sort LTP thresholds descending so we can break on first match
+        # (highest qualifying tier).  Hoisted outside the loop to avoid
+        # re-sorting on every atom.
+        ltp_thresholds = sorted(ltp_tiers.keys(), reverse=True)
         affected_ids: list[int] = []
         confidence_updates: list[tuple[float, int]] = []
         now = datetime.now(tz=timezone.utc)
@@ -1461,11 +1465,13 @@ class ConsolidationEngine:
 
             # Multi-scale LTP: frequently accessed atoms are protected from
             # decay.  Higher access_count → lower protection factor → smaller
-            # effective exponent → slower decay.
+            # effective exponent → slower decay.  Iterates highest threshold
+            # first and breaks on match to pick the strongest qualifying tier.
             ltp_factor = 1.0
-            for threshold in sorted(ltp_tiers.keys()):
+            for threshold in ltp_thresholds:
                 if atom.access_count >= threshold:
                     ltp_factor = ltp_tiers[threshold]
+                    break
             exponent *= ltp_factor
 
             # B1: Per-type decay multiplier — skills/facts decay slowly,

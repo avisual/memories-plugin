@@ -296,18 +296,30 @@ class LearningEngine:
                     # confidence immediately.  New competing memories
                     # interfere with older conflicting ones upon detection,
                     # rather than waiting for consolidation-time resolution.
+                    #
+                    # Safeguards:
+                    # - Confidence floor (0.1) prevents auto-destruction
+                    # - Atomic SQL prevents lost-update races
+                    # - Floor guard prevents stacking from multiple calls
+                    _INTERFERENCE_FLOOR = 0.1
                     penalty = self._cfg.learning.interference_confidence_penalty
                     if penalty > 0 and candidate.created_at <= atom.created_at:
-                        new_conf = max(0.0, candidate.confidence - penalty)
-                        await self._atoms.update(
-                            candidate_id, confidence=new_conf
+                        await self._storage.execute_write(
+                            """
+                            UPDATE atoms
+                            SET confidence = MAX(?, confidence - ?),
+                                updated_at = datetime('now')
+                            WHERE id = ? AND confidence > ?
+                            """,
+                            (_INTERFERENCE_FLOOR, penalty,
+                             candidate_id, _INTERFERENCE_FLOOR),
                         )
                         logger.info(
-                            "Retroactive interference: atom %d confidence "
-                            "%.2f -> %.2f (contradicted by new atom %d)",
+                            "Retroactive interference: atom %d "
+                            "confidence reduced by %.2f "
+                            "(contradicted by new atom %d)",
                             candidate_id,
-                            candidate.confidence,
-                            new_conf,
+                            penalty,
                             atom_id,
                         )
 
