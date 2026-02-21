@@ -4,7 +4,7 @@
 [![Install from source](https://img.shields.io/badge/install-from%20source-blue)](https://github.com/avisual/memories-plugin)
 [![Python 3.13+](https://img.shields.io/badge/python-3.13+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Tests](https://img.shields.io/badge/tests-1037%20passing-success)](https://github.com/avisual/memories-plugin)
+[![Tests](https://img.shields.io/badge/tests-1097%20passing-success)](https://github.com/avisual/memories-plugin)
 
 > **The only AI memory system that prevents mistakes _before_ they happen.**
 
@@ -48,21 +48,50 @@ The system integrates with Claude Code through two channels:
 │  Stop ─────────────→ Hook ──→ Hebbian learning   │
 │                                                  │
 │  MCP Tools: remember, recall, connect, forget,   │
-│             amend, reflect, status, pathway       │
+│    amend, reflect, status, pathway, stats,        │
+│    create_task, update_task, list_tasks,           │
+│    stale_memories                                  │
 └──────────────────────┬──────────────────────────┘
                        │
 ┌──────────────────────▼──────────────────────────┐
 │                 memories server                   │
 │                                                  │
 │  Brain ──→ Retrieval (spreading activation)      │
-│        ──→ Learning (Hebbian, auto-linking)       │
-│        ──→ Consolidation (decay, merge, prune)   │
+│        ──→ Learning (Hebbian, auto-linking,      │
+│             supersession, novelty gating)         │
+│        ──→ Consolidation (decay, merge, prune,   │
+│             LTD, STC, abstraction, feedback)      │
 │        ──→ Context (budget compression)          │
 │                                                  │
 │  Storage: SQLite + sqlite-vec + FTS5             │
 │  Embeddings: Ollama (nomic-embed-text, 768-dim)  │
 └─────────────────────────────────────────────────┘
 ```
+
+### Learning pipeline
+
+When you `remember()` an atom, the learning engine automatically:
+
+- **Auto-links** — vector search finds related atoms and creates typed synapses (`related-to`, `caused-by`, `elaborates`, `warns-against`, `contradicts`)
+- **Detects supersession** — near-duplicate atoms (>0.9 similarity, same type) get a `supersedes` synapse; the older atom's confidence is reduced
+- **Gates novelty** — hooks check whether incoming content is genuinely new before storing, avoiding redundant atoms
+- **Suggests regions** — infers the best region from project context, keyword matching, or majority vote of similar atoms
+
+### Consolidation (reflect)
+
+Calling `reflect()` runs a full consolidation cycle — 16 operations modelled on biological memory consolidation:
+
+| Phase | Operations |
+|-------|-----------|
+| **Tune** | Auto-tune retrieval scoring weights based on feedback signals |
+| **Reclassify** | Fix misclassified antipatterns; apply user feedback (good/bad) |
+| **Resolve** | Settle contradiction pairs; reconsolidate superseded atoms |
+| **Decay** | Reduce confidence of stale atoms and synapse strengths |
+| **Prune** | Remove weak synapses, stale warns-against links, dormant connections |
+| **LTD & STC** | Long-term depression for unactivated synapses; expire STC tags |
+| **Abstract** | Cluster similar experiences into semantic summary atoms |
+| **Merge** | Unify exact and near-duplicate atoms (hash-based then embedding-based) |
+| **Promote** | Boost confidence of frequently accessed atoms |
 
 ## Quick Start
 
@@ -258,9 +287,14 @@ Once registered, Claude can use these tools directly:
 | `connect` | Create or strengthen a connection between two memories. |
 | `forget` | Soft-delete (recoverable) or hard-delete a memory. |
 | `amend` | Update an existing memory. Re-embeds and re-links if content changes. |
-| `reflect` | Run memory consolidation — decay, prune, merge, promote. Like sleep. |
+| `reflect` | Run memory consolidation — decay, prune, merge, promote, and more. Like sleep. |
 | `status` | Get system health: atom/synapse counts, regions, DB size, Ollama status. |
 | `pathway` | Visualize the connection graph radiating from a specific memory. |
+| `stats` | Hook invocation statistics, relevance scores, latency breakdowns. |
+| `create_task` | Create a task atom with lifecycle tracking (pending/in_progress/completed). |
+| `update_task` | Update task status; optionally flags linked memories as stale. |
+| `list_tasks` | List task atoms with optional status and region filters. |
+| `stale_memories` | Find memories linked to completed tasks that may be outdated. |
 
 ## Hooks
 
@@ -336,6 +370,8 @@ Run `python -m memories <command>` (or `uv run python -m memories <command>` fro
 | `health` | Quick health check (DB, Ollama, model) |
 | `diagnose` | Full diagnostics across all components |
 | `stats` | Session stats, hook performance, top atoms, latency |
+| `eval` | Show exactly what Claude sees for a given prompt (dry-run hook injection) |
+| `feedback` | Mark a recalled atom as good or bad (`feedback <atom_id> good\|bad`) |
 | `backfill` | Scan all `~/.claude/projects/` transcripts and store novel insights as atoms. Auto-relinks the graph when done. Safe to run repeatedly. |
 | `relink` | Re-run `auto_link` for every atom to fill any missing synapses. Idempotent — existing synapses are strengthened, not duplicated. |
 | `normalise` | Rename fragmented region aliases to canonical names (e.g. merges `general`, `project:git` → `project:utils`). |
