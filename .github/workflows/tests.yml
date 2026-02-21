@@ -7,7 +7,10 @@ on:
     branches: [main]
 
 jobs:
-  test:
+  # ---------------------------------------------------------
+  # Unit tests (fast, no Ollama needed)
+  # ---------------------------------------------------------
+  unit:
     runs-on: ubuntu-latest
 
     steps:
@@ -24,5 +27,47 @@ jobs:
       - name: Install dependencies
         run: uv sync --frozen --extra dev
 
-      - name: Run tests
-        run: uv run pytest tests/ -q --tb=short
+      - name: Run unit tests
+        run: uv run pytest tests/ -q --tb=short -m "not integration"
+
+  # ---------------------------------------------------------
+  # Integration tests (real Ollama embeddings)
+  # ---------------------------------------------------------
+  integration:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+
+      - name: Install dependencies
+        run: uv sync --frozen --extra dev
+
+      - name: Set up Ollama with nomic-embed-text
+        uses: pydantic/ollama-action@v3
+        with:
+          model: nomic-embed-text
+
+      - name: Verify Ollama serves nomic-embed-text
+        run: |
+          curl -sf http://localhost:11434/api/embeddings \
+            -d '{"model":"nomic-embed-text","prompt":"health check"}' \
+            | python -c "
+          import sys, json
+          d = json.load(sys.stdin)
+          assert len(d['embedding']) == 768, f'Expected 768 dims, got {len(d[\"embedding\"])}'
+          print('Ollama verified: 768-dim embeddings OK')
+          "
+
+      - name: Run integration tests
+        run: uv run pytest tests/ -q --tb=short -m integration
+        env:
+          MEMORIES_OLLAMA_URL: http://localhost:11434
+          MEMORIES_EMBEDDING_MODEL: nomic-embed-text

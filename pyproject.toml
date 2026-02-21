@@ -85,6 +85,7 @@ asyncio_mode = "auto"
 testpaths = ["tests"]
 markers = [
     "load: Load and concurrency tests (deselect with '-m \"not load\"')",
+    "integration: Integration tests requiring a running Ollama server (auto-skipped when unavailable)",
 ]
 
 [tool.ruff]
