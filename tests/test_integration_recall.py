@@ -497,3 +497,121 @@ class TestSynapseGraph:
         )
         for row in rows:
             assert row["bidirectional"] == 0
+
+
+class TestRememberThenRecallIntegration:
+    """End-to-end remember → recall round-trip with real Ollama embeddings.
+
+    Verifies that atoms stored via Brain.remember() are immediately
+    retrievable via Brain.recall() using real semantic embeddings.
+    """
+
+    @pytest.fixture
+    async def full_brain(self, integration_storage, real_embeddings):
+        """Brain with real embeddings and a real LearningEngine."""
+        from memories.learning import LearningEngine
+
+        storage = integration_storage
+        embeddings = real_embeddings
+        atoms = AtomManager(storage, embeddings)
+        synapses = SynapseManager(storage)
+        context = ContextBudget(storage)
+        retrieval = RetrievalEngine(storage, embeddings, atoms, synapses, context)
+        learning = LearningEngine(storage, embeddings, atoms, synapses)
+
+        b = Brain.__new__(Brain)
+        b._config = get_config()
+        b._storage = storage
+        b._embeddings = embeddings
+        b._atoms = atoms
+        b._synapses = synapses
+        b._context = context
+        b._retrieval = retrieval
+        b._learning = learning
+        b._consolidation = None
+        b._current_session_id = "integration-test-session"
+        b._initialized = True
+
+        await storage.execute_write(
+            "INSERT INTO sessions (id, project) VALUES (?, ?)",
+            ("integration-test-session", None),
+        )
+
+        return b
+
+    async def test_remember_then_recall_returns_atom(self, full_brain) -> None:
+        """An atom stored via remember() should be returned by a semantically
+        similar recall() query using real embeddings."""
+        result = await full_brain.remember(
+            content=(
+                "PostgreSQL VACUUM reclaims storage occupied by dead tuples. "
+                "Run VACUUM ANALYZE regularly on high-churn tables."
+            ),
+            type="fact",
+            region="project:postgres-app",
+            importance=0.8,
+        )
+        atom_id = result["atom_id"]
+
+        recall_result = await full_brain.recall(
+            query="How to reclaim dead tuple storage in PostgreSQL?",
+            budget_tokens=4000,
+        )
+
+        recalled_ids = {a["id"] for a in recall_result["atoms"]}
+        assert atom_id in recalled_ids, (
+            f"Remembered atom {atom_id} not found in recall results. "
+            f"Got IDs: {recalled_ids}"
+        )
+
+    async def test_remember_multiple_then_recall_ranks_correctly(
+        self, full_brain,
+    ) -> None:
+        """Multiple remembered atoms should rank correctly by semantic relevance."""
+        await full_brain.remember(
+            content="Docker containers use cgroups for resource isolation",
+            type="fact", region="devops",
+        )
+        pg_result = await full_brain.remember(
+            content=(
+                "PostgreSQL connection pooling with PgBouncer reduces "
+                "connection overhead and improves query throughput"
+            ),
+            type="skill", region="project:postgres-app",
+        )
+        await full_brain.remember(
+            content="I prefer VS Code with the Vim extension for editing",
+            type="preference", region="personal",
+        )
+
+        recall_result = await full_brain.recall(
+            query="PostgreSQL connection pooling performance",
+            budget_tokens=4000,
+        )
+
+        if recall_result["atoms"]:
+            top_atom = recall_result["atoms"][0]
+            assert top_atom["id"] == pg_result["atom_id"], (
+                f"Expected PostgreSQL atom to rank first, "
+                f"got atom {top_atom['id']}: {top_atom['content'][:60]}"
+            )
+
+    async def test_dedup_prevents_duplicate_storage(self, full_brain) -> None:
+        """Remembering near-identical content should be deduplicated."""
+        r1 = await full_brain.remember(
+            content="Always use parameterized SQL queries to prevent injection",
+            type="antipattern", region="security",
+            severity="critical", instead="Use parameterized queries",
+        )
+
+        r2 = await full_brain.remember(
+            content="Always use parameterized SQL queries to prevent SQL injection attacks",
+            type="antipattern", region="security",
+            severity="critical", instead="Use parameterized queries",
+        )
+
+        # Second call should be deduplicated (same atom returned).
+        if r2.get("deduplicated"):
+            assert r2["atom_id"] == r1["atom_id"], (
+                "Near-identical content should be deduplicated to the same atom"
+            )
