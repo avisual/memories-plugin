@@ -50,10 +50,14 @@ jobs:
       - name: Install dependencies
         run: uv sync --frozen --extra dev
 
-      - name: Set up Ollama with nomic-embed-text
-        uses: pydantic/ollama-action@v3
-        with:
-          model: nomic-embed-text
+      - name: Install Ollama
+        run: curl -fsSL https://ollama.com/install.sh | bash
+
+      - name: Start Ollama and pull model
+        run: |
+          ollama serve &
+          sleep 5
+          ollama pull nomic-embed-text
 
       - name: Verify Ollama serves nomic-embed-text
         run: |
