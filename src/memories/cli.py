@@ -116,11 +116,23 @@ def _project_name(cwd: str | None) -> str | None:
     return Path(cwd).name or None
 
 
-def _hook_budget() -> int:
-    """Calculate the hook token budget from config (default 5% of context)."""
+def _hook_budget(hook_type: str = "prompt-submit") -> int:
+    """Calculate the hook token budget, differentiated by hook type.
+
+    Session-start gets a larger budget (one-time cost at session open).
+    Prompt-submit uses the default budget.
+    Pre-tool uses a minimal budget (must be fast, only for warnings).
+    """
     from memories.config import get_config
     cfg = get_config()
-    return int(cfg.context_window_tokens * cfg.hook_budget_pct)
+    base = cfg.context_window_tokens
+    multipliers = {
+        "session-start": 0.03,   # 3% — one-time, can be generous
+        "prompt-submit": 0.02,   # 2% — per-prompt, standard
+        "pre-tool": 0.005,       # 0.5% — must be fast, warnings only
+    }
+    pct = multipliers.get(hook_type, cfg.hook_budget_pct)
+    return int(base * pct)
 
 
 _brain_instance: "Brain | None" = None
@@ -377,7 +389,7 @@ async def _hook_session_start(data: dict[str, Any]) -> str:
             query = project
             result = await brain.recall(
                 query=query,
-                budget_tokens=_hook_budget(),
+                budget_tokens=_hook_budget("session-start"),
                 region=f"project:{project}",
             )
 
@@ -434,7 +446,7 @@ async def _hook_prompt_submit(data: dict[str, Any]) -> str:
         project = _project_name(cwd)
         session_id = data.get("session_id", "")
 
-        budget = _hook_budget()
+        budget = _hook_budget("prompt-submit")
 
         # Primary recall: project-scoped for relevance.
         result = await brain.recall(
