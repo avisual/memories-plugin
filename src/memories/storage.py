@@ -140,6 +140,7 @@ CREATE TABLE IF NOT EXISTS synapses (
     bidirectional INTEGER NOT NULL DEFAULT 1,
     activated_count INTEGER NOT NULL DEFAULT 0,
     last_activated_at TEXT,
+    tag_expires_at TEXT,
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     UNIQUE(source_id, target_id, relationship)
 );
@@ -613,6 +614,15 @@ class Storage:
                 DROP TABLE hook_stats_old;
             """)
             log.info("Migration: Added task-completed + notification to hook_stats CHECK constraint")
+
+        # Migration 11: Add tag_expires_at for synaptic tagging and capture (v1.11.0)
+        syn_info = conn.execute("PRAGMA table_info(synapses)").fetchall()
+        syn_columns = {col[1] for col in syn_info}
+        if "tag_expires_at" not in syn_columns:
+            conn.execute(
+                "ALTER TABLE synapses ADD COLUMN tag_expires_at TEXT"
+            )
+            log.info("Migration: Added 'tag_expires_at' column to synapses table")
 
     def _probe_vec_support(self) -> bool:
         """Check whether sqlite-vec can be loaded in this environment.

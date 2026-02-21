@@ -97,6 +97,7 @@ class TestSynapseDataclass:
             "bidirectional",
             "activated_count",
             "last_activated_at",
+            "tag_expires_at",
             "created_at",
         }
         assert set(d.keys()) == expected_keys

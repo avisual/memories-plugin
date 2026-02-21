@@ -129,6 +129,7 @@ class Synapse:
     activated_count: int
     last_activated_at: str | None
     created_at: str
+    tag_expires_at: str | None = None
 
     # ------------------------------------------------------------------
     # Factory helpers
@@ -161,6 +162,7 @@ class Synapse:
             activated_count=row["activated_count"],
             last_activated_at=row["last_activated_at"],
             created_at=row["created_at"],
+            tag_expires_at=row["tag_expires_at"] if "tag_expires_at" in row.keys() else None,
         )
 
     # ------------------------------------------------------------------
@@ -184,6 +186,7 @@ class Synapse:
             "bidirectional": self.bidirectional,
             "activated_count": self.activated_count,
             "last_activated_at": self.last_activated_at,
+            "tag_expires_at": self.tag_expires_at,
             "created_at": self.created_at,
         }
 

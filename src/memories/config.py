@@ -105,6 +105,17 @@ class LearningConfig:
     too many weak associations dilute the learning signal.  Pairs are
     prioritised by temporal proximity when timestamps are available."""
 
+    stc_tagged_strength: float = 0.25
+    """Initial strength for new auto-linked synapses under Synaptic Tagging
+    and Capture.  New synapses start weak ("tagged") and must be reinforced
+    by Hebbian co-activation within ``stc_capture_window_days`` to survive.
+    Implements Frey & Morris (1997) synaptic tagging and capture."""
+
+    stc_capture_window_days: int = 14
+    """Days within which a tagged synapse must be Hebbian-reinforced to
+    survive.  Tags that expire without reinforcement are deleted during
+    consolidation.  Reinforced tags have their tag cleared (captured)."""
+
 
 @dataclass(frozen=True, slots=True)
 class ConsolidationConfig:

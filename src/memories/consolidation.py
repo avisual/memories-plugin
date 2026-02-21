@@ -245,6 +245,7 @@ class ConsolidationEngine:
             await self._prune_stale_warns_against(result)
             await self._apply_ltd(result)
             await self._prune_dormant_synapses(result)
+            await self._expire_stc_tags(result)
             # Integrate hub atom cleanup to cap over-connected nodes.
             if not dry_run:
                 hub_cleaned = await self._synapses.cleanup_hub_atoms()
@@ -644,6 +645,87 @@ class ConsolidationEngine:
                 total_pruned,
                 dormant_cutoff_days,
                 dormant_multiplier,
+            )
+
+    # ------------------------------------------------------------------
+    # Step 0b4: Synaptic Tagging and Capture (STC)
+    # ------------------------------------------------------------------
+
+    async def _expire_stc_tags(self, result: ConsolidationResult) -> None:
+        """Expire uncaptured synaptic tags and promote captured ones.
+
+        Implements Frey & Morris (1997) synaptic tagging and capture:
+
+        - **Expire**: delete tagged synapses whose capture window has elapsed
+          without Hebbian reinforcement (``activated_count <= 1``).
+        - **Promote**: clear the tag on synapses that WERE reinforced
+          (``activated_count > 1``), converting them into permanent synapses.
+
+        This ensures only associations validated by repeated co-activation
+        survive, reducing graph noise from one-time embedding similarity hits.
+        """
+        if result.dry_run:
+            expired_rows = await self._storage.execute(
+                """
+                SELECT COUNT(*) AS cnt FROM synapses
+                WHERE tag_expires_at IS NOT NULL
+                  AND tag_expires_at < datetime('now')
+                  AND activated_count <= 1
+                """,
+            )
+            promoted_rows = await self._storage.execute(
+                """
+                SELECT COUNT(*) AS cnt FROM synapses
+                WHERE tag_expires_at IS NOT NULL
+                  AND activated_count > 1
+                """,
+            )
+            expired_count = expired_rows[0]["cnt"] if expired_rows else 0
+            promoted_count = promoted_rows[0]["cnt"] if promoted_rows else 0
+            result.details.append({
+                "action": "stc_expire",
+                "would_expire": expired_count,
+                "would_promote": promoted_count,
+            })
+            return
+
+        # Delete expired, unreinforced tags.
+        deleted = await self._storage.execute_write_returning(
+            """
+            DELETE FROM synapses
+            WHERE tag_expires_at IS NOT NULL
+              AND tag_expires_at < datetime('now')
+              AND activated_count <= 1
+            RETURNING id
+            """,
+        )
+        expired_count = len(deleted)
+        result.pruned += expired_count
+
+        # Promote reinforced tags: clear tag_expires_at to make permanent.
+        await self._storage.execute_write(
+            """
+            UPDATE synapses
+            SET tag_expires_at = NULL
+            WHERE tag_expires_at IS NOT NULL
+              AND activated_count > 1
+            """,
+        )
+        promoted_rows = await self._storage.execute(
+            "SELECT changes() AS cnt",
+        )
+        promoted_count = promoted_rows[0]["cnt"] if promoted_rows else 0
+
+        if expired_count or promoted_count:
+            result.details.append({
+                "action": "stc_expire",
+                "expired": expired_count,
+                "promoted": promoted_count,
+            })
+            logger.info(
+                "STC: expired %d uncaptured tags, promoted %d captured synapses",
+                expired_count,
+                promoted_count,
             )
 
     # ------------------------------------------------------------------

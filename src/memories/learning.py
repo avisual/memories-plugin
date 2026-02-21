@@ -182,6 +182,8 @@ class LearningEngine:
             return []
 
         threshold = self._cfg.learning.auto_link_threshold
+        stc_strength = self._cfg.learning.stc_tagged_strength
+        stc_window = self._cfg.learning.stc_capture_window_days
         created_synapses: list[dict] = []
 
         # Collect all candidate IDs that pass the basic filters (not self, above
@@ -247,15 +249,30 @@ class LearningEngine:
                         continue
                     outbound_budget -= 1
 
+                # STC: related-to synapses start at tagged strength and must
+                # be reinforced within the capture window.  Typed semantic
+                # links (caused-by, elaborates, part-of) use full similarity
+                # since they carry explicit evidence.
+                use_tagged = relationship == "related-to"
+                initial_strength = stc_strength if use_tagged else similarity
+
                 synapse = await self._safe_create_synapse(
                     source_id=atom_id,
                     target_id=candidate_id,
                     relationship=relationship,
-                    strength=similarity,
+                    strength=initial_strength,
                     bidirectional=bidirectional,
                 )
                 if synapse is not None:
                     created_synapses.append(synapse)
+                    # Set tag expiry for STC-tagged synapses.
+                    if use_tagged:
+                        await self._set_tag_expiry(
+                            synapse["source_id"],
+                            synapse["target_id"],
+                            synapse["relationship"],
+                            stc_window,
+                        )
 
             # --- (b) warns-against for antipatterns -----------------------
             if candidate.type == "antipattern":
@@ -879,6 +896,29 @@ class LearningEngine:
 
         # Generic fallback — bidirectional topical association.
         return "related-to", True
+
+    async def _set_tag_expiry(
+        self,
+        source_id: int,
+        target_id: int,
+        relationship: str,
+        window_days: int,
+    ) -> None:
+        """Set the STC tag expiry timestamp on a newly created synapse.
+
+        Only sets the tag if the synapse does not already have one (i.e. it
+        is truly new, not an existing synapse that was strengthened via upsert).
+        """
+        await self._storage.execute_write(
+            """
+            UPDATE synapses
+            SET tag_expires_at = datetime('now', '+' || ? || ' days')
+            WHERE source_id = ? AND target_id = ? AND relationship = ?
+              AND tag_expires_at IS NULL
+              AND activated_count <= 1
+            """,
+            (window_days, source_id, target_id, relationship),
+        )
 
     async def _safe_create_synapse(
         self,

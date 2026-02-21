@@ -893,6 +893,48 @@ class TestCueOverloadProtection:
             f"Expected at most 10 new pairs (cap), got {total}"
         )
 
+    async def test_temporal_sorting_applied(self, storage: Storage) -> None:
+        """When timestamps are available, pairs closest in time should survive the cap."""
+        from memories.config import LearningConfig, MemoriesConfig
+
+        test_cfg = MemoriesConfig(
+            learning=LearningConfig(
+                max_new_pairs_per_session=3,
+                min_accesses_for_hebbian=0,
+            )
+        )
+
+        # Create 5 atoms
+        atom_ids = []
+        for i in range(5):
+            aid = await storage.execute_write(
+                """
+                INSERT INTO atoms (content, type, region, confidence, importance,
+                                   access_count, created_at)
+                VALUES (?, 'fact', 'general', 1.0, 0.5, 5, datetime('now'))
+                """,
+                (f"temporal atom {i}",),
+            )
+            atom_ids.append(aid)
+
+        # Timestamps: atoms 0,1,2 are within 10 seconds of each other;
+        # atoms 3,4 are 1000 seconds away
+        timestamps = {
+            atom_ids[0]: 100.0,
+            atom_ids[1]: 105.0,
+            atom_ids[2]: 110.0,
+            atom_ids[3]: 1100.0,
+            atom_ids[4]: 1200.0,
+        }
+
+        mgr = SynapseManager(storage)
+        with patch("memories.synapses.get_config", return_value=test_cfg):
+            mgr._cfg = test_cfg
+            total = await mgr.hebbian_update(atom_ids, atom_timestamps=timestamps)
+
+        # With cap of 3, the 3 closest-in-time pairs should be created
+        assert total == 3
+
     async def test_no_cap_when_under_limit(self, storage: Storage) -> None:
         """When session has few atoms, no capping occurs."""
         atom_ids = []
@@ -914,3 +956,103 @@ class TestCueOverloadProtection:
         assert total == 10, (
             f"Expected all 10 pairs to be created, got {total}"
         )
+
+
+# =======================================================================
+# 7. Synaptic Tagging and Capture (STC)
+# =======================================================================
+
+
+class TestSynapticTaggingAndCapture:
+    """Verify that STC tags are set on new synapses and expired/promoted
+    during consolidation."""
+
+    async def test_stc_config_defaults(self) -> None:
+        """LearningConfig should have STC parameters with sensible defaults."""
+        cfg = LearningConfig()
+        assert cfg.stc_tagged_strength == 0.25
+        assert cfg.stc_capture_window_days == 14
+
+    async def test_expire_unreinforced_tags(self, storage: Storage) -> None:
+        """Tagged synapses that were never reinforced should be deleted."""
+        atom_a = await _insert_atom(storage, "stc atom A")
+        atom_b = await _insert_atom(storage, "stc atom B")
+
+        # Create a tagged synapse with expired tag (in the past).
+        await storage.execute_write(
+            """
+            INSERT INTO synapses
+                (source_id, target_id, relationship, strength, bidirectional,
+                 activated_count, tag_expires_at)
+            VALUES (?, ?, 'related-to', 0.25, 1, 1, datetime('now', '-1 day'))
+            """,
+            (atom_a, atom_b),
+        )
+
+        engine = _make_consolidation_engine(storage)
+        result = await engine.reflect()
+
+        # The unreinforced synapse should have been deleted.
+        rows = await storage.execute(
+            "SELECT id FROM synapses WHERE source_id = ? AND target_id = ?",
+            (atom_a, atom_b),
+        )
+        assert len(rows) == 0, "Unreinforced expired tag should be deleted"
+        assert result.pruned >= 1
+
+    async def test_promote_reinforced_tags(self, storage: Storage) -> None:
+        """Tagged synapses that were reinforced should have their tag cleared."""
+        atom_a = await _insert_atom(storage, "promoted atom A")
+        atom_b = await _insert_atom(storage, "promoted atom B")
+
+        # Create a tagged synapse with activated_count > 1 (reinforced).
+        synapse_id = await storage.execute_write(
+            """
+            INSERT INTO synapses
+                (source_id, target_id, relationship, strength, bidirectional,
+                 activated_count, tag_expires_at, last_activated_at)
+            VALUES (?, ?, 'related-to', 0.4, 1, 3, datetime('now', '+7 day'),
+                    datetime('now'))
+            """,
+            (atom_a, atom_b),
+        )
+
+        engine = _make_consolidation_engine(storage)
+        await engine.reflect()
+
+        # The tag should be cleared (promoted to permanent).
+        rows = await storage.execute(
+            "SELECT tag_expires_at FROM synapses WHERE id = ?",
+            (synapse_id,),
+        )
+        assert len(rows) == 1
+        assert rows[0]["tag_expires_at"] is None, (
+            "Reinforced synapse should have tag cleared (promoted)"
+        )
+
+    async def test_non_expired_tags_survive(self, storage: Storage) -> None:
+        """Tagged synapses within the capture window should not be deleted."""
+        atom_a = await _insert_atom(storage, "surviving atom A")
+        atom_b = await _insert_atom(storage, "surviving atom B")
+
+        # Create a tagged synapse with future expiry and no reinforcement.
+        synapse_id = await storage.execute_write(
+            """
+            INSERT INTO synapses
+                (source_id, target_id, relationship, strength, bidirectional,
+                 activated_count, tag_expires_at)
+            VALUES (?, ?, 'related-to', 0.25, 1, 1, datetime('now', '+7 day'))
+            """,
+            (atom_a, atom_b),
+        )
+
+        engine = _make_consolidation_engine(storage)
+        await engine.reflect()
+
+        # The synapse should still exist (tag not yet expired).
+        rows = await storage.execute(
+            "SELECT id, tag_expires_at FROM synapses WHERE id = ?",
+            (synapse_id,),
+        )
+        assert len(rows) == 1, "Non-expired tagged synapse should survive"
+        assert rows[0]["tag_expires_at"] is not None
