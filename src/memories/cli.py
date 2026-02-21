@@ -447,28 +447,38 @@ async def _hook_prompt_submit(data: dict[str, Any]) -> str:
         session_id = data.get("session_id", "")
 
         budget = _hook_budget("prompt-submit")
+        global_result = None
 
-        # Primary recall: project-scoped for relevance.
-        result = await brain.recall(
-            query=prompt,
-            budget_tokens=budget,
-            region=f"project:{project}" if project else None,
-        )
+        # A2: Run project-scoped and global recalls concurrently to halve
+        # latency (perf M3).  The global recall surfaces cross-project
+        # knowledge without adding to the hook's wall-clock time.
+        if project:
+            global_budget = max(budget // 3, 500)
+            result, global_result = await asyncio.gather(
+                brain.recall(
+                    query=prompt,
+                    budget_tokens=budget,
+                    region=f"project:{project}",
+                ),
+                brain.recall(
+                    query=prompt,
+                    budget_tokens=global_budget,
+                    region=None,
+                ),
+            )
+        else:
+            result = await brain.recall(
+                query=prompt,
+                budget_tokens=budget,
+                region=None,
+            )
 
         atoms = result.get("atoms", [])
         antipatterns = result.get("antipatterns", [])
 
-        # A2: Secondary global recall (no region) to surface cross-project
-        # knowledge — general antipatterns, skills, and facts that are
-        # relevant to the query but stored in a different project.
-        if project:
+        # Merge global results, deduplicating by ID.
+        if global_result:
             seen_ids = {a.get("id") for a in atoms} | {a.get("id") for a in antipatterns}
-            global_budget = max(budget // 3, 500)
-            global_result = await brain.recall(
-                query=prompt,
-                budget_tokens=global_budget,
-                region=None,  # search all regions
-            )
             for ga in global_result.get("atoms", []):
                 if ga.get("id") not in seen_ids:
                     atoms.append(ga)
@@ -483,7 +493,10 @@ async def _hook_prompt_submit(data: dict[str, Any]) -> str:
             brain, "prompt-submit", latency_ms,
             project=project, query=prompt, result=result,
         )
+        # M1: Save atoms from both results for Hebbian learning.
         await _save_hook_atoms(brain, session_id, result)
+        if global_result:
+            await _save_hook_atoms(brain, session_id, global_result)
 
         if not atoms and not antipatterns:
             return "Success"

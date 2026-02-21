@@ -269,7 +269,7 @@ class Brain:
         if self._current_session_id and self._storage:
             try:
                 context_rows = await self._storage.execute(
-                    "SELECT atom_id FROM hook_session_atoms WHERE claude_session_id = ?",
+                    "SELECT atom_id FROM hook_session_atoms WHERE claude_session_id = ? ORDER BY accessed_at DESC",
                     (self._current_session_id,),
                 )
                 context_ids = [r["atom_id"] for r in context_rows if r["atom_id"] != atom.id]

@@ -1561,14 +1561,19 @@ class ConsolidationEngine:
             return
 
         placeholders = ",".join("?" * len(all_ids))
+        # Use UNION ALL instead of OR so SQLite can use indexes on each
+        # branch independently (perf M4 — OR across columns skips indexes).
         all_related = await self._storage.execute(
             f"""
             SELECT source_id, target_id, strength, bidirectional FROM synapses
-            WHERE (source_id IN ({placeholders})
-                   OR (target_id IN ({placeholders}) AND bidirectional = 1))
+            WHERE source_id IN ({placeholders}) AND relationship = 'related-to'
+            UNION ALL
+            SELECT source_id, target_id, strength, bidirectional FROM synapses
+            WHERE target_id IN ({placeholders}) AND bidirectional = 1
               AND relationship = 'related-to'
+              AND source_id NOT IN ({placeholders})
             """,
-            tuple(all_ids) + tuple(all_ids),
+            tuple(all_ids) + tuple(all_ids) + tuple(all_ids),
         )
 
         # Build lookup: atom_id → list of (neighbor_id, strength).
