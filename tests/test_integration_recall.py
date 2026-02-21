@@ -11,7 +11,7 @@ Run locally:
     ollama serve &
     uv run pytest tests/test_integration_recall.py -m integration -v
 
-Run in CI via pydantic/ollama-action (see .github/workflows/tests.yml).
+Run in CI via the official Ollama install script (see .github/workflows/tests.yml).
 """
 
 from __future__ import annotations
