@@ -866,22 +866,22 @@ class TestSupersessionRealEmbeddings:
         return learning, storage, embeddings, seed_atom
 
     async def test_supersedes_near_duplicate(self, env) -> None:
-        """A nearly identical text (one word changed) should create a supersedes synapse."""
+        """A nearly identical text should create a supersedes synapse."""
         learning, storage, embeddings, seed_atom = env
 
         # Seed original atom directly.
         id1 = await seed_atom(
             "PostgreSQL VACUUM reclaims storage occupied by dead tuples "
-            "left after UPDATE and DELETE operations",
+            "after UPDATE and DELETE operations on a table",
             region="project:postgres",
         )
 
-        # Seed a near-duplicate (only "left after" → "remaining after").
+        # Seed a near-duplicate — identical except trailing phrase.
         import asyncio
         await asyncio.sleep(0.01)  # Ensure created_at is later.
         id2 = await seed_atom(
             "PostgreSQL VACUUM reclaims storage occupied by dead tuples "
-            "remaining after UPDATE and DELETE operations",
+            "after UPDATE and DELETE operations on the table",
             region="project:postgres",
         )
 
