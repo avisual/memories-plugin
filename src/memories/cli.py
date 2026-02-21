@@ -332,6 +332,12 @@ async def _hook_session_start(data: dict[str, Any]) -> str:
         brain = await _get_brain()
         assert brain._storage is not None
 
+        # Bridge the Claude Code session_id to the Brain's internal session
+        # tracking so that session priming (recall) and contextual encoding
+        # (remember) work correctly through the hook path.
+        if session_id:
+            brain._current_session_id = session_id
+
         # Register this session and detect sub-agent lineage.
         if session_id:
             await brain._storage.execute_write(
@@ -1609,7 +1615,8 @@ async def _hook_pre_tool_use(data: dict[str, Any]) -> str:
     ``Bash`` (with a descriptive description) are processed -- other tools
     are either noisy, low-signal, or better captured by PostToolUse.
 
-    Returns an empty string so the tool always proceeds.
+    For Bash commands, also performs a fast antipattern-only recall to
+    surface relevant warnings before execution.
     """
     t0 = time.monotonic()
     tool_name = data.get("tool_name", "")
@@ -1622,8 +1629,38 @@ async def _hook_pre_tool_use(data: dict[str, Any]) -> str:
     if not content or len(content) < 20:
         return ""
 
+    output_lines: list[str] = []
+
     try:
         brain = await _get_brain()
+
+        # A3: Pre-tool antipattern recall — surface relevant warnings
+        # before Bash/Task execution.  Uses a small budget and restricts
+        # to antipattern type for speed.
+        if tool_name == "Bash":
+            cwd = data.get("cwd", "")
+            project = _project_name(cwd)
+            warning_result = await brain.recall(
+                query=content[:300],
+                budget_tokens=500,
+                region=f"project:{project}" if project else None,
+                types=["antipattern"],
+                include_antipatterns=True,
+            )
+            warnings = warning_result.get("atoms", []) + warning_result.get("antipatterns", [])
+            if warnings:
+                # Deduplicate by ID.
+                seen: set[int] = set()
+                unique_warnings: list[dict[str, Any]] = []
+                for w in warnings:
+                    wid = w.get("id")
+                    if wid not in seen:
+                        unique_warnings.append(w)
+                        seen.add(wid)
+                output_lines.append(f"[memories] {len(unique_warnings)} relevant warnings:")
+                for w in unique_warnings[:3]:  # cap at 3
+                    output_lines.append(_format_atom_line(w))
+
         is_novel = await brain._learning.assess_novelty(content)
         novelty = "pass" if is_novel else "fail"
 
@@ -1653,7 +1690,7 @@ async def _hook_pre_tool_use(data: dict[str, Any]) -> str:
     except Exception as exc:
         log.error("pre-tool hook: unexpected error: %s", exc, exc_info=True)
 
-    return ""
+    return "\n".join(output_lines) if output_lines else ""
 
 
 # ------------------------------------------------------------------
