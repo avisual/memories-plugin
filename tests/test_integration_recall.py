@@ -938,7 +938,6 @@ class TestConsolidationMergeRealEmbeddings:
     @pytest.fixture
     async def consolidation_env(self, integration_storage, real_embeddings):
         from memories.consolidation import ConsolidationEngine
-        from memories.learning import LearningEngine
 
         storage = integration_storage
         embeddings = real_embeddings
