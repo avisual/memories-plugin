@@ -431,9 +431,16 @@ class Brain:
             session_atom_ids=session_atom_ids,
         )
 
+        # Deduplicate: remove antipatterns that already appear in atoms.
+        atom_ids = {a.get("id") for a in result.atoms if a.get("id") is not None}
+        deduped_antipatterns = [
+            ap for ap in result.antipatterns
+            if ap.get("id") not in atom_ids
+        ]
+
         return {
             "atoms": result.atoms,
-            "antipatterns": result.antipatterns,
+            "antipatterns": deduped_antipatterns,
             "pathways": result.pathways,
             "budget_used": result.budget_used,
             "budget_remaining": result.budget_remaining,
