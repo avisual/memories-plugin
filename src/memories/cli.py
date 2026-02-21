@@ -320,11 +320,14 @@ async def _hook_session_start(data: dict[str, Any]) -> str:
                         "session-start: detected sub-agent; parent=%s", parent_id
                     )
 
-        query = f"project context for {project}" if project else None
         result = None
 
         # Recall project-specific memories if we have a project context.
+        # Use the project name itself as the query (not a meta-description
+        # like "project context for X") — this has better semantic overlap
+        # with actual stored content that mentions the project.
         if project:
+            query = project
             result = await brain.recall(
                 query=query,
                 budget_tokens=_hook_budget(),
@@ -344,7 +347,8 @@ async def _hook_session_start(data: dict[str, Any]) -> str:
                 for atom in atoms:
                     content = atom.get("content", "")
                     atom_type = atom.get("type", "unknown")
-                    lines.append(f"  [{atom_type}] {content}")
+                    confidence = atom.get("confidence", 1.0)
+                    lines.append(f"  [{atom_type}|{confidence:.1f}] {content}")
 
                 return "\n".join(lines)
         else:
@@ -382,11 +386,37 @@ async def _hook_prompt_submit(data: dict[str, Any]) -> str:
         project = _project_name(cwd)
         session_id = data.get("session_id", "")
 
+        budget = _hook_budget()
+
+        # Primary recall: project-scoped for relevance.
         result = await brain.recall(
             query=prompt,
-            budget_tokens=_hook_budget(),
+            budget_tokens=budget,
             region=f"project:{project}" if project else None,
         )
+
+        atoms = result.get("atoms", [])
+        antipatterns = result.get("antipatterns", [])
+
+        # A2: Secondary global recall (no region) to surface cross-project
+        # knowledge — general antipatterns, skills, and facts that are
+        # relevant to the query but stored in a different project.
+        if project:
+            seen_ids = {a.get("id") for a in atoms} | {a.get("id") for a in antipatterns}
+            global_budget = max(budget // 3, 500)
+            global_result = await brain.recall(
+                query=prompt,
+                budget_tokens=global_budget,
+                region=None,  # search all regions
+            )
+            for ga in global_result.get("atoms", []):
+                if ga.get("id") not in seen_ids:
+                    atoms.append(ga)
+                    seen_ids.add(ga.get("id"))
+            for gap in global_result.get("antipatterns", []):
+                if gap.get("id") not in seen_ids:
+                    antipatterns.append(gap)
+                    seen_ids.add(gap.get("id"))
 
         latency_ms = int((time.monotonic() - t0) * 1000)
         await _record_hook_stat(
@@ -395,11 +425,12 @@ async def _hook_prompt_submit(data: dict[str, Any]) -> str:
         )
         await _save_hook_atoms(brain, session_id, result)
 
-        atoms = result.get("atoms", [])
-        antipatterns = result.get("antipatterns", [])
-
         if not atoms and not antipatterns:
             return "Success"
+
+        # A4: Deduplicate — remove antipatterns that already appear in atoms.
+        atom_ids = {a.get("id") for a in atoms}
+        antipatterns = [ap for ap in antipatterns if ap.get("id") not in atom_ids]
 
         lines = []
         if atoms:
@@ -407,7 +438,8 @@ async def _hook_prompt_submit(data: dict[str, Any]) -> str:
             for atom in atoms:
                 content = atom.get("content", "")
                 atom_type = atom.get("type", "unknown")
-                lines.append(f"  [{atom_type}] {content}")
+                confidence = atom.get("confidence", 1.0)
+                lines.append(f"  [{atom_type}|{confidence:.1f}] {content}")
 
         if antipatterns:
             lines.append(f"[memories] {len(antipatterns)} warnings:")
