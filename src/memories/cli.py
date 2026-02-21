@@ -48,6 +48,47 @@ _BASH_REAL_ERROR_SIGS: tuple[str, ...] = (
 )
 
 
+def _format_atom_line(atom: dict[str, Any]) -> str:
+    """Format a single atom for hook output injection.
+
+    Includes type, confidence, atom ID, and content.  Antipatterns
+    additionally show severity and "instead" fields when present.
+    """
+    content = atom.get("content", "")
+    atom_type = atom.get("type", "unknown")
+    confidence = atom.get("confidence", 1.0)
+    atom_id = atom.get("id", "")
+
+    line = f"  [{atom_type}|{confidence:.1f}] {content}"
+    if atom_id:
+        line += f"  (id:{atom_id})"
+
+    # Structured antipattern metadata.
+    if atom_type == "antipattern":
+        severity = atom.get("severity")
+        instead = atom.get("instead")
+        if severity:
+            line += f"\n    severity: {severity}"
+        if instead:
+            line += f"\n    instead: {instead}"
+
+    return line
+
+
+def _format_pathways(pathways: list[dict[str, Any]]) -> list[str]:
+    """Format pathways between result atoms for context injection."""
+    if not pathways:
+        return []
+    lines = ["  connections:"]
+    for pw in pathways[:5]:  # cap at 5 to stay compact
+        rel = pw.get("relationship", "related-to")
+        src = pw.get("source_id", "?")
+        tgt = pw.get("target_id", "?")
+        strength = pw.get("strength", 0.0)
+        lines.append(f"    {src} --[{rel}|{strength:.2f}]--> {tgt}")
+    return lines
+
+
 def _read_stdin_json() -> dict[str, Any]:
     """Read and parse JSON from stdin (non-blocking, UTF-8)."""
     raw: str = ""
@@ -343,12 +384,13 @@ async def _hook_session_start(data: dict[str, Any]) -> str:
 
             atoms = result.get("atoms", [])
             if atoms:
-                lines = [f"[memories] {len(atoms)} memories for {project}:"]
+                lines = [
+                    f"[memories] {len(atoms)} recalled memories for {project}"
+                    " (verify before acting on stale information):"
+                ]
                 for atom in atoms:
-                    content = atom.get("content", "")
-                    atom_type = atom.get("type", "unknown")
-                    confidence = atom.get("confidence", 1.0)
-                    lines.append(f"  [{atom_type}|{confidence:.1f}] {content}")
+                    lines.append(_format_atom_line(atom))
+                lines.extend(_format_pathways(result.get("pathways", [])))
 
                 return "\n".join(lines)
         else:
@@ -434,18 +476,18 @@ async def _hook_prompt_submit(data: dict[str, Any]) -> str:
 
         lines = []
         if atoms:
-            lines.append(f"[memories] {len(atoms)} relevant memories:")
+            lines.append(
+                f"[memories] {len(atoms)} recalled memories"
+                " (verify before acting on stale information):"
+            )
             for atom in atoms:
-                content = atom.get("content", "")
-                atom_type = atom.get("type", "unknown")
-                confidence = atom.get("confidence", 1.0)
-                lines.append(f"  [{atom_type}|{confidence:.1f}] {content}")
+                lines.append(_format_atom_line(atom))
+            lines.extend(_format_pathways(result.get("pathways", [])))
 
         if antipatterns:
             lines.append(f"[memories] {len(antipatterns)} warnings:")
             for ap in antipatterns:
-                content = ap.get("content", "")
-                lines.append(f"  [warning] {content}")
+                lines.append(_format_atom_line(ap))
 
         return "\n".join(lines)
 
