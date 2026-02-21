@@ -4,14 +4,14 @@ This guide walks through basic usage of avisual memories with Claude Code.
 
 ## Prerequisites
 
-- avisual-memories installed ([Installation Guide](installation.md))
+- memories installed from source ([Installation Guide](installation.md))
 - Ollama running with nomic-embed-text model
 - Claude Code (or compatible AI agent)
 
 ## Step 1: Verify Setup
 
 ```bash
-avisual-memories diagnose
+uv run python -m memories diagnose
 ```
 
 Ensure all checks pass before continuing.

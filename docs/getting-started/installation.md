@@ -6,9 +6,7 @@
 - **Ollama** for local embeddings (free, no API key)
 - **AI agent** that supports MCP (Claude Code, Aider, etc.)
 
-## Install avisual-memories
-
-> **Note:** PyPI package coming soon. For now, install from source.
+## Install from Source
 
 ```bash
 git clone https://github.com/avisual/memories-plugin.git
@@ -48,7 +46,7 @@ This downloads a 274MB model for local embeddings (no API costs!).
 ### Interactive Setup (Recommended)
 
 ```bash
-avisual-memories setup --interactive
+uv run python -m memories setup --interactive
 ```
 
 The wizard will:
@@ -62,7 +60,7 @@ The wizard will:
 ### Non-Interactive Setup
 
 ```bash
-avisual-memories setup --non-interactive
+uv run python -m memories setup --non-interactive
 ```
 
 For automation/scripts (assumes Ollama already running).
@@ -70,7 +68,7 @@ For automation/scripts (assumes Ollama already running).
 ## Verify Installation
 
 ```bash
-avisual-memories diagnose
+uv run python -m memories diagnose
 ```
 
 Should show:

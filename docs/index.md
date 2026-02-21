@@ -165,7 +165,6 @@ Tested with 1,000-atom datasets. See [benchmarks](https://github.com/avisual/mem
 
 - **GitHub Issues**: [github.com/avisual/memories-plugin/issues](https://github.com/avisual/memories-plugin/issues)
 - **Documentation**: [avisual.github.io/memories](https://avisual.github.io/memories)
-- **PyPI**: Coming soon
 
 ## License
 

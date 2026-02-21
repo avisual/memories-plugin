@@ -16,14 +16,14 @@ All settings are controlled via environment variables with the `MEMORIES_` prefi
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `MEMORIES_CONTEXT_WINDOW_TOKENS` | `200000` | Model context window size |
-| `MEMORIES_HOOK_BUDGET_PCT` | `0.02` | Fraction of context window for hook injection (2% = 4,000 tokens on 200K window) |
+| `MEMORIES_HOOK_BUDGET_PCT` | `0.02` | Default fraction of context window for hook injection. Differentiated per hook: session-start=3%, prompt-submit=2%, pre-tool=0.5% |
 
 ## Deduplication
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `MEMORIES_DEDUP_THRESHOLD` | `0.92` | Cosine similarity above which a new atom is skipped as a near-duplicate of an existing one |
-| `MEMORIES_REGION_DIVERSITY_CAP` | `5` | Max atoms per region returned in a single recall |
+| `MEMORIES_REGION_DIVERSITY_CAP` | `2` | Max atoms per region returned in a single recall |
 
 ## Thinking Block Distillation (Optional)
 

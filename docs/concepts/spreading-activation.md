@@ -46,7 +46,7 @@ Every activated atom gets a composite score:
 
 Results are sorted by composite score. Atoms are packed into the token budget (`budget_tokens`) from highest score down. When the budget is nearly full, atoms are progressively compressed (content truncated) rather than dropped.
 
-A region diversity cap (`MEMORIES_REGION_DIVERSITY_CAP`, default 5) prevents any single project from dominating the results.
+A region diversity cap (`MEMORIES_REGION_DIVERSITY_CAP`, default 2) prevents any single project from dominating the results.
 
 ## Example
 

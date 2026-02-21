@@ -192,10 +192,14 @@ Hook fires → cli.py reads stdin JSON → brain.recall(query, budget, region)
 ## Success Criteria
 
 After all iterations:
-1. `session-start` surfaces top-5 most relevant memories for the project (not generic padding)
-2. `prompt-submit` surfaces cross-project knowledge when relevant
-3. Claude sees confidence, pathways, and structured antipatterns in context
-4. Pre-tool warnings fire before dangerous Bash/Task calls
-5. All 1000+ tests pass
-6. Performance architect PASS (no new N+1 queries, all hooks under timeout)
-7. Hebbian architect PASS (no new learning rule regressions)
+1. `session-start` surfaces top-5 most relevant memories for the project (not generic padding) — **DONE**
+2. `prompt-submit` surfaces cross-project knowledge when relevant — **DONE**
+3. Claude sees confidence, pathways, and structured antipatterns in context — **DONE**
+4. Pre-tool warnings fire before dangerous Bash/Task calls — **DONE**
+5. All 1000+ tests pass — **DONE** (1037 passing, 5 Ollama-dependent skipped)
+6. Performance architect PASS (no new N+1 queries, all hooks under timeout) — **PASS**
+7. Hebbian architect PASS (no new learning rule regressions) — **PASS**
+
+## Status: COMPLETE (2026-02-21)
+
+All 7 iterations implemented, both architect reviews passed.

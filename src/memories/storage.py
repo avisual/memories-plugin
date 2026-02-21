@@ -412,10 +412,15 @@ class Storage:
             log.info("Migration: Added 'importance' column to atoms table")
 
         # Migration 2: Add task_status column for task atoms (v1.2.0)
+        # NOTE: We intentionally omit the CHECK constraint from the ALTER TABLE
+        # because SQLite 3.45+ raises a spurious "NOT NULL constraint failed"
+        # when ADD COLUMN with CHECK follows an earlier ADD COLUMN with NOT NULL
+        # DEFAULT on the same table.  The CHECK is already in _SCHEMA_SQL for
+        # newly-created databases; migrated databases rely on application
+        # validation.
         if "task_status" not in columns:
             conn.execute(
-                "ALTER TABLE atoms ADD COLUMN task_status TEXT "
-                "CHECK(task_status IN ('pending','active','done','archived') OR task_status IS NULL)"
+                "ALTER TABLE atoms ADD COLUMN task_status TEXT"
             )
             log.info("Migration: Added 'task_status' column to atoms table")
 
