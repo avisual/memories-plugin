@@ -201,7 +201,7 @@ class RetrievalEngine:
             rel: getattr(_type_weights, rel.replace("-", "_"), 0.5)
             for rel in (
                 "related-to", "caused-by", "part-of", "contradicts",
-                "supersedes", "elaborates", "warns-against",
+                "supersedes", "elaborates", "warns-against", "encoded-with",
             )
         }
 

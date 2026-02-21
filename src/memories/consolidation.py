@@ -1563,22 +1563,30 @@ class ConsolidationEngine:
         placeholders = ",".join("?" * len(all_ids))
         all_related = await self._storage.execute(
             f"""
-            SELECT source_id, target_id, strength FROM synapses
-            WHERE source_id IN ({placeholders})
+            SELECT source_id, target_id, strength, bidirectional FROM synapses
+            WHERE (source_id IN ({placeholders})
+                   OR (target_id IN ({placeholders}) AND bidirectional = 1))
               AND relationship = 'related-to'
             """,
-            tuple(all_ids),
+            tuple(all_ids) + tuple(all_ids),
         )
 
-        # Build lookup: source_id → list of (target_id, strength)
+        # Build lookup: atom_id → list of (neighbor_id, strength).
+        # For bidirectional synapses, index in both directions so that
+        # incoming connections on the superseded atom are also transferred.
         neighbors_by_source: dict[int, list[tuple[int, float]]] = {}
         existing_targets_by_source: dict[int, set[int]] = {}
         for r in all_related:
             src = r["source_id"]
-            neighbors_by_source.setdefault(src, []).append(
-                (r["target_id"], r["strength"])
-            )
-            existing_targets_by_source.setdefault(src, set()).add(r["target_id"])
+            tgt = r["target_id"]
+            strength = r["strength"]
+            # Forward direction: source → target
+            neighbors_by_source.setdefault(src, []).append((tgt, strength))
+            existing_targets_by_source.setdefault(src, set()).add(tgt)
+            # Reverse direction for bidirectional synapses: target → source
+            if r["bidirectional"]:
+                neighbors_by_source.setdefault(tgt, []).append((src, strength))
+                existing_targets_by_source.setdefault(tgt, set()).add(src)
 
         transferred = 0
         all_new_synapses: list[tuple[int, int, float]] = []
@@ -1738,7 +1746,7 @@ class ConsolidationEngine:
             # Implements Wixted & Ebbesen (1991) dual-process forgetting.
             exp_confidence = atom.confidence * (effective_rate ** exponent)
             if days_since > transition_days:
-                transition_exponent = (transition_days / decay_after_days) * ltp_factor
+                transition_exponent = (transition_days / decay_after_days) * ltp_factor * importance_protection
                 exp_part = effective_rate ** transition_exponent
                 power_part = (transition_days / days_since) ** power_exponent
                 power_confidence = atom.confidence * exp_part * power_part
@@ -1807,16 +1815,19 @@ class ConsolidationEngine:
             stats = await self._synapses.get_stats()
             total = stats.get("total", 0)
             related_to_count = stats.get("by_relationship", {}).get("related-to", 0)
+            encoded_with_count = stats.get("by_relationship", {}).get("encoded-with", 0)
             result.details.append({
                 "action": "decay_synapses",
-                "note": f"Would decay {total} synapses (related-to: {related_to_count} at accelerated rate)",
+                "note": f"Would decay {total} synapses (related-to: {related_to_count}, encoded-with: {encoded_with_count} at accelerated rates)",
                 "total_synapses": total,
                 "related_to_count": related_to_count,
+                "encoded_with_count": encoded_with_count,
             })
             return
 
         base_decay = self._cfg.decay_rate
         related_to_decay = base_decay * 0.9  # 10% extra decay for generic connections
+        encoded_with_decay = base_decay * 0.85  # 15% extra decay for contextual bindings
 
         # First, apply extra decay to "related-to" synapses
         await self._storage.execute_write(
@@ -1828,13 +1839,25 @@ class ConsolidationEngine:
             (related_to_decay,),
         )
 
-        # Then apply normal decay to all other synapses (exempt supersedes —
-        # provenance pointers that must never decay).
+        # Accelerated decay for "encoded-with" contextual bindings — these are
+        # session-temporal links that should fade faster than semantic links
+        # (Tulving encoding specificity: context drifts over time).
         await self._storage.execute_write(
             """
             UPDATE synapses
             SET strength = strength * ?
-            WHERE relationship NOT IN ('related-to', 'supersedes')
+            WHERE relationship = 'encoded-with'
+            """,
+            (encoded_with_decay,),
+        )
+
+        # Then apply normal decay to all other synapses (exempt supersedes —
+        # provenance pointers that must never decay, and already-decayed types).
+        await self._storage.execute_write(
+            """
+            UPDATE synapses
+            SET strength = strength * ?
+            WHERE relationship NOT IN ('related-to', 'encoded-with', 'supersedes')
             """,
             (base_decay,),
         )
@@ -1846,6 +1869,7 @@ class ConsolidationEngine:
             "action": "decay_synapses",
             "base_factor": base_decay,
             "related_to_factor": related_to_decay,
+            "encoded_with_factor": encoded_with_decay,
             "synapses_pruned_by_decay": pruned_by_decay,
         })
 
@@ -1853,9 +1877,10 @@ class ConsolidationEngine:
         result.pruned += pruned_by_decay
 
         logger.info(
-            "Synapse decay applied (base=%.2f, related-to=%.2f): %d pruned",
+            "Synapse decay applied (base=%.2f, related-to=%.2f, encoded-with=%.2f): %d pruned",
             base_decay,
             related_to_decay,
+            encoded_with_decay,
             pruned_by_decay,
         )
 

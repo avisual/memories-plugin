@@ -1243,10 +1243,11 @@ class TestContextualEncoding:
             "SELECT strength FROM synapses WHERE id = ?", (synapse_id,)
         )
         if rows:
-            # LTD fraction is 0.15 → would give 0.5 * 0.85 = 0.425.
-            # General decay alone would give ~0.5 * 0.95 = 0.475.
-            # If strength > 0.425, LTD was correctly excluded.
-            assert rows[0]["strength"] > 0.42, (
+            # LTD fraction is 0.15 → with LTD + encoded-with decay would give
+            # 0.5 * 0.85 * (0.95*0.85) ≈ 0.343.
+            # Encoded-with decay alone (no LTD) gives 0.5 * (0.95*0.85) ≈ 0.404.
+            # If strength > 0.35, LTD was correctly excluded.
+            assert rows[0]["strength"] > 0.35, (
                 f"encoded-with synapse should be excluded from LTD "
-                f"(got {rows[0]['strength']:.3f}, LTD would give ~0.425)"
+                f"(got {rows[0]['strength']:.3f}, LTD would give ~0.343)"
             )
