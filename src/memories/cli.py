@@ -51,26 +51,35 @@ _BASH_REAL_ERROR_SIGS: tuple[str, ...] = (
 def _format_atom_line(atom: dict[str, Any]) -> str:
     """Format a single atom for hook output injection.
 
-    Includes type, confidence, atom ID, and content.  Antipatterns
-    additionally show severity and "instead" fields when present.
+    Uses confidence-based framing (EmotionPrompt research: stronger
+    assertive language for high-confidence atoms shifts LLM attention
+    toward trusted knowledge).  Antipatterns use consequence framing
+    (BCSP research: behavioral consequence scenarios improve adherence).
     """
     content = atom.get("content", "")
     atom_type = atom.get("type", "unknown")
     confidence = atom.get("confidence", 1.0)
     atom_id = atom.get("id", "")
 
-    line = f"  [{atom_type}|{confidence:.1f}] {content}"
-    if atom_id:
-        line += f"  (id:{atom_id})"
-
-    # Structured antipattern metadata.
+    # Confidence-based framing: high-confidence atoms get assertive
+    # language, low-confidence atoms get hedging.
     if atom_type == "antipattern":
-        severity = atom.get("severity")
+        severity = atom.get("severity", "medium")
+        prefix = "KNOWN MISTAKE" if severity in ("high", "critical") else "warning"
+        line = f"  [{prefix}] {content}"
+        if atom_id:
+            line += f"  (id:{atom_id})"
         instead = atom.get("instead")
-        if severity:
-            line += f"\n    severity: {severity}"
         if instead:
             line += f"\n    instead: {instead}"
+    elif confidence >= 0.8:
+        line = f"  [{atom_type}] {content}"
+        if atom_id:
+            line += f"  (id:{atom_id})"
+    else:
+        line = f"  [{atom_type}|unverified] {content}"
+        if atom_id:
+            line += f"  (id:{atom_id})"
 
     return line
 
@@ -403,8 +412,8 @@ async def _hook_session_start(data: dict[str, Any]) -> str:
             atoms = result.get("atoms", [])
             if atoms:
                 lines = [
-                    f"[memories] {len(atoms)} recalled memories for {project}"
-                    " (verify before acting on stale information):"
+                    f"[memories] {len(atoms)} prior learnings for {project}"
+                    " — apply these to avoid repeating past mistakes:"
                 ]
                 for atom in atoms:
                     lines.append(_format_atom_line(atom))
@@ -508,15 +517,18 @@ async def _hook_prompt_submit(data: dict[str, Any]) -> str:
         lines = []
         if atoms:
             lines.append(
-                f"[memories] {len(atoms)} recalled memories"
-                " (verify before acting on stale information):"
+                f"[memories] {len(atoms)} prior learnings"
+                " — apply these to avoid repeating past mistakes:"
             )
             for atom in atoms:
                 lines.append(_format_atom_line(atom))
             lines.extend(_format_pathways(result.get("pathways", [])))
 
         if antipatterns:
-            lines.append(f"[memories] {len(antipatterns)} warnings:")
+            lines.append(
+                f"[memories] {len(antipatterns)} known pitfalls"
+                " — ignoring these has caused failures before:"
+            )
             for ap in antipatterns:
                 lines.append(_format_atom_line(ap))
 
@@ -1682,7 +1694,10 @@ async def _hook_pre_tool_use(data: dict[str, Any]) -> str:
                     if wid not in seen:
                         unique_warnings.append(w)
                         seen.add(wid)
-                output_lines.append(f"[memories] {len(unique_warnings)} relevant warnings:")
+                output_lines.append(
+                    f"[memories] {len(unique_warnings)} known pitfalls"
+                    " — ignoring these has caused failures before:"
+                )
                 for w in unique_warnings[:3]:  # cap at 3
                     output_lines.append(_format_atom_line(w))
 
