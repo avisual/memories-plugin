@@ -589,11 +589,17 @@ async def _hook_post_tool(data: dict[str, Any]) -> str:
             # Calculate importance based on type and content
             importance = _calculate_importance(atom_type, content_summary, tool_name)
 
+            # For antipatterns, provide a default severity from the error
+            # signature so the atom is useful even when heuristic extraction
+            # in extract_antipattern_fields() finds no explicit keywords.
+            severity = _infer_error_severity(content_summary) if atom_type == "antipattern" else None
+
             remember_result = await brain.remember(
                 content=content_summary[:800],
                 type=atom_type,
                 source_project=project,
                 importance=importance,
+                severity=severity,
             )
             new_atom_id = remember_result.get("atom_id")
 
@@ -801,6 +807,30 @@ def _infer_atom_type(
         return "experience"
 
     return "fact"
+
+
+def _infer_error_severity(content: str) -> str:
+    """Infer a default severity from error content when type is antipattern.
+
+    Assigns severity based on the error signature so auto-captured tool failures
+    get meaningful severity even when ``extract_antipattern_fields`` heuristics
+    find no explicit keyword.  The brain's ``remember()`` only calls the heuristic
+    extractor when severity is ``None``, so explicit values here take precedence.
+    """
+    lower = content.lower()
+    # Permission/security errors are high severity.
+    if any(sig in lower for sig in ("permission denied", "access denied", "unauthorized", "forbidden")):
+        return "high"
+    # Data loss risks are high severity.
+    if any(sig in lower for sig in ("rm -rf", "drop table", "delete from", "truncate")):
+        return "high"
+    # Python tracebacks are medium severity — they indicate code bugs.
+    if "traceback (most recent call last)" in lower:
+        return "medium"
+    # Missing dependencies or commands are medium.
+    if any(sig in lower for sig in ("command not found", "module not found", "no such file")):
+        return "medium"
+    return "medium"
 
 
 def _calculate_importance(
@@ -1834,11 +1864,13 @@ async def _hook_post_tool_failure(data: dict[str, Any]) -> str:
             cwd = data.get("cwd", "")
             project = _project_name(cwd)
             importance = _calculate_importance(atom_type, content, tool_name)
+            severity = _infer_error_severity(content) if atom_type == "antipattern" else None
             result = await brain.remember(
                 content=content,
                 type=atom_type,
                 source_project=project,
                 importance=importance,
+                severity=severity,
             )
             new_atom_id = result.get("atom_id")
 
