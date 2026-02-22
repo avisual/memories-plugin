@@ -69,7 +69,7 @@ class TestFormatAtomLine:
     def test_basic_fact(self):
         atom = {"type": "fact", "confidence": 0.9, "id": 1, "content": "Python uses GIL"}
         line = _format_atom_line(atom)
-        assert "[fact|0.9]" in line
+        assert "[fact]" in line
         assert "Python uses GIL" in line
         assert "(id:1)" in line
 
@@ -80,8 +80,8 @@ class TestFormatAtomLine:
             "severity": "high", "instead": "Use ast.literal_eval",
         }
         line = _format_atom_line(atom)
-        assert "[antipattern|0.8]" in line
-        assert "severity: high" in line
+        assert "[KNOWN MISTAKE]" in line
+        assert "Don't use eval()" in line
         assert "instead: Use ast.literal_eval" in line
 
     def test_missing_id(self):

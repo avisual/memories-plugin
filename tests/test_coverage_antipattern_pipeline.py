@@ -205,8 +205,8 @@ class TestAntipatternFormattingEndToEnd:
         }
         line = _format_atom_line(atom)
 
-        assert "[antipattern|0.9]" in line
-        assert "severity: high" in line
+        assert "[KNOWN MISTAKE]" in line
+        assert "Never use rm -rf without checking path first" in line
         assert "instead: Use trash-put or mv to a staging directory" in line
         assert "(id:42)" in line
 
@@ -220,10 +220,10 @@ class TestAntipatternFormattingEndToEnd:
         }
         line = _format_atom_line(atom)
 
-        assert "[antipattern|0.7]" in line
+        assert "[warning]" in line
         assert "Watch out for race conditions" in line
-        # No severity/instead lines.
-        assert "severity:" not in line
+        # No instead line.
+        assert "instead:" not in line
 
     def test_high_severity_antipattern_stands_out(self):
         """Verify the high-severity antipattern format is visually distinct."""
@@ -239,5 +239,5 @@ class TestAntipatternFormattingEndToEnd:
 
         # All critical info should be present for the LLM to parse.
         assert "Never commit .env files" in line
-        assert "severity: critical" in line
+        assert "[KNOWN MISTAKE]" in line
         assert "instead: Add .env to .gitignore" in line
