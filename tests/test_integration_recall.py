@@ -877,12 +877,18 @@ class TestSupersessionRealEmbeddings:
         )
 
         # Seed a near-duplicate — identical except trailing phrase.
-        import asyncio
-        await asyncio.sleep(0.01)  # Ensure created_at is later.
         id2 = await seed_atom(
             "PostgreSQL VACUUM reclaims storage occupied by dead tuples "
             "after UPDATE and DELETE operations on the table",
             region="project:postgres",
+        )
+
+        # detect_supersedes requires atom.created_at > candidate.created_at.
+        # SQLite DEFAULT CURRENT_TIMESTAMP has second-level granularity, so both
+        # atoms may get the same created_at.  Force id2 to be strictly later.
+        await storage.execute_write(
+            "UPDATE atoms SET created_at = datetime(created_at, '+1 second') WHERE id = ?",
+            (id2,),
         )
 
         count = await learning.detect_supersedes(id2)
