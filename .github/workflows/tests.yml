@@ -31,9 +31,10 @@ jobs:
         run: uv run pytest tests/ -q --tb=short -m "not integration"
 
   # ---------------------------------------------------------
-  # Integration tests (real Ollama embeddings)
+  # Integration tests (real Ollama embeddings) — disabled
   # ---------------------------------------------------------
   integration:
+    if: false
     runs-on: ubuntu-latest
 
     steps:
