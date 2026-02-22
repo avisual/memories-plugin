@@ -1,8 +1,8 @@
 # Test Coverage Analysis & Hebbian Architecture Review
 
 **Date:** 2026-02-22
-**Overall Coverage:** 69% (5,075 statements, 1,561 missed)
-**Tests:** 1,044 passing across 43 test files
+**Overall Coverage:** 69% → **75%** after new tests (5,075 statements, 1,256 missed)
+**Tests:** 1,044 → **1,127** passing across 48 test files
 
 ---
 
@@ -233,9 +233,9 @@ After reviewing `retrieval.py`, `learning.py`, `synapses.py`, `consolidation.py`
 
 When an atom is recalled and then the user provides feedback or modifies related knowledge, the system doesn't update the atom's embedding or re-evaluate its synapses. Biological memory undergoes reconsolidation when re-activated — the act of retrieval makes a memory temporarily labile and subject to updating. Adding a lightweight reconsolidation check (re-run auto_link on high-confidence recalls) would improve graph quality over time.
 
-**M3 — Encoded-with synapses are not created**
+**M3 — ~~Encoded-with synapses are not created~~ CORRECTED: They ARE created**
 
-The `encoded-with` synapse type exists in the schema (`config.py:47`) with weight 0.2, but no code path creates these synapses. They're designed for contextual binding (encoding specificity principle — Tulving 1973) but are never populated. If atoms stored in the same session were linked with `encoded-with`, recall of one would weakly activate session-mates, implementing context-dependent retrieval beyond the current session priming.
+`brain.py:264-296` creates `encoded-with` synapses during `remember()` when `_current_session_id` is set. The CLI bridges this at `cli.py:351`. This is working correctly — session atoms get bidirectional `encoded-with` links at strength 0.15, capped to 10 per atom. No fix needed.
 
 #### Low Priority
 
@@ -283,4 +283,4 @@ All atoms in a session are treated equally for Hebbian learning. Biological memo
 
 11. **Test `backfill_transcripts()`** — Important for onboarding, currently 0% covered.
 
-12. **Create `encoded-with` synapses during session** — Implement the context binding mechanism.
+12. ~~**Create `encoded-with` synapses during session**~~ — Already implemented in `brain.py:264-296`.
