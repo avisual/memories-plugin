@@ -36,7 +36,12 @@ logger = logging.getLogger(__name__)
 
 mcp = FastMCP(
     "memories",
-    instructions="Brain-like memory system with spreading activation",
+    instructions=(
+        "Persistent memory system storing prior learnings from real experience. "
+        "Recalled memories are verified knowledge — prioritize them over guessing, "
+        "especially antipatterns which flag known mistakes. "
+        "Always recall before acting on a topic you may have encountered before."
+    ),
 )
 
 _brain = Brain()
@@ -642,7 +647,9 @@ async def stale_memories(
 async def debug(topic: str) -> str:
     """Use before debugging — recalls known antipatterns and error patterns for a topic."""
     return (
-        f"Before starting to debug '{topic}', call mcp__memories__recall with the query "
+        f"Checking past mistakes first is the most efficient debugging strategy — "
+        f"it prevents re-investigating already-solved issues. "
+        f"Call mcp__memories__recall with the query "
         f"'{topic} error antipattern bug' to surface known failure modes and solutions. "
         f"After resolving the issue, store the root cause and fix as an antipattern atom "
         f"using mcp__memories__remember so it is not investigated again."
@@ -653,10 +660,11 @@ async def debug(topic: str) -> str:
 async def architecture(topic: str) -> str:
     """Use before architectural decisions — recalls prior decisions and patterns."""
     return (
-        f"Before making architectural decisions about '{topic}', call "
-        f"mcp__memories__recall with '{topic} architecture decision pattern' to retrieve "
-        f"prior findings. Build on what is already known. After deciding, store the "
-        f"rationale as an insight atom using mcp__memories__remember."
+        f"Architectural decisions made without reviewing prior context risk repeating "
+        f"mistakes or contradicting existing design choices. "
+        f"Call mcp__memories__recall with '{topic} architecture decision pattern' to "
+        f"retrieve prior findings. Build on what is already known. After deciding, "
+        f"store the rationale as an insight atom using mcp__memories__remember."
     )
 
 
@@ -664,7 +672,8 @@ async def architecture(topic: str) -> str:
 async def onboard(project: str) -> str:
     """Use when starting work on a project — recalls everything known about it."""
     return (
-        f"To orient yourself on '{project}', call mcp__memories__recall with "
+        f"Starting without context leads to avoidable errors and duplicated effort. "
+        f"Call mcp__memories__recall with "
         f"region='project:{project}' and queries for 'architecture', 'known issues', "
         f"and 'conventions'. Review the returned atoms before writing any code."
     )
@@ -674,7 +683,8 @@ async def onboard(project: str) -> str:
 async def review(project: str) -> str:
     """Use before code review — recalls project conventions, antipatterns and decisions."""
     return (
-        f"Before reviewing code in '{project}', call mcp__memories__recall with "
+        f"Effective review catches issues that have occurred before in this project. "
+        f"Call mcp__memories__recall with "
         f"region='project:{project}' and query 'antipattern convention decision' to "
         f"surface known issues to check for. After review, store any new findings."
     )
