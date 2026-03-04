@@ -1,0 +1,49 @@
+avisual memories
+Copyright 2026 avisual
+
+This product includes software developed by third parties.
+
+---
+
+MCP (Model Context Protocol)
+Copyright Anthropic, PBC
+Licensed under the MIT License
+https://github.com/modelcontextprotocol/python-sdk
+
+sqlite-vec
+Copyright Alex Garcia
+Licensed under the MIT License
+https://github.com/asg017/sqlite-vec
+
+Ollama Python Client
+Copyright Ollama
+Licensed under the MIT License
+https://github.com/ollama/ollama-python
+
+httpx
+Copyright Encode OSS Ltd.
+Licensed under the BSD 3-Clause License
+https://github.com/encode/httpx
+
+anyio
+Copyright Alex Gronholm
+Licensed under the MIT License
+https://github.com/agronholm/anyio
+
+NumPy
+Copyright NumPy Developers
+Licensed under the BSD 3-Clause License
+https://github.com/numpy/numpy
+
+---
+
+Embedding Model
+
+This project uses Ollama to run local embedding models. The default model
+(nomic-embed-text) is developed by Nomic AI and licensed under the
+Apache License 2.0.
+
+nomic-embed-text
+Copyright Nomic AI
+Licensed under the Apache License 2.0
+https://huggingface.co/nomic-ai/nomic-embed-text-v1.5

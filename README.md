@@ -1,0 +1,642 @@
+# avisual memories
+
+[![Tests](https://github.com/avisual/memories-plugin/actions/workflows/tests.yml/badge.svg)](https://github.com/avisual/memories-plugin/actions/workflows/tests.yml)
+[![Install from source](https://img.shields.io/badge/install-from%20source-blue)](https://github.com/avisual/memories-plugin)
+[![Python 3.13+](https://img.shields.io/badge/python-3.13+-blue.svg)](https://www.python.org/downloads/)
+[![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
+[![Tests](https://img.shields.io/badge/tests-1097%20passing-success)](https://github.com/avisual/memories-plugin)
+
+> **The only AI memory system that prevents mistakes _before_ they happen.**
+
+> **Completely free and open source.** No API keys, no subscriptions, no paywall. Everything runs locally on your machine.
+
+A brain-like memory system for AI coding agents that gives them persistent, searchable long-term memory with neural-inspired retrieval — plus **antipatterns** that proactively warn agents when they're about to repeat past mistakes.
+
+Works with **any MCP-compatible client** — Claude Code, Cursor, Windsurf, VS Code (Copilot), Cline, and more. Instead of starting every conversation from scratch, memories recalls relevant context from past sessions — what you worked on, what went wrong, what patterns you use — and surfaces it when needed.
+
+See also [Nate B Jones](https://www.youtube.com/@NateBJones)' [similar approach to persistent AI memory](https://www.youtube.com/watch?v=2JiMmye2ezg).
+
+> **Early release (March 2026)** — this project is under active development. The `main` branch is the stable release; active development happens on the [`dev` branch](https://github.com/avisual/memories/tree/dev) in the [development repo](https://github.com/avisual/memories). Contributions, feedback, and issues are welcome.
+
+## Why avisual memories?
+
+Unlike basic RAG systems or commercial memory APIs, avisual memories is built like an actual brain:
+
+| Feature | avisual memories | Mem0 ($249/mo) | LangChain Memory | ChromaDB |
+|---------|------------------|----------------|------------------|----------|
+| **Antipatterns** (proactive warnings) | ✅ | ❌ | ❌ | ❌ |
+| Spreading activation (neural retrieval) | ✅ | ❌ | ❌ | ❌ |
+| Hebbian learning (auto-connection) | ✅ | ❌ | ❌ | ❌ |
+| Memory consolidation (decay/merge) | ✅ | ❌ | ❌ | ❌ |
+| Local-first (no API costs) | ✅ | ❌ | ✅ | ✅ |
+| Open source (Apache 2.0) | ✅ | ❌ | ✅ | ✅ |
+| Multi-agent memory sharing | ✅ | ✅ | ❌ | ❌ |
+| Works with any AI agent | ✅ | ✅ | ✅ | ✅ |
+
+**The antipatterns feature alone saves hours of debugging.** When your agent tries to repeat a mistake (like using `rm` instead of `trash`, or browser automation that got blocked), memories surfaces a warning _before_ the command runs.
+
+## How it works
+
+Memories stores knowledge as **atoms** (discrete facts, experiences, skills, antipatterns) connected by **synapses** (weighted relationships). Retrieval uses **spreading activation** — when you recall one memory, activation flows through connected memories like neural pathways, surfacing related knowledge you didn't explicitly search for.
+
+The system exposes a standard **MCP server** with 13 tools (remember, recall, connect, forget, amend, reflect, status, pathway, stats, create_task, update_task, list_tasks, stale_memories) that work with any MCP-compatible client.
+
+For **Claude Code** users, optional **hooks** provide deep integration — automatic context injection on every prompt, learning from tool outputs, Hebbian strengthening at session end, and sub-agent memory propagation. Hooks are Claude Code-specific; the MCP tools work everywhere.
+
+### Architecture
+
+```
+┌─────────────────────────────────────────────────┐
+│              Any MCP Client                      │
+│  Claude Code · Cursor · Windsurf · VS Code · …  │
+│                                                  │
+│  MCP Tools: remember, recall, connect, forget,   │
+│    amend, reflect, status, pathway, stats,        │
+│    create_task, update_task, list_tasks,           │
+│    stale_memories                                  │
+│                                                  │
+│  Claude Code only (optional):                    │
+│    Hooks ──→ auto-recall, learn from errors,     │
+│              Hebbian learning, sub-agent merge    │
+└──────────────────────┬──────────────────────────┘
+                       │ MCP (stdio)
+┌──────────────────────▼──────────────────────────┐
+│                 memories server                   │
+│                                                  │
+│  Brain ──→ Retrieval (spreading activation)      │
+│        ──→ Learning (Hebbian, auto-linking,      │
+│             supersession, novelty gating)         │
+│        ──→ Consolidation (decay, merge, prune,   │
+│             LTD, STC, abstraction, feedback)      │
+│        ──→ Context (budget compression)          │
+│                                                  │
+│  Storage: SQLite + sqlite-vec + FTS5             │
+│  Embeddings: Ollama (nomic-embed-text, 768-dim)  │
+└─────────────────────────────────────────────────┘
+```
+
+### Learning pipeline
+
+When you `remember()` an atom, the learning engine automatically:
+
+- **Auto-links** — vector search finds related atoms and creates typed synapses (`related-to`, `caused-by`, `elaborates`, `warns-against`, `contradicts`)
+- **Detects supersession** — near-duplicate atoms (>0.9 similarity, same type) get a `supersedes` synapse; the older atom's confidence is reduced
+- **Gates novelty** — hooks check whether incoming content is genuinely new before storing, avoiding redundant atoms
+- **Suggests regions** — infers the best region from project context, keyword matching, or majority vote of similar atoms
+
+### Consolidation (reflect)
+
+Calling `reflect()` runs a full consolidation cycle — 16 operations modelled on biological memory consolidation:
+
+| Phase | Operations |
+|-------|-----------|
+| **Tune** | Auto-tune retrieval scoring weights based on feedback signals |
+| **Reclassify** | Fix misclassified antipatterns; apply user feedback (good/bad) |
+| **Resolve** | Settle contradiction pairs; reconsolidate superseded atoms |
+| **Decay** | Reduce confidence of stale atoms and synapse strengths |
+| **Prune** | Remove weak synapses, stale warns-against links, dormant connections |
+| **LTD & STC** | Long-term depression for unactivated synapses; expire STC tags |
+| **Abstract** | Cluster similar experiences into semantic summary atoms |
+| **Merge** | Unify exact and near-duplicate atoms (hash-based then embedding-based) |
+| **Promote** | Boost confidence of frequently accessed atoms |
+
+## Quick Start
+
+### Install from Source
+
+```bash
+# 1. Clone and install
+git clone https://github.com/avisual/memories-plugin.git
+cd memories-plugin
+uv sync
+
+# 2. Run interactive setup
+uv run python -m memories setup --interactive
+```
+
+The setup wizard will:
+- ✓ Check if Ollama is installed (and tell you how to install it)
+- ✓ Start Ollama daemon if needed (with your permission)
+- ✓ Download the embedding model (with your permission)
+- ✓ Create the database directory
+- ✓ Register the MCP server in Claude Code (with your permission)
+- ✓ Optionally configure hooks for Claude Code deep integration
+- ✓ Run a health check
+
+Start a new session in your MCP client and memories will be active!
+
+## Tell Your AI Agent to Install This
+
+**Copy and paste this prompt to Claude Code (or any AI coding agent):**
+
+```
+Install the memories MCP server for me. Run these commands:
+
+1. Clone: git clone https://github.com/avisual/memories-plugin.git && cd memories-plugin && uv sync
+2. Install Ollama if needed: brew install ollama && ollama serve &
+3. Pull embedding model: ollama pull nomic-embed-text
+4. Run setup: uv run python -m memories setup --non-interactive
+5. Verify: uv run python -m memories diagnose
+
+Then restart and I'll have persistent memory!
+```
+
+This gives the agent explicit commands to run - no ambiguity, no recursion.
+
+## Installation
+
+### Prerequisites
+
+- **Python 3.13+**
+- **[uv](https://docs.astral.sh/uv/)** — Python package manager
+- **[Ollama](https://ollama.ai/)** — local embedding model server
+- **Any MCP client** — [Claude Code](https://docs.anthropic.com/en/docs/claude-code), [Cursor](https://cursor.sh), [Windsurf](https://codeium.com/windsurf), VS Code with Copilot, [Cline](https://github.com/cline/cline), or any other MCP-compatible environment
+
+### 1. Clone and install
+
+```bash
+git clone https://github.com/avisual/memories-plugin.git
+cd memories-plugin
+uv sync
+```
+
+### 2. Run setup
+
+```bash
+# Interactive setup with prompts
+uv run python -m memories setup
+
+# Non-interactive setup (automated)
+uv run python -m memories setup --non-interactive
+```
+
+### 3. Verify installation
+
+```bash
+# Run diagnostics
+uv run python -m memories diagnose
+
+# Or run health check
+uv run python -m memories health
+```
+
+You should see all components marked as `[ok]`.
+
+### Manual Setup (Alternative)
+
+If you prefer manual configuration, follow these steps:
+
+#### Install and start Ollama
+
+```bash
+# macOS
+brew install ollama
+ollama serve &
+
+# Pull the embedding model
+ollama pull nomic-embed-text
+```
+
+#### Verify the installation
+
+```bash
+uv run python -m memories health
+```
+
+You should see:
+
+```
+memories health check:
+  atoms: 0
+  synapses: 0
+  regions: 0
+  db_size: 0.05 MB
+  ollama: healthy
+  model: nomic-embed-text
+```
+
+#### Register the MCP server
+
+Add to your MCP client's configuration. The server command is the same for all clients:
+
+**Claude Code** (`~/.claude.json`):
+```json
+{
+  "mcpServers": {
+    "memories": {
+      "type": "stdio",
+      "command": "/path/to/memories-plugin/.venv/bin/python",
+      "args": ["-m", "memories"]
+    }
+  }
+}
+```
+
+**Cursor** (Settings → MCP → Add Server):
+```json
+{
+  "memories": {
+    "command": "/path/to/memories-plugin/.venv/bin/python",
+    "args": ["-m", "memories"]
+  }
+}
+```
+
+**VS Code / Cline** (`.vscode/mcp.json` or Cline MCP settings):
+```json
+{
+  "servers": {
+    "memories": {
+      "command": "/path/to/memories-plugin/.venv/bin/python",
+      "args": ["-m", "memories"]
+    }
+  }
+}
+```
+
+Replace `/path/to/memories-plugin` with your actual clone path.
+
+#### Configure hooks (Claude Code only)
+
+For Claude Code users, add to your `~/.claude/settings.json`:
+
+```json
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/path/to/memories/.venv/bin/python -m memories hook prompt-submit",
+            "timeout": 15
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Bash|Write|Edit|MultiEdit|NotebookEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/path/to/memories/.venv/bin/python -m memories hook post-tool",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/path/to/memories/.venv/bin/python -m memories hook stop",
+            "timeout": 30
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+Replace `/path/to/memories` with your actual clone path.
+
+#### Start a new session
+
+The memory system is now active. In Claude Code with hooks, relevant memories are automatically recalled and injected on each prompt. In other MCP clients, use the `recall` tool to search memories and `remember` to store them.
+
+## MCP Tools
+
+Once registered, your AI agent can use these tools directly in any MCP client:
+
+| Tool | Description |
+|------|-------------|
+| `remember` | Store a new memory atom. Auto-creates synaptic connections to related memories. |
+| `recall` | Search memories using semantic similarity with spreading activation. |
+| `connect` | Create or strengthen a connection between two memories. |
+| `forget` | Soft-delete (recoverable) or hard-delete a memory. |
+| `amend` | Update an existing memory. Re-embeds and re-links if content changes. |
+| `reflect` | Run memory consolidation — decay, prune, merge, promote, and more. Like sleep. |
+| `status` | Get system health: atom/synapse counts, regions, DB size, Ollama status. |
+| `pathway` | Visualize the connection graph radiating from a specific memory. |
+| `stats` | Hook invocation statistics, relevance scores, latency breakdowns. |
+| `create_task` | Create a task atom with lifecycle tracking (pending/in_progress/completed). |
+| `update_task` | Update task status; optionally flags linked memories as stale. |
+| `list_tasks` | List task atoms with optional status and region filters. |
+| `stale_memories` | Find memories linked to completed tasks that may be outdated. |
+
+## Hooks (Claude Code only)
+
+Hooks provide deep integration with Claude Code — automatic recall, learning from errors, and Hebbian strengthening. They're optional; the MCP tools work without them in any client. If you use a different MCP client, you get the full tool suite but without automatic background learning.
+
+Hooks run automatically during Claude Code sessions:
+
+| Hook | Event | What it does |
+|------|-------|-------------|
+| `session-start` | SessionStart | Initializes brain, starts session, recalls project-specific memories |
+| `prompt-submit` | UserPromptSubmit | Recalls relevant memories (project-scoped + cross-project) and injects them as context before every prompt |
+| `pre-tool` | PreToolUse | Recalls antipattern warnings before Bash/Task execution; captures intent as atoms |
+| `post-tool` | PostToolUse | Learns from Bash errors, file edits, and tool outputs (novelty-gated before storing) |
+| `post-tool-failure` | PostToolUseFailure | Captures tool failures as antipatterns or experiences |
+| `stop` | Stop | Reads session transcript, applies Hebbian learning, propagates sub-agent atoms to parent session |
+| `subagent-stop` | SubagentStop | Same as stop — runs in sub-agent (Task) sessions and merges atoms into the parent's learning graph |
+| `subagent-start` | SubagentStart | Captures sub-agent delegation patterns as insights |
+| `pre-compact` | PreCompact | Checkpoints Hebbian learning mid-session so atoms aren't lost if context compacts before stop fires |
+| `session-end` | SessionEnd | Safety net: final Hebbian pass if Stop hook was missed |
+| `permission-request` | PermissionRequest | Records permission requests (antipattern if dangerous, else experience) |
+| `task-completed` | TaskCompleted | Records task completion milestones as experience atoms |
+| `notification` | Notification | Captures elicitation dialog notifications (user clarification requests) |
+
+### Sub-agent learning
+
+When Claude Code spawns sub-agents (via the Task tool), each sub-agent runs its own `stop` hook. Memories detects the parent session automatically (by project + recency) and merges the sub-agent's atoms into the parent's co-activation graph. The parent's final `stop` then runs one consolidated Hebbian pass linking everything together.
+
+## Configuration
+
+All settings use environment variables with the `MEMORIES_` prefix:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `MEMORIES_OLLAMA_URL` | `http://localhost:11434` | Ollama server URL |
+| `MEMORIES_EMBEDDING_MODEL` | `nomic-embed-text` | Embedding model name |
+| `MEMORIES_EMBEDDING_DIMS` | `768` | Embedding dimensions |
+| `MEMORIES_DB_PATH` | `~/.memories/memories.db` | Database file path |
+| `MEMORIES_CONTEXT_WINDOW_TOKENS` | `200000` | Model context window size |
+| `MEMORIES_HOOK_BUDGET_PCT` | `0.02` | Default hook injection budget (% of context window). Session-start uses 3%, prompt-submit 2%, pre-tool 0.5%. |
+| `MEMORIES_DEDUP_THRESHOLD` | `0.92` | Cosine similarity above which a new atom is skipped as a near-duplicate |
+| `MEMORIES_REGION_DIVERSITY_CAP` | `2` | Maximum atoms per project returned in a single retrieval pass |
+| `MEMORIES_DISTILL_THINKING` | `false` | Use a local LLM to extract atomic facts from Claude thinking blocks |
+| `MEMORIES_DISTILL_MODEL` | `llama3.2:3b` | Ollama model used for fact extraction (any generative model works) |
+
+Nested config uses double underscores:
+
+```bash
+# Change spreading activation depth
+export MEMORIES_RETRIEVAL__SPREAD_DEPTH=3
+
+# Change Hebbian learning increment
+export MEMORIES_LEARNING__HEBBIAN_INCREMENT=0.1
+```
+
+### Atomic fact extraction (optional)
+
+When `MEMORIES_DISTILL_THINKING=true`, the stop hook uses a local Ollama generative model to extract 2–5 discrete facts from each Claude thinking block, storing each as a separate atom. This produces a denser, more precisely-linked memory graph at the cost of additional Ollama inference time.
+
+```bash
+# Enable with default model (llama3.2:3b)
+ollama pull llama3.2:3b
+export MEMORIES_DISTILL_THINKING=true
+
+# Or use a different model
+export MEMORIES_DISTILL_MODEL=mistral:7b
+```
+
+## CLI Commands
+
+Run `python -m memories <command>` (or `uv run python -m memories <command>` from source):
+
+| Command | Description |
+|---------|-------------|
+| `setup` | Interactive or non-interactive setup wizard |
+| `health` | Quick health check (DB, Ollama, model) |
+| `diagnose` | Full diagnostics across all components |
+| `stats` | Session stats, hook performance, top atoms, latency |
+| `eval` | Show exactly what Claude sees for a given prompt (dry-run hook injection) |
+| `feedback` | Mark a recalled atom as good or bad (`feedback <atom_id> good\|bad`) |
+| `backfill` | Scan all `~/.claude/projects/` transcripts and store novel insights as atoms. Auto-relinks the graph when done. Safe to run repeatedly. |
+| `relink` | Re-run `auto_link` for every atom to fill any missing synapses. Idempotent — existing synapses are strengthened, not duplicated. |
+| `normalise` | Rename fragmented region aliases to canonical names (e.g. merges `general`, `project:git` → `project:utils`). |
+| `reatomise` | Split large blob atoms into 2–5 atomic facts using a local LLM, soft-delete the originals, then auto-relink the graph. Requires Ollama. |
+| `migrate` | Import atoms from a legacy claude-mem database |
+
+### Verifying injection
+
+To see exactly what memories are injected for a given prompt:
+
+```bash
+echo '{"session_id":"x","prompt":"YOUR QUESTION","cwd":"'$(pwd)'"}' | \
+  python -m memories hook prompt-submit
+```
+
+### Backfilling historical transcripts
+
+```bash
+# Basic backfill (novelty-gated, safe to re-run)
+python -m memories backfill
+
+# With verbose output and LLM fact extraction
+MEMORIES_DISTILL_THINKING=true python -m memories backfill --verbose
+```
+
+### Maintaining graph quality
+
+```bash
+# After a backfill, fix any region fragmentation:
+python -m memories normalise --verbose
+
+# Split large blob atoms into atomic facts (requires Ollama):
+python -m memories reatomise --verbose
+
+# Re-wire the whole graph (runs auto_link for every atom):
+python -m memories relink --verbose
+```
+
+## Memory Types
+
+| Type | Description |
+|------|-------------|
+| `fact` | A verified piece of knowledge |
+| `experience` | Something learned from practice |
+| `skill` | A how-to or technique |
+| `preference` | A personal or project preference |
+| `insight` | A derived observation or conclusion |
+| `antipattern` | A known mistake to avoid (surfaced as warnings during recall) |
+| `task` | A tracked task with lifecycle (pending → in_progress → completed) |
+
+## Data Storage
+
+All data is stored locally in `~/.memories/`:
+
+- `memories.db` — SQLite database with sqlite-vec for vector search and FTS5 for keyword search
+- `backups/` — Automatic backups (configurable count, default 5)
+
+No data leaves your machine. Embeddings are generated locally via Ollama.
+
+## Migration from claude-mem
+
+If you have existing observations from the [claude-mem](https://github.com/thedotmack/claude-mem) plugin:
+
+```bash
+uv run python -m memories migrate --source ~/.claude-mem/claude-mem.db
+```
+
+Use `--dry-run` to preview without making changes.
+
+## Development
+
+```bash
+# Install with dev dependencies
+uv sync --group dev
+
+# Run unit tests (no external services needed)
+uv run pytest -m "not integration"
+
+# Run a specific test file
+uv run pytest tests/test_retrieval.py
+
+# Health check
+uv run python -m memories health
+```
+
+### Integration tests
+
+Integration tests run against a real Ollama server with `nomic-embed-text` and
+are executed automatically in CI. To run them locally:
+
+```bash
+# Start Ollama and pull the embedding model
+ollama serve &
+ollama pull nomic-embed-text
+
+# Run integration tests only
+uv run pytest -m integration -v
+
+# Run everything (unit + integration)
+uv run pytest
+```
+
+The integration suite (`tests/test_integration_recall.py`) covers:
+
+- **Embedding quality** — dimensionality, cache consistency, semantic similarity
+- **Vector & FTS search** — relevance ranking, latency
+- **Full recall pipeline** — spreading activation, antipattern surfacing, region filters
+- **Learning pipeline** — auto_link synapse creation, supersession detection, warns-against
+- **Consolidation** — near-duplicate merging with real embedding similarity
+- **Dedup** — pre-insertion deduplication in `remember()`
+- **Batch operations** — batch vs single embedding consistency, vector updates
+- **Larger graph recall** — 15-atom, 3-cluster graph with cross-cluster hub activation
+
+Tests are auto-skipped when Ollama is unavailable.
+
+## Troubleshooting
+
+### Multi-window support
+
+Multiple MCP client windows can share memories simultaneously. Each window spawns its own server process; they all access the same `~/.memories/memories.db` safely via SQLite WAL mode.
+
+To see how many servers are running:
+```bash
+uv run python -m memories diagnose
+```
+
+### "Ollama server unreachable"
+
+Make sure Ollama is running:
+```bash
+# Check if Ollama is running
+curl http://localhost:11434/api/tags
+
+# Start Ollama manually
+ollama serve
+
+# Or as a service (macOS)
+brew services start ollama
+```
+
+### "Model not found: nomic-embed-text"
+
+Pull the embedding model:
+```bash
+ollama pull nomic-embed-text
+```
+
+### "Health check failed"
+
+Run full diagnostics:
+```bash
+uv run python -m memories diagnose
+```
+
+This will check:
+- MCP server status
+- Ollama installation and daemon
+- Required model availability
+- Database health
+- Configuration files
+
+### Database issues
+
+If you encounter database corruption or lock issues:
+
+```bash
+# Check database status
+uv run python -m memories health
+
+# Backup and reset (WARNING: deletes all memories)
+mv ~/.memories/memories.db ~/.memories/memories.db.backup
+uv run python -m memories health  # Creates fresh DB
+```
+
+### Uninstall
+
+To remove memories from Claude Code configuration (other MCP clients: remove the server entry from your MCP settings):
+```bash
+uv run python -m memories setup --uninstall
+```
+
+This removes MCP server registration and hooks but keeps your `~/.memories/` data directory. To delete all data:
+```bash
+rm -rf ~/.memories/
+```
+
+### Getting Help
+
+- Check diagnostics: `uv run python -m memories diagnose`
+- View stats: `uv run python -m memories stats`
+- Check health: `uv run python -m memories health`
+- Open an issue: https://github.com/avisual/memories-plugin/issues
+
+## Documentation
+
+- **[Getting Started Guide](https://avisual.github.io/memories/getting-started/)** - Installation and setup
+- **[Antipatterns Deep Dive](https://avisual.github.io/memories/concepts/antipatterns/)** - How mistake prevention works
+- **[Spreading Activation](https://avisual.github.io/memories/concepts/spreading-activation/)** - Neural-inspired retrieval explained
+- **[API Reference](https://avisual.github.io/memories/api/)** - MCP tools documentation
+- **[Best Practices](https://avisual.github.io/memories/guides/best-practices/)** - Tips for effective memory management
+
+## Contributing
+
+Contributions welcome! Please:
+1. Fork the repo
+2. Create a feature branch
+3. Add tests for new features
+4. Ensure all tests pass: `uv run pytest`
+5. Submit a PR
+
+## Acknowledgments
+
+This project builds on excellent open-source work:
+
+| Project | By | License | Role |
+|---------|----|---------|----- |
+| [MCP Python SDK](https://github.com/modelcontextprotocol/python-sdk) | Anthropic | MIT | Model Context Protocol server framework |
+| [sqlite-vec](https://github.com/asg017/sqlite-vec) | Alex Garcia | MIT | Vector similarity search in SQLite |
+| [Ollama](https://github.com/ollama/ollama) | Ollama | MIT | Local model serving |
+| [nomic-embed-text](https://huggingface.co/nomic-ai/nomic-embed-text-v1.5) | Nomic AI | Apache-2.0 | Default embedding model |
+| [httpx](https://github.com/encode/httpx) | Encode | BSD-3 | Async HTTP client |
+| [NumPy](https://github.com/numpy/numpy) | NumPy Developers | BSD-3 | Vector operations |
+
+See [NOTICE](NOTICE) for full attribution details.
+
+## License
+
+Apache 2.0 - see [LICENSE](LICENSE) file for details.
+
+## Links
+
+- **Documentation**: https://avisual.github.io/memories/
+- **GitHub**: https://github.com/avisual/memories-plugin
+- **Issues**: https://github.com/avisual/memories-plugin/issues
+- **Changelog**: [CHANGELOG.md](CHANGELOG.md)

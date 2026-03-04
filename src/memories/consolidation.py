@@ -1,0 +1,3529 @@
+"""Memory consolidation: decay, pruning, merging, and promotion.
+
+The **consolidation engine** implements the brain-like "sleep" maintenance
+cycle for the memory graph.  When :meth:`ConsolidationEngine.reflect` is
+called it runs a sequence of operations that mirror biological memory
+consolidation:
+
+1. **Decay** -- atoms not accessed within a configurable window have their
+   confidence reduced (analogous to forgetting curves).  Synapse strengths
+   are similarly decayed by a multiplicative factor.
+2. **Prune** -- synapses whose post-decay strength falls below a threshold
+   are deleted, removing dead pathways from the graph.
+3. **Merge** -- near-duplicate atoms (very high embedding similarity, same
+   type) are unified into a single canonical atom.  Tags are merged, synapses
+   are redirected, and a ``supersedes`` link records provenance.
+4. **Promote** -- frequently accessed atoms receive a confidence boost,
+   cementing them as core memories.
+
+All mutations can be previewed via the ``dry_run`` parameter, and every
+significant action is logged to the ``consolidation_log`` table for
+auditability.
+
+Usage::
+
+    from memories.consolidation import ConsolidationEngine
+
+    engine = ConsolidationEngine(storage, embeddings, atoms, synapses)
+    result = await engine.reflect(dry_run=True)
+    print(result)
+
+    # Actually apply
+    result = await engine.reflect()
+"""
+
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import json
+import logging
+import math
+import sqlite3
+import uuid
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
+from typing import Any
+
+from memories.atoms import Atom, AtomManager
+from memories.config import get_config
+from memories.embeddings import EmbeddingEngine
+from memories.storage import Storage
+from memories.synapses import SynapseManager
+
+
+def _content_signature(content: str) -> str:
+    """Generate a normalized signature for duplicate detection.
+
+    Strips whitespace, lowercases, and hashes the content to quickly
+    identify exact or near-exact duplicates before expensive embedding
+    comparisons.
+    """
+    normalized = " ".join(content.lower().split())
+    return hashlib.sha256(normalized.encode()).hexdigest()[:16]
+
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Confidence floor -- atoms never decay below this value automatically.
+# Explicit forget (soft_delete) can still set confidence to 0.
+# ---------------------------------------------------------------------------
+
+_CONFIDENCE_FLOOR: float = 0.1
+"""Minimum confidence that automatic decay will reduce an atom to.
+
+This ensures that atoms are never silently obliterated by the background
+decay process alone.  A human or explicit ``forget()`` call is required
+to fully remove a memory."""
+
+
+# ---------------------------------------------------------------------------
+# ConsolidationResult
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class ConsolidationResult:
+    """Summary of a single consolidation cycle.
+
+    Attributes
+    ----------
+    merged:
+        Number of atom pairs that were merged (duplicates removed).
+    decayed:
+        Number of atoms whose confidence was reduced.
+    pruned:
+        Number of synapses pruned (deleted) because their strength fell
+        below the configured threshold.
+    promoted:
+        Number of atoms that received a confidence boost.
+    compressed:
+        Reserved for future content compression (currently unused).
+    details:
+        List of per-action detail dicts for logging and debugging.
+    dry_run:
+        Whether this was a preview run (no database mutations).
+    """
+
+    merged: int = 0
+    decayed: int = 0
+    pruned: int = 0
+    promoted: int = 0
+    compressed: int = 0
+    reclassified: int = 0
+    categorised: int = 0
+    ltd: int = 0
+    feedback_adjusted: int = 0
+    abstracted: int = 0
+    resolved: int = 0
+    reconsolidated: int = 0
+    distilled: int = 0
+    patterns_detected: int = 0
+    rejection_patterns_learned: int = 0
+    details: list[dict[str, Any]] = field(default_factory=list)
+    dry_run: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialise the result to a plain dict for MCP tool responses.
+
+        Returns
+        -------
+        dict[str, Any]
+            All counters plus the detail log.
+        """
+        return {
+            "merged": self.merged,
+            "decayed": self.decayed,
+            "pruned": self.pruned,
+            "promoted": self.promoted,
+            "compressed": self.compressed,
+            "reclassified": self.reclassified,
+            "categorised": self.categorised,
+            "ltd": self.ltd,
+            "feedback_adjusted": self.feedback_adjusted,
+            "abstracted": self.abstracted,
+            "resolved": self.resolved,
+            "reconsolidated": self.reconsolidated,
+            "distilled": self.distilled,
+            "patterns_detected": self.patterns_detected,
+            "rejection_patterns_learned": self.rejection_patterns_learned,
+            "dry_run": self.dry_run,
+            "details": self.details,
+        }
+
+
+# ---------------------------------------------------------------------------
+# ConsolidationEngine
+# ---------------------------------------------------------------------------
+
+
+class ConsolidationEngine:
+    """Brain-like consolidation engine for the memory graph.
+
+    Runs periodic maintenance that decays stale memories, prunes weak
+    connections, merges near-duplicates, and promotes frequently accessed
+    atoms.
+
+    Parameters
+    ----------
+    storage:
+        An initialised :class:`~memories.storage.Storage` instance.
+    embeddings:
+        An initialised :class:`~memories.embeddings.EmbeddingEngine` for
+        vector similarity operations.
+    atoms:
+        An :class:`~memories.atoms.AtomManager` for atom CRUD.
+    synapses:
+        A :class:`~memories.synapses.SynapseManager` for synapse CRUD,
+        decay, and pruning.
+    """
+
+    def __init__(
+        self,
+        storage: Storage,
+        embeddings: EmbeddingEngine,
+        atoms: AtomManager,
+        synapses: SynapseManager,
+    ) -> None:
+        self._storage = storage
+        self._embeddings = embeddings
+        self._atoms = atoms
+        self._synapses = synapses
+        self._cfg = get_config().consolidation
+        cfg = get_config()
+        self._ollama_url = cfg.ollama_url
+        self._distill_model = cfg.distill_model
+        self._distill_enabled = cfg.distill_thinking
+        self._llm_client = None  # lazily created in _distill_cluster()
+        self.__learning_engine = None  # L-5: lazy singleton, not per-method
+
+    @property
+    def _learning_engine(self):
+        """Lazy-create a shared LearningEngine (L-5: avoids per-method construction)."""
+        if self.__learning_engine is None:
+            from memories.learning import LearningEngine
+            self.__learning_engine = LearningEngine(
+                self._storage, self._embeddings, self._atoms, self._synapses
+            )
+        return self.__learning_engine
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    async def reflect(
+        self,
+        scope: str = "all",
+        dry_run: bool = False,
+    ) -> ConsolidationResult:
+        """Run a full consolidation cycle.  Like sleep for the brain.
+
+        Operations are executed in a deliberate order:
+
+        1. **Decay atoms** -- reduce confidence of stale atoms.
+        2. **Decay synapses** -- multiplicative strength reduction.
+        3. **Prune synapses** -- remove weak connections.
+        4. **Merge duplicates** -- unify near-identical atoms.
+        5. **Promote strong** -- boost frequently accessed atoms.
+        6. **Log** -- write a summary to ``consolidation_log``.
+
+        Parameters
+        ----------
+        scope:
+            ``"all"`` to process every atom, or a region name to limit
+            processing to atoms in that region.
+        dry_run:
+            If ``True`` the engine computes what *would* happen without
+            writing any mutations to the database.  Useful for previewing
+            the impact of a consolidation cycle.
+
+        Returns
+        -------
+        ConsolidationResult
+            Aggregate counts and per-action detail log.
+        """
+        result = ConsolidationResult(dry_run=dry_run)
+        holder = uuid.uuid4().hex
+
+        # Acquire advisory lock to prevent concurrent consolidation.
+        def _try_lock(conn: sqlite3.Connection) -> bool:
+            return Storage.try_acquire_lock(conn, "consolidation", holder)
+
+        acquired = await self._storage.execute_transaction(_try_lock)
+        if not acquired:
+            logger.warning("Consolidation already in progress; skipping")
+            return result
+
+        try:
+            await self._tune_retrieval_weights(result)
+            await self._reclassify_antipatterns(result)
+            await self._classify_uncategorised_antipatterns(result)
+            await self._distill_oversized_atoms(result)
+            await self._apply_feedback_signals(result)
+            await self._resolve_contradictions(result)
+            await self._reconsolidate_superseded(result)
+            # Decay is rate-limited to once per ~20h. Time-proportional
+            # factors ensure correct total decay even if consolidation runs
+            # multiple times per day — dry_run reports stats without writing.
+            decay_due = dry_run or await self._should_run_decay()
+            if decay_due:
+                await self._decay_atoms(result, scope)
+                await self._decay_synapses(result)
+                await self._apply_ltd(result)
+            elif not dry_run:
+                logger.info(
+                    "Decay skipped: last run was < %dh ago",
+                    self._cfg.decay_min_interval_hours,
+                )
+                result.details.append({
+                    "action": "decay_skipped",
+                    "reason": "rate_limited",
+                })
+            # Pruning always runs — cleans up synapses weakened by prior cycles.
+            await self._prune_synapses(result)
+            await self._prune_stale_warns_against(result)
+            await self._prune_dormant_synapses(result)
+            await self._expire_stc_tags(result)
+            # Integrate hub atom cleanup to cap over-connected nodes.
+            if not dry_run:
+                hub_cleaned = await self._synapses.cleanup_hub_atoms()
+                if hub_cleaned:
+                    result.pruned += hub_cleaned
+                    result.details.append({"action": "hub_cleanup", "synapses_deleted": hub_cleaned})
+                outbound_cleaned = await self._synapses.cleanup_hub_atoms_outbound()
+                if outbound_cleaned:
+                    result.pruned += outbound_cleaned
+                    result.details.append({"action": "hub_cleanup_outbound", "synapses_deleted": outbound_cleaned})
+            await self._abstract_experiences(result, scope)
+            await self._detect_error_patterns(result, scope)
+            # First pass: merge exact duplicates (fast, hash-based)
+            await self._merge_exact_duplicates(result, scope)
+            # Second pass: merge near-duplicates (slower, embedding-based)
+            await self._merge_duplicates(result, scope)
+            await self._promote_strong(result, scope)
+
+            # Learn new rejection patterns from accumulated junk.
+            await self._learn_from_rejections(result)
+
+            # Auto-generate SKILL.md for mature project regions.
+            if (scope == "all" or scope.startswith("project:")) and self._cfg.skill_gen_min_atoms > 0:
+                skill_results = await self._maybe_generate_skills(dry_run=dry_run)
+                generated = [p for p, actions in skill_results.items() if "generated" in actions]
+                if generated:
+                    result.details.append({
+                        "action": "auto_skill_gen",
+                        "projects": generated,
+                    })
+
+            if not dry_run:
+                await self._log_consolidation(result)
+        finally:
+            def _release(conn: sqlite3.Connection) -> None:
+                Storage.release_lock(conn, "consolidation", holder)
+
+            await self._storage.execute_transaction(_release)
+
+        logger.info(
+            "Consolidation %s complete: "
+            "reclassified=%d  categorised=%d  distilled=%d  merged=%d  abstracted=%d  "
+            "resolved=%d  decayed=%d  pruned=%d  ltd=%d  promoted=%d  feedback=%d",
+            "(dry-run)" if dry_run else "",
+            result.reclassified,
+            result.categorised,
+            result.distilled,
+            result.merged,
+            result.abstracted,
+            result.resolved,
+            result.decayed,
+            result.pruned,
+            result.ltd,
+            result.promoted,
+            result.feedback_adjusted,
+        )
+
+        return result
+
+    async def get_history(self, limit: int = 20) -> list[dict[str, Any]]:
+        """Retrieve recent entries from the consolidation log.
+
+        Parameters
+        ----------
+        limit:
+            Maximum number of log entries to return.
+
+        Returns
+        -------
+        list[dict[str, Any]]
+            Log entries ordered by most recent first, each containing
+            ``id``, ``action``, ``details``, ``atoms_affected``, and
+            ``created_at``.
+        """
+        rows = await self._storage.execute(
+            """
+            SELECT id, action, details, atoms_affected, created_at
+            FROM consolidation_log
+            ORDER BY created_at DESC
+            LIMIT ?
+            """,
+            (limit,),
+        )
+        entries: list[dict[str, Any]] = []
+        for row in rows:
+            entry: dict[str, Any] = {
+                "id": row["id"],
+                "action": row["action"],
+                "created_at": row["created_at"],
+            }
+            # Parse JSON columns back into Python objects.
+            if row["details"]:
+                try:
+                    entry["details"] = json.loads(row["details"])
+                except (json.JSONDecodeError, TypeError):
+                    entry["details"] = row["details"]
+            else:
+                entry["details"] = None
+
+            if row["atoms_affected"]:
+                try:
+                    entry["atoms_affected"] = json.loads(row["atoms_affected"])
+                except (json.JSONDecodeError, TypeError):
+                    entry["atoms_affected"] = row["atoms_affected"]
+            else:
+                entry["atoms_affected"] = None
+
+            entries.append(entry)
+
+        return entries
+
+    # ------------------------------------------------------------------
+    # Step 0: Reclassify misclassified antipatterns
+    # ------------------------------------------------------------------
+
+    async def _reclassify_antipatterns(self, result: ConsolidationResult) -> None:
+        """Fix atoms wrongly stored as antipatterns by the post-tool hook.
+
+        Before the _infer_atom_type fix, file edits whose old/new content
+        contained the word "error" were stored as ``antipattern`` instead of
+        ``experience``.  Command outputs with error text but no actual mistake
+        were also misclassified.  This pass corrects them automatically so
+        each reflect cycle cleans up any remaining noise.
+
+        Patterns reclassified to ``experience``:
+        - ``Edited <file>: changed ...``  (Edit/Write/MultiEdit summaries)
+        - ``Command `...` produced ...``  (Bash output summaries)
+        - ``Ran `...``` / ``Running ...``  (other tool-output summaries)
+        - ``Fixed ...``                    (fix/bug-fix summaries — past events)
+        - ``The error is ...``             (error diagnostics — not guidance)
+        - ``The error was ...``            (error diagnostics — not guidance)
+        - ``An error occurred ...``        (event descriptions)
+        - ``The command produced an error`` (Bash error output without backticks)
+        - ``The original ... incorrect``   (correction notes)
+        - ``The original ... had an incorrect`` (correction notes)
+        """
+        patterns = [
+            # Tool-output summaries (original patterns)
+            "Edited %:%",
+            "Command `%` produced%",
+            "Ran `%`%",
+            "Running `%`%",
+            # Fix/correction descriptions — past-tense events, not guidance
+            "Fixed %",
+            # Error diagnostics — describe what happened, not what to avoid
+            "The error is %",
+            "The error was %",
+            "An error occurred%",
+            "The command produced an error%",
+            # Correction notes — describe a fix, not a pattern to avoid
+            "The original%was incorrect%",
+            "The original%had an incorrect%",
+            "The original%incorrect%has been%",
+        ]
+        like_clauses = " OR ".join("content LIKE ?" for _ in patterns)
+        rows = await self._storage.execute(
+            f"""
+            SELECT id, content FROM atoms
+            WHERE type = 'antipattern'
+              AND is_deleted = 0
+              AND ({like_clauses})
+            """,
+            tuple(patterns),
+        )
+        if rows:
+            if not result.dry_run:
+                ids = [r["id"] for r in rows]
+                placeholders = ",".join("?" * len(ids))
+                await self._storage.execute_write(
+                    f"UPDATE atoms SET type = 'experience' WHERE id IN ({placeholders})",
+                    tuple(ids),
+                )
+
+            result.reclassified += len(rows)
+            for row in rows:
+                result.details.append({
+                    "action": "reclassify",
+                    "atom_id": row["id"],
+                    "reason": "event/fix description misclassified as antipattern",
+                })
+            logger.info("Reclassified %d misclassified antipatterns", len(rows))
+
+        # --- Pass 2: short antipatterns lacking negative keywords -----------
+        # 1,548+ atoms are misclassified as antipattern with content like
+        # "A single line of code was edited" — they should be experience.
+        # They have confidence=1.0 so the stale-pruning pass ignores them.
+        await self._reclassify_short_antipatterns(result)
+
+    async def _reclassify_short_antipatterns(
+        self, result: ConsolidationResult
+    ) -> None:
+        """Reclassify antipatterns that lack prescriptive/cautionary language.
+
+        Atoms typed ``antipattern`` that contain no prescriptive keywords
+        (should not, avoid, never use, bad practice, etc.) are reclassified
+        to ``experience``.  Their outbound ``warns-against`` synapses are
+        deleted in the same pass.
+
+        This catches both short descriptive atoms ("A line of code was edited")
+        and longer paraphrased descriptions that were misclassified because
+        they contained words like "error" or "wrong" in a descriptive context.
+        """
+        # Only prescriptive keywords qualify an atom as a genuine antipattern.
+        # Atoms lacking ALL of these are reclassified.  Must stay in sync
+        # with _ANTIPATTERN_PRESCRIPTIVE in cli.py.
+        misclassified_rows = await self._storage.execute(
+            """
+            SELECT id FROM atoms
+            WHERE type = 'antipattern'
+              AND is_deleted = 0
+              AND LOWER(content) NOT LIKE '%should not%'
+              AND LOWER(content) NOT LIKE '%should never%'
+              AND LOWER(content) NOT LIKE '%avoid%'
+              AND LOWER(content) NOT LIKE '%never use%'
+              AND LOWER(content) NOT LIKE '%never do%'
+              AND LOWER(content) NOT LIKE '%never %'
+              AND LOWER(content) NOT LIKE '%bad practice%'
+              AND LOWER(content) NOT LIKE '%mistake%'
+              AND LOWER(content) NOT LIKE '%pitfall%'
+              AND LOWER(content) NOT LIKE '%antipattern%'
+              AND LOWER(content) NOT LIKE '%anti-pattern%'
+              AND LOWER(content) NOT LIKE '%failure mode%'
+              AND LOWER(content) NOT LIKE '%gotcha%'
+              AND LOWER(content) NOT LIKE '%footgun%'
+              AND LOWER(content) NOT LIKE '%beware%'
+              AND LOWER(content) NOT LIKE '%don''t%'
+              AND LOWER(content) NOT LIKE '%do not%'
+              AND LOWER(content) NOT LIKE '%must not%'
+              AND LOWER(content) NOT LIKE '%instead of%'
+              AND LOWER(content) NOT LIKE '%leads to%'
+              AND LOWER(content) NOT LIKE '%causes%'
+              AND LOWER(content) NOT LIKE '%results in%'
+              AND LOWER(content) NOT LIKE '%will break%'
+              AND LOWER(content) NOT LIKE '%creates a%'
+              AND LOWER(content) NOT LIKE '%introduces%'
+            """,
+        )
+        if not misclassified_rows:
+            return
+
+        ids = [r["id"] for r in misclassified_rows]
+
+        if not result.dry_run:
+            # Process in batches of 500 to respect SQLite placeholder limits.
+            # M-4: Wrap UPDATE + DELETE in a single transaction per batch to
+            # prevent graph inconsistency if a crash occurs between the two.
+            batch_size = 500
+            for start in range(0, len(ids), batch_size):
+                batch = ids[start : start + batch_size]
+                id_ph = ",".join("?" * len(batch))
+                batch_tuple = tuple(batch)
+
+                def _reclassify_batch(conn, _ph=id_ph, _params=batch_tuple):
+                    conn.execute(
+                        f"UPDATE atoms SET type = 'experience' WHERE id IN ({_ph})",
+                        _params,
+                    )
+                    conn.execute(
+                        f"DELETE FROM synapses WHERE source_id IN ({_ph}) "
+                        f"AND relationship = 'warns-against'",
+                        _params,
+                    )
+
+                await self._storage.execute_transaction(_reclassify_batch)
+
+        result.reclassified += len(ids)
+        for atom_id in ids:
+            result.details.append({
+                "action": "reclassify",
+                "atom_id": atom_id,
+                "reason": "short antipattern lacking negative keywords",
+            })
+        logger.info(
+            "Reclassified %d short misclassified antipatterns to experience",
+            len(ids),
+        )
+
+    # ------------------------------------------------------------------
+    # Step 0a: Backfill antipattern categories
+    # ------------------------------------------------------------------
+
+    async def _classify_uncategorised_antipatterns(
+        self, result: ConsolidationResult
+    ) -> None:
+        """Backfill category tags on antipatterns that lack one.
+
+        Processes up to ``backfill_batch_size`` uncategorised antipatterns
+        per consolidation cycle, oldest first, using
+        :meth:`LearningEngine.suggest_antipattern_category`.
+        """
+        from memories.learning import ANTIPATTERN_CATEGORY_PREFIX
+
+        cfg = get_config()
+        if not cfg.antipattern_classification.enabled:
+            return
+
+        batch_size = cfg.antipattern_classification.backfill_batch_size
+
+        rows = await self._storage.execute(
+            """
+            SELECT id, content, tags FROM atoms
+            WHERE type = 'antipattern'
+              AND is_deleted = 0
+              AND (tags IS NULL OR tags NOT LIKE ?)
+            ORDER BY created_at ASC
+            LIMIT ?
+            """,
+            (f'%"{ANTIPATTERN_CATEGORY_PREFIX}%', batch_size),
+        )
+
+        if not rows:
+            return
+
+        count = 0
+        tag_updates: list[tuple[str, int]] = []
+        for row in rows:
+            existing_tags: list[str] = []
+            if row["tags"]:
+                try:
+                    existing_tags = json.loads(row["tags"])
+                except (json.JSONDecodeError, TypeError):
+                    existing_tags = []
+
+            category = await self._learning_engine.suggest_antipattern_category(
+                row["content"], existing_tags
+            )
+            new_tags = existing_tags + [f"{ANTIPATTERN_CATEGORY_PREFIX}{category}"]
+            tag_updates.append((json.dumps(new_tags), row["id"]))
+            count += 1
+
+        if not result.dry_run and tag_updates:
+            await self._storage.execute_many(
+                "UPDATE atoms SET tags = ?, updated_at = datetime('now') WHERE id = ?",
+                tag_updates,
+            )
+
+        result.categorised += count
+        if count:
+            result.details.append({
+                "action": "classify_antipatterns",
+                "count": count,
+            })
+            logger.info("Categorised %d uncategorised antipatterns", count)
+
+    # ------------------------------------------------------------------
+    # Step 0a-2: Distill oversized atoms
+    # ------------------------------------------------------------------
+
+    async def _distill_oversized_atoms(
+        self, result: ConsolidationResult
+    ) -> None:
+        """Summarise atoms whose content exceeds the configured threshold.
+
+        Uses the local Ollama distillation model to condense verbose atoms
+        into concise, self-contained summaries (~100 tokens).  Falls back
+        to simple truncation when Ollama is unavailable.
+
+        Processed oldest-first, capped at ``distill_batch_size`` per cycle.
+        Re-embeds the atom after distillation so vector search stays accurate.
+        """
+        cfg = get_config()
+        if not cfg.consolidation.distill_oversized:
+            return
+
+        max_chars = cfg.consolidation.distill_max_chars
+        batch_size = cfg.consolidation.distill_batch_size
+
+        rows = await self._storage.execute(
+            """
+            SELECT id, content, type FROM atoms
+            WHERE is_deleted = 0
+              AND length(content) > ?
+            ORDER BY created_at ASC
+            LIMIT ?
+            """,
+            (max_chars, batch_size),
+        )
+
+        if not rows:
+            return
+
+        count = 0
+        for row in rows:
+            original = row["content"]
+            distilled = await self._distill_single(original, max_chars, cfg)
+
+            if distilled == original:
+                continue  # No improvement — skip.
+
+            if not result.dry_run:
+                await self._storage.execute_write(
+                    "UPDATE atoms SET content = ?, updated_at = datetime('now') WHERE id = ?",
+                    (distilled, row["id"]),
+                )
+                # Re-embed so vector search uses the new content.
+                try:
+                    await self._embeddings.embed_and_store(row["id"], distilled)
+                except Exception as exc:
+                    logger.debug("Re-embed failed for atom %d: %s", row["id"], exc)
+
+            count += 1
+
+        result.distilled += count
+        if count:
+            result.details.append({
+                "action": "distill_oversized",
+                "count": count,
+            })
+            logger.info(
+                "Distilled %d oversized atoms (threshold=%d chars)",
+                count, max_chars,
+            )
+
+    async def _distill_single(
+        self, content: str, max_chars: int, cfg
+    ) -> str:
+        """Distill a single atom's content via Ollama or fallback truncation.
+
+        Returns the distilled content, or the original if distillation
+        fails or produces nothing useful.
+        """
+        import asyncio
+
+        try:
+            import ollama as _ollama
+        except ImportError:
+            # Ollama not installed — fall back to truncation.
+            return content[:max_chars]
+
+        prompt = (
+            "Summarise the following into a single concise sentence "
+            "(under 150 characters). Keep only the key fact or insight. "
+            "Output ONLY the summary, no preamble.\n\n"
+            f"{content[:1500]}"
+        )
+
+        try:
+            client = _ollama.AsyncClient(host=cfg.ollama_url)
+            response = await asyncio.wait_for(
+                client.generate(model=cfg.distill_model, prompt=prompt),
+                timeout=15.0,
+            )
+            raw = (response.response or "").strip()
+            # Validate: must be shorter than original and non-trivial.
+            if raw and len(raw) >= 20 and len(raw) < len(content):
+                return raw[:max_chars]
+        except Exception as exc:
+            logger.debug("Ollama distill failed, falling back to truncation: %s", exc)
+
+        # Fallback: truncate at last sentence boundary within max_chars.
+        truncated = content[:max_chars]
+        last_period = truncated.rfind(".")
+        if last_period > max_chars // 2:
+            return truncated[: last_period + 1]
+        return truncated
+
+    # ------------------------------------------------------------------
+    # Step 0b: Long-Term Depression (anti-Hebbian synapse weakening)
+    # ------------------------------------------------------------------
+
+    async def _apply_ltd(self, result: ConsolidationResult) -> None:
+        """Weaken synapses between atoms that consistently fire apart.
+
+        Implements the anti-Hebbian rule: "neurons that fire apart wire
+        apart."  A synapse qualifies for LTD when **both** of these hold:
+
+        1. **Both endpoint atoms are individually active** — each was
+           accessed within ``decay_after_days``, confirming they are still
+           being used in the current context.
+        2. **The synapse itself has not been Hebbian-reinforced** within
+           ``ltd_window_days`` — the two atoms keep being accessed in
+           separate sessions without co-occurring.
+
+        This differs from passive synapse decay (which applies to all
+        synapses regardless of atom activity) by targeting relationships
+        that are actively diverging in usage context, not just fading from
+        disuse.
+
+        Each qualifying synapse is weakened by ``ltd_amount`` per cycle.
+        If weakening pushes strength below ``prune_threshold``, the synapse
+        is deleted by :meth:`~memories.synapses.SynapseManager.weaken`.
+        """
+        ltd_window_days = self._cfg.ltd_window_days
+        activity_window = self._cfg.decay_after_days
+        prune_threshold = self._cfg.prune_threshold
+
+        rows = await self._storage.execute(
+            """
+            SELECT s.id, s.strength, s.source_id, s.target_id, s.relationship
+            FROM synapses s
+            JOIN atoms a1 ON a1.id = s.source_id
+            JOIN atoms a2 ON a2.id = s.target_id
+            WHERE s.strength > ?
+              AND (
+                  s.last_activated_at IS NULL
+                  OR s.last_activated_at < datetime('now', ?)
+              )
+              AND s.relationship NOT IN ('contradicts', 'supersedes', 'warns-against', 'encoded-with')
+              AND a1.is_deleted = 0
+              AND a2.is_deleted = 0
+              AND a1.last_accessed_at IS NOT NULL
+              AND a2.last_accessed_at IS NOT NULL
+              AND a1.last_accessed_at > datetime('now', ?)
+              AND a2.last_accessed_at > datetime('now', ?)
+            """,
+            (prune_threshold, f"-{ltd_window_days} days", f"-{activity_window} days", f"-{activity_window} days"),
+        )
+
+        if not rows:
+            return
+
+        for row in rows:
+            result.details.append({
+                "action": "ltd",
+                "synapse_id": row["id"],
+                "relationship": row["relationship"],
+                "old_strength": round(row["strength"], 4),
+                "source_id": row["source_id"],
+                "target_id": row["target_id"],
+            })
+
+        if not result.dry_run:
+            ltd_fraction = self._cfg.ltd_fraction
+            ltd_floor = self._cfg.ltd_min_floor
+            multiplier = 1.0 - ltd_fraction
+
+            synapse_ids = [row["id"] for row in rows]
+            id_ph = ",".join("?" for _ in synapse_ids)
+
+            # Batch proportional LTD: strength = MAX(floor, strength * multiplier).
+            # A single UPDATE replaces the old per-row weaken() loop.
+            await self._storage.execute_write(
+                f"UPDATE synapses "
+                f"SET strength = MAX(?, strength * ?) "
+                f"WHERE id IN ({id_ph})",
+                (ltd_floor, multiplier, *synapse_ids),
+            )
+
+            # Batch prune: delete any synapses that fell at or below prune_threshold.
+            await self._storage.execute_write(
+                f"DELETE FROM synapses "
+                f"WHERE id IN ({id_ph}) AND strength <= ?",
+                (*synapse_ids, prune_threshold),
+            )
+
+        result.ltd += len(rows)
+        logger.info(
+            "LTD applied to %d synapses (window=%d days, fraction=%.3f)",
+            len(rows),
+            ltd_window_days,
+            self._cfg.ltd_fraction,
+        )
+
+    # ------------------------------------------------------------------
+    # Step 0b2: Accelerated decay for dormant (never-activated) synapses
+    # ------------------------------------------------------------------
+
+    async def _prune_dormant_synapses(self, result: ConsolidationResult) -> None:
+        """Accelerated decay for synapses that have never been activated.
+
+        Synapses created but never traversed during spreading activation
+        decay at ``dormant_multiplier`` rate per cycle.  Those already below
+        ``prune_threshold`` are deleted immediately.
+
+        Synapses where **both** endpoint atoms are recently active (accessed
+        within ``decay_after_days``) are excluded -- those are already
+        handled by :meth:`_apply_ltd` and applying both would cause a
+        double-decay bug (0.85 * 0.80 = 0.68x per cycle).
+        """
+        dormant_cutoff_days = self._cfg.dormant_cutoff_days
+        dormant_multiplier = self._cfg.dormant_multiplier
+
+        rows = await self._storage.execute(
+            """
+            SELECT s.id, s.strength FROM synapses s
+            JOIN atoms a1 ON a1.id = s.source_id
+            JOIN atoms a2 ON a2.id = s.target_id
+            WHERE s.last_activated_at IS NULL
+              AND s.created_at < datetime('now', ?)
+              AND s.strength > ?
+              AND a1.is_deleted = 0
+              AND a2.is_deleted = 0
+              -- Exclude synapses already covered by _apply_ltd
+              -- (_apply_ltd only fires when BOTH atoms are recently active)
+              AND NOT (
+                  a1.last_accessed_at IS NOT NULL
+                  AND a1.last_accessed_at > datetime('now', ?)
+                  AND a2.last_accessed_at IS NOT NULL
+                  AND a2.last_accessed_at > datetime('now', ?)
+              )
+            """,
+            (
+                f"-{dormant_cutoff_days} days",
+                self._cfg.prune_threshold,
+                f"-{self._cfg.decay_after_days} days",
+                f"-{self._cfg.decay_after_days} days",
+            ),
+        )
+        if not rows:
+            return
+
+        synapse_ids = [row["id"] for row in rows]
+
+        if result.dry_run:
+            result.details.append({"action": "dormant_decay", "would_affect": len(synapse_ids)})
+            return
+
+        # Process in batches of 500 to stay within SQLite placeholder limits.
+        batch_size = 500
+        total_pruned = 0
+        for start in range(0, len(synapse_ids), batch_size):
+            batch = synapse_ids[start : start + batch_size]
+            id_ph = ",".join("?" for _ in batch)
+
+            await self._storage.execute_write(
+                f"UPDATE synapses SET strength = MAX(?, strength * ?) WHERE id IN ({id_ph})",
+                (self._cfg.prune_threshold, dormant_multiplier, *batch),
+            )
+            deleted = await self._storage.execute_write_returning(
+                f"DELETE FROM synapses WHERE id IN ({id_ph}) AND strength <= ? RETURNING id",
+                (*batch, self._cfg.prune_threshold),
+            )
+            total_pruned += len(deleted)
+
+        result.pruned += total_pruned
+        if total_pruned:
+            logger.info(
+                "Dormant synapse pruning: decayed %d, deleted %d (cutoff=%d days, multiplier=%.2f)",
+                len(synapse_ids),
+                total_pruned,
+                dormant_cutoff_days,
+                dormant_multiplier,
+            )
+
+    # ------------------------------------------------------------------
+    # Step 0b4: Synaptic Tagging and Capture (STC)
+    # ------------------------------------------------------------------
+
+    async def _expire_stc_tags(self, result: ConsolidationResult) -> None:
+        """Expire uncaptured synaptic tags and promote captured ones.
+
+        Implements Frey & Morris (1997) synaptic tagging and capture:
+
+        - **Expire**: delete tagged synapses whose capture window has elapsed
+          without any Hebbian reinforcement (``activated_count = 0``).
+        - **Promote**: clear the tag on synapses that WERE reinforced
+          (``activated_count >= 1``), converting them into permanent synapses.
+
+        This ensures only associations validated by repeated co-activation
+        survive, reducing graph noise from one-time embedding similarity hits.
+        """
+        if result.dry_run:
+            expired_rows = await self._storage.execute(
+                """
+                SELECT COUNT(*) AS cnt FROM synapses
+                WHERE tag_expires_at IS NOT NULL
+                  AND tag_expires_at < datetime('now')
+                  AND activated_count = 0
+                """,
+            )
+            promoted_rows = await self._storage.execute(
+                """
+                SELECT COUNT(*) AS cnt FROM synapses
+                WHERE tag_expires_at IS NOT NULL
+                  AND activated_count >= 1
+                """,
+            )
+            expired_count = expired_rows[0]["cnt"] if expired_rows else 0
+            promoted_count = promoted_rows[0]["cnt"] if promoted_rows else 0
+            result.details.append({
+                "action": "stc_expire",
+                "would_expire": expired_count,
+                "would_promote": promoted_count,
+            })
+            return
+
+        # Delete expired, unreinforced tags (never co-activated).
+        deleted = await self._storage.execute_write_returning(
+            """
+            DELETE FROM synapses
+            WHERE tag_expires_at IS NOT NULL
+              AND tag_expires_at < datetime('now')
+              AND activated_count = 0
+            RETURNING id
+            """,
+        )
+        expired_count = len(deleted)
+        result.pruned += expired_count
+
+        # Promote reinforced tags: clear tag_expires_at to make permanent.
+        # M-2: >= 1 (not > 1) — a single co-activation is sufficient evidence.
+        promoted = await self._storage.execute_write_returning(
+            """
+            UPDATE synapses
+            SET tag_expires_at = NULL
+            WHERE tag_expires_at IS NOT NULL
+              AND activated_count >= 1
+            RETURNING id
+            """,
+        )
+        promoted_count = len(promoted)
+
+        if expired_count or promoted_count:
+            result.details.append({
+                "action": "stc_expire",
+                "expired": expired_count,
+                "promoted": promoted_count,
+            })
+            logger.info(
+                "STC: expired %d uncaptured tags, promoted %d captured synapses",
+                expired_count,
+                promoted_count,
+            )
+
+    # ------------------------------------------------------------------
+    # Step 0b3: Prune warns-against from low-confidence antipatterns
+    # ------------------------------------------------------------------
+
+    async def _prune_stale_warns_against(self, result: ConsolidationResult) -> None:
+        """Delete warns-against synapses from decayed antipattern atoms.
+
+        When an antipattern atom's confidence decays below 0.3, its
+        ``warns-against`` synapses with strength < 0.4 are stale noise
+        that should be removed to keep recall clean.
+        """
+        if result.dry_run:
+            rows = await self._storage.execute(
+                """
+                SELECT COUNT(*) AS cnt FROM synapses
+                WHERE relationship = 'warns-against'
+                  AND strength < 0.4
+                  AND source_id IN (
+                      SELECT id FROM atoms
+                      WHERE type = 'antipattern'
+                        AND confidence < 0.3
+                        AND is_deleted = 0
+                  )
+                """,
+            )
+            would_prune = rows[0]["cnt"] if rows else 0
+            if would_prune:
+                result.details.append({
+                    "action": "prune_stale_warns_against",
+                    "would_prune": would_prune,
+                })
+            return
+
+        deleted = await self._storage.execute_write_returning(
+            """
+            DELETE FROM synapses
+            WHERE relationship = 'warns-against'
+              AND strength < 0.4
+              AND source_id IN (
+                  SELECT id FROM atoms
+                  WHERE type = 'antipattern'
+                    AND confidence < 0.3
+                    AND is_deleted = 0
+              )
+            RETURNING id
+            """,
+        )
+        if deleted:
+            result.pruned += len(deleted)
+            result.details.append({
+                "action": "prune_stale_warns_against",
+                "pruned": len(deleted),
+            })
+            logger.info(
+                "Pruned %d stale warns-against synapses from low-confidence antipatterns",
+                len(deleted),
+            )
+
+    # ------------------------------------------------------------------
+    # Step 0c: Feedback signals → importance adjustment
+    # ------------------------------------------------------------------
+
+    async def _tune_retrieval_weights(self, result: ConsolidationResult) -> None:
+        """Nudge retrieval weights toward atom properties that predict good recall.
+
+        Uses accumulated ``atom_feedback`` signals from the last 30 days to
+        compare the mean property values of positively-rated vs negatively-rated
+        atoms.  When a property is consistently higher in good atoms it gets a
+        small weight increase; the reverse triggers a decrease.  Changes are
+        clamped to ±``weight_tuning_max_drift`` of the factory defaults.
+        """
+        cfg = get_config().consolidation
+        lr = cfg.weight_tuning_learning_rate
+        max_drift = cfg.weight_tuning_max_drift
+        min_samples = cfg.weight_tuning_min_samples
+
+        # H-1: Factory defaults from config — single source of truth for
+        # clamping bounds.  spread_activation and vector_similarity are
+        # per-query signals (depend on graph distance, not atom properties)
+        # and are not tunable from per-atom feedback.
+        from memories.config import RetrievalWeights as _RW
+        _factory = _RW()
+        DEFAULTS: dict[str, float] = {
+            "confidence":  _factory.confidence,   # 0.12
+            "importance":  _factory.importance,    # 0.11
+            "frequency":   _factory.frequency,     # 0.02
+            "recency":     _factory.recency,       # 0.08
+        }
+
+        cutoff = (datetime.now(tz=timezone.utc) - timedelta(days=30)).isoformat()
+        good_ids, bad_ids = await self._storage.get_feedback_atom_ids_since(cutoff)
+
+        if len(good_ids) < min_samples or len(bad_ids) < min_samples:
+            return  # not enough signal to tune
+
+        good_atoms = list((await self._atoms.get_batch_without_tracking(good_ids)).values())
+        bad_atoms  = list((await self._atoms.get_batch_without_tracking(bad_ids)).values())
+
+        if not good_atoms or not bad_atoms:
+            return
+
+        def sig(a: Atom, name: str) -> float:
+            if name == "confidence":
+                return a.confidence
+            if name == "importance":
+                return a.importance
+            if name == "frequency":
+                return min(1.0, math.log1p(a.access_count) / math.log1p(100))
+            # recency: 1.0 for today, 0.0 for 90+ days ago
+            ref = a.last_accessed_at or a.created_at or ""
+            try:
+                last_accessed = datetime.fromisoformat(ref)
+                if last_accessed.tzinfo is None:
+                    last_accessed = last_accessed.replace(tzinfo=timezone.utc)
+                days = max(0, (datetime.now(tz=timezone.utc) - last_accessed).days)
+            except (ValueError, TypeError):
+                days = 90
+            return max(0.0, 1.0 - days / 90)
+
+        stored = await self._storage.load_retrieval_weights() or dict(DEFAULTS)
+        # Ensure per-query signals are always present for the DB schema,
+        # even though they are not feedback-tuned.
+        stored.setdefault("spread_activation", _factory.spread_activation)
+
+        changed = False
+        for signal, default in DEFAULTS.items():
+            # All entries in DEFAULTS are per-atom signals that are tunable.
+            good_mean = sum(sig(a, signal) for a in good_atoms) / len(good_atoms)
+            bad_mean  = sum(sig(a, signal) for a in bad_atoms)  / len(bad_atoms)
+            diff = good_mean - bad_mean
+            if abs(diff) < 0.05:
+                continue  # no meaningful difference — skip
+            # M-1: Scale by diff magnitude (not binary ±1) for natural damping.
+            # When the signal is ambiguous (small diff), the step is tiny.
+            # As weights approach optimal, the diff shrinks → smaller steps →
+            # convergence instead of sawtooth oscillation.
+            lo = default * (1 - max_drift)
+            hi = default * (1 + max_drift)
+            stored[signal] = max(lo, min(hi, stored[signal] + diff * lr))
+            changed = True
+
+        if changed and not result.dry_run:
+            await self._storage.save_retrieval_weights(stored)
+            result.details.append({"action": "weights_tuned", "weights": stored})
+
+    async def _apply_feedback_signals(self, result: ConsolidationResult) -> None:
+        """Adjust atom importance based on accumulated user feedback.
+
+        Each unprocessed ``good`` or ``bad`` signal in ``atom_feedback``
+        nudges the atom's ``importance`` score.  Good feedback increases
+        importance so the atom surfaces more prominently in future recalls;
+        bad feedback decreases it.  Bad signals are weighted 1.5× because
+        negative feedback is a stronger signal (the agent explicitly rated
+        the atom as unhelpful, not merely absent).
+
+        Records are marked ``processed_at = now`` after application so
+        each feedback event is counted exactly once across consolidation
+        cycles.
+
+        The increments are controlled by :attr:`~ConsolidationConfig.feedback_good_increment`
+        and :attr:`~ConsolidationConfig.feedback_bad_decrement`.
+        """
+        good_inc = self._cfg.feedback_good_increment
+        bad_dec = self._cfg.feedback_bad_decrement
+        type_inertia = self._cfg.type_feedback_inertia
+
+        rows = await self._storage.execute(
+            """
+            SELECT atom_id,
+                   SUM(CASE WHEN signal = 'good' THEN 1 ELSE 0 END) AS good_count,
+                   SUM(CASE WHEN signal = 'bad'  THEN 1 ELSE 0 END) AS bad_count,
+                   GROUP_CONCAT(id) AS feedback_ids
+            FROM atom_feedback
+            WHERE processed_at IS NULL
+            GROUP BY atom_id
+            """
+        )
+        if not rows:
+            return
+
+        # E2: Batch-fetch all atom importances in one query instead of N queries.
+        atom_ids_in_feedback = [int(r["atom_id"]) for r in rows]
+        atoms_map = await self._atoms.get_batch_without_tracking(atom_ids_in_feedback)
+
+        importance_updates: list[tuple[float, int]] = []
+        all_feedback_ids: list[str] = []  # comma-separated id strings per group
+        adjusted = 0
+
+        for row in rows:
+            atom_id = int(row["atom_id"])
+            good = int(row["good_count"] or 0)
+            bad = int(row["bad_count"] or 0)
+            feedback_ids_str: str = row["feedback_ids"]
+            all_feedback_ids.append(feedback_ids_str)
+
+            # Net delta: bad is weighted 1.5× as a stronger signal.
+            delta = (good * good_inc) - (bad * bad_dec * 1.5)
+
+            atom = atoms_map.get(atom_id)
+            if atom is None:
+                # A4: atom deleted — will be marked processed below; skip delta.
+                continue
+
+            # Type-dependent feedback inertia: stable knowledge types
+            # (facts, skills) resist feedback changes; ephemeral types
+            # (experiences, tasks) respond readily.
+            inertia = type_inertia.get(atom.type, 0.0)
+            delta *= (1.0 - inertia)
+
+            if abs(delta) < 1e-6:
+                continue  # no net change; still mark processed below
+
+            new_importance = max(0.0, min(1.0, atom.importance + delta))
+            importance_updates.append((new_importance, atom_id))
+
+            result.details.append({
+                "action": "feedback_importance",
+                "atom_id": atom_id,
+                "good": good,
+                "bad": bad,
+                "delta": round(delta, 4),
+                "old_importance": round(atom.importance, 4),
+                "new_importance": round(new_importance, 4),
+            })
+            adjusted += 1
+
+        if not result.dry_run:
+            # Batch all importance updates in one execute_many.
+            if importance_updates:
+                await self._storage.execute_many(
+                    "UPDATE atoms SET importance = ?, updated_at = datetime('now') WHERE id = ?",
+                    importance_updates,
+                )
+            # Mark all feedback rows (including deleted-atom and no-change rows) processed.
+            if all_feedback_ids:
+                # Expand the comma-separated id strings into individual int ids
+                # so we can build a proper parameterised query.
+                flat_ids: list[int] = []
+                for group in all_feedback_ids:
+                    flat_ids.extend(int(i) for i in group.split(","))
+                placeholders = ",".join("?" for _ in flat_ids)
+                await self._storage.execute_write(
+                    f"UPDATE atom_feedback SET processed_at = datetime('now') "
+                    f"WHERE id IN ({placeholders})",
+                    tuple(flat_ids),
+                )
+
+        result.feedback_adjusted = adjusted
+        if adjusted:
+            logger.info(
+                "Feedback signals applied to %d atoms (good_inc=%.3f, bad_dec=%.3f)",
+                adjusted,
+                good_inc,
+                bad_dec,
+            )
+
+    # ------------------------------------------------------------------
+    # Step 0d: Contradiction resolution
+    # ------------------------------------------------------------------
+
+    async def _resolve_contradictions(self, result: ConsolidationResult) -> None:
+        """Settle long-standing contradictions in favour of the stronger atom.
+
+        Two atoms linked by a ``contradicts`` synapse inhibit each other during
+        spreading activation indefinitely.  Once one side has accumulated
+        substantially more evidence (higher confidence × usage), continuing
+        to suppress the winner is counter-productive.
+
+        Resolution criteria
+        -------------------
+        - Both atoms must be older than ``contradiction_min_age_days`` (14) so
+          fresh contradictions from a single session are not auto-resolved.
+        - ``winner_score >= loser_score × threshold`` (default 2.0) — the
+          winner must be at least twice as strong.  This is deliberately
+          conservative; close calls are left for the user to resolve.
+        - Score formula: ``confidence × log1p(access_count)``.  The log scale
+          prevents a single heavily-accessed atom from trivially winning.
+
+        When resolution fires the loser's confidence is decremented by
+        ``contradiction_resolution_decay`` (0.15) and a ``supersedes``
+        synapse is created from winner to loser so the provenance is
+        preserved.  The loser is not deleted — it may still hold unique
+        context — but its reduced confidence will cause it to surface less.
+        """
+        threshold = self._cfg.contradiction_resolution_threshold
+        decay_amount = self._cfg.contradiction_resolution_decay
+        min_age_days = self._cfg.contradiction_min_age_days
+
+        # E3: Join atom data directly into the synapse query to eliminate
+        # per-pair get_without_tracking calls.
+        rows = await self._storage.execute(
+            """
+            SELECT s.id AS synapse_id, s.source_id, s.target_id,
+                   a1.confidence AS conf_a, a1.access_count AS acc_a,
+                   a2.confidence AS conf_b, a2.access_count AS acc_b
+            FROM synapses s
+            JOIN atoms a1 ON a1.id = s.source_id AND a1.is_deleted = 0
+            JOIN atoms a2 ON a2.id = s.target_id AND a2.is_deleted = 0
+            WHERE s.relationship = 'contradicts'
+              AND s.strength > 0
+              AND a1.created_at < datetime('now', ?)
+              AND a2.created_at < datetime('now', ?)
+            """,
+            (f"-{min_age_days} days", f"-{min_age_days} days"),
+        )
+        if not rows:
+            return
+
+        seen_pairs: set[frozenset[int]] = set()
+        # Collect batch operations for all resolved contradictions.
+        loser_updates: list[tuple[float, int]] = []
+        supersede_inserts: list[tuple[int, int]] = []
+
+        for row in rows:
+            pair: frozenset[int] = frozenset([row["source_id"], row["target_id"]])
+            if pair in seen_pairs:
+                continue
+            seen_pairs.add(pair)
+
+            score_a = row["conf_a"] * math.log1p(row["acc_a"])
+            score_b = row["conf_b"] * math.log1p(row["acc_b"])
+
+            if score_a >= score_b * threshold:
+                winner_id = row["source_id"]
+                loser_id = row["target_id"]
+                loser_confidence = float(row["conf_b"])
+                winner_score, loser_score = score_a, score_b
+            elif score_b >= score_a * threshold:
+                winner_id = row["target_id"]
+                loser_id = row["source_id"]
+                loser_confidence = float(row["conf_a"])
+                winner_score, loser_score = score_b, score_a
+            else:
+                continue  # Too close to call — leave the contradiction active.
+
+            new_confidence = max(0.0, loser_confidence - decay_amount)
+
+            result.details.append({
+                "action": "resolve_contradiction",
+                "winner_id": winner_id,
+                "loser_id": loser_id,
+                "winner_score": round(winner_score, 4),
+                "loser_score": round(loser_score, 4),
+                "old_confidence": round(loser_confidence, 4),
+                "new_confidence": round(new_confidence, 4),
+            })
+
+            if not result.dry_run:
+                loser_updates.append((new_confidence, loser_id))
+                supersede_inserts.append((winner_id, loser_id))
+
+            result.resolved += 1
+
+        # Batch-apply loser confidence reductions.
+        if loser_updates:
+            await self._storage.execute_many(
+                """
+                UPDATE atoms SET confidence = ?, updated_at = datetime('now')
+                WHERE id = ?
+                """,
+                loser_updates,
+            )
+        # Batch-create supersedes synapses (INSERT OR IGNORE skips existing).
+        if supersede_inserts:
+            await self._storage.execute_many(
+                """
+                INSERT OR IGNORE INTO synapses
+                    (source_id, target_id, relationship, strength, bidirectional)
+                VALUES (?, ?, 'supersedes', 0.8, 0)
+                """,
+                supersede_inserts,
+            )
+
+        if result.resolved:
+            logger.info(
+                "Resolved %d contradiction(s) (threshold=%.1f, decay=%.3f)",
+                result.resolved,
+                threshold,
+                decay_amount,
+            )
+
+    # ------------------------------------------------------------------
+    # LLM distillation helpers (W3-D)
+    # ------------------------------------------------------------------
+
+    _GENERIC_PATTERNS: tuple[str, ...] = (
+        "systems require proper",
+        "the system is",
+        "this is important",
+        "it is necessary",
+        "things can be",
+        "processes should be",
+    )
+
+    @staticmethod
+    def _distillation_is_acceptable(text: str) -> bool:
+        """Return True if *text* is a specific, useful distillation.
+
+        Rejects outputs that are too short (< 10 words) or match known
+        generic abstraction patterns that dilute recall precision.
+        Falls back to verbatim first-atom content when rejected.
+        """
+        if len(text.split()) < 10:
+            return False
+        lower = text.lower()
+        return not any(p in lower for p in ConsolidationEngine._GENERIC_PATTERNS)
+
+    async def _distill_cluster(self, cluster: list[Atom]) -> str:
+        """Distil a cluster of experience atoms into a single insight string.
+
+        Uses the local LLM (via :attr:`_llm_client`) to summarise the cluster
+        into a concise, generalised statement.  Falls back to the verbatim
+        content of the first atom when:
+
+        * the LLM call exceeds the 15-second timeout, or
+        * the cluster is empty, or
+        * any other exception is raised (e.g. Ollama unreachable).
+
+        Parameters
+        ----------
+        cluster:
+            List of :class:`~memories.atoms.Atom` instances forming a
+            similarity cluster.  Must be non-empty for a real LLM call.
+
+        Returns
+        -------
+        str
+            Distilled insight string, or verbatim first-atom content on
+            fallback, or ``""`` for an empty cluster.
+        """
+        if not cluster:
+            return ""
+
+        fallback = cluster[0].content
+
+        try:
+            # Lazy import and client construction — only when actually needed.
+            if self._llm_client is None:
+                import ollama
+
+                self._llm_client = ollama.AsyncClient(host=self._ollama_url)
+
+            snippets = "\n".join(
+                f"- {a.content[:200]}" for a in cluster[:10]
+            )
+            prompt = (
+                "You are a memory consolidation assistant. "
+                "Summarise the following related experiences into a single, "
+                "concise general fact (1-2 sentences). "
+                "Output only the fact, no preamble:\n\n"
+                f"{snippets}"
+            )
+
+            response = await asyncio.wait_for(
+                self._llm_client.generate(
+                    model=self._distill_model,
+                    prompt=prompt,
+                ),
+                timeout=15.0,
+            )
+            distilled: str = response.response.strip()
+            if not distilled:
+                return fallback
+            if not self._distillation_is_acceptable(distilled):
+                logger.debug(
+                    "Distillation rejected (generic/too short): %r — using fallback",
+                    distilled[:100],
+                )
+                return fallback
+            return distilled
+        except Exception as exc:
+            logger.warning("Distillation failed for cluster: %s", exc, exc_info=True)
+            return fallback
+
+    async def _synthesise_antipattern(
+        self, template: Atom, cluster: list[Atom],
+    ) -> str:
+        """Synthesise prescriptive antipattern content from an error cluster.
+
+        Uses the local LLM to generate a 1-sentence warning starting with
+        "Avoid" or "Do not".  Falls back to a heuristic cleanup of the
+        template content when the LLM is unavailable.
+        """
+        snippets = "\n".join(f"- {a.content[:200]}" for a in cluster[:5])
+        fallback = f"Avoid: {template.content}"
+        if len(fallback) > 300:
+            fallback = fallback[:297] + "..."
+
+        try:
+            if self._llm_client is None:
+                import ollama
+                self._llm_client = ollama.AsyncClient(host=self._ollama_url)
+
+            prompt = (
+                "You are a memory assistant. The following experiences describe "
+                "repeated errors or problems. Write a single prescriptive warning "
+                "(1-2 sentences) that tells a developer what to AVOID. Start with "
+                "'Avoid' or 'Do not'. Be specific — include file names, commands, "
+                "or error messages when available. Output only the warning:\n\n"
+                f"{snippets}"
+            )
+            response = await asyncio.wait_for(
+                self._llm_client.generate(
+                    model=self._distill_model,
+                    prompt=prompt,
+                ),
+                timeout=15.0,
+            )
+            result = response.response.strip()
+            if result and len(result) >= 30:
+                return result[:300]
+        except Exception as exc:
+            logger.debug("Antipattern synthesis failed: %s", exc)
+
+        return fallback
+
+    async def _synthesise_antipattern_instead(
+        self, template: Atom, cluster: list[Atom],
+    ) -> str:
+        """Synthesise an 'instead' recommendation for an auto-detected antipattern.
+
+        Uses the local LLM to suggest what to do instead.  Falls back to a
+        descriptive summary of the cluster size.
+        """
+        fallback = f"Pattern detected from {len(cluster)} similar errors"
+
+        try:
+            if self._llm_client is None:
+                import ollama
+                self._llm_client = ollama.AsyncClient(host=self._ollama_url)
+
+            snippets = "\n".join(f"- {a.content[:200]}" for a in cluster[:5])
+            prompt = (
+                "You are a memory assistant. The following experiences describe "
+                "repeated errors. In one sentence, recommend what to do INSTEAD "
+                "to avoid these errors. Be specific and actionable. Output only "
+                "the recommendation:\n\n"
+                f"{snippets}"
+            )
+            response = await asyncio.wait_for(
+                self._llm_client.generate(
+                    model=self._distill_model,
+                    prompt=prompt,
+                ),
+                timeout=15.0,
+            )
+            result = response.response.strip()
+            if result and len(result) >= 20:
+                return result[:300]
+        except Exception as exc:
+            logger.debug("Antipattern 'instead' synthesis failed: %s", exc)
+
+        return fallback
+
+    async def _distill_clusters_concurrent(
+        self, clusters: list[list[Atom]]
+    ) -> list[str]:
+        """Distil multiple clusters concurrently using :func:`asyncio.gather`.
+
+        All clusters are submitted simultaneously rather than sequentially,
+        reducing total wall-clock time when Ollama can handle parallel
+        requests.  Each individual call still has a 15-second timeout (see
+        :meth:`_distill_cluster`) and falls back to verbatim on error.
+
+        Parameters
+        ----------
+        clusters:
+            List of atom clusters, one per pending abstraction.
+
+        Returns
+        -------
+        list[str]
+            Distilled strings in the same order as *clusters*.  Exceptions
+            from individual calls are caught inside :meth:`_distill_cluster`
+            so every entry is always a string.
+        """
+        tasks = [self._distill_cluster(cluster) for cluster in clusters]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        # Ensure any unexpected exceptions (beyond what _distill_cluster
+        # catches) still produce a valid fallback string.
+        out: list[str] = []
+        for i, res in enumerate(results):
+            if isinstance(res, BaseException):
+                out.append(clusters[i][0].content if clusters[i] else "")
+            else:
+                out.append(res)  # type: ignore[arg-type]
+        return out
+
+    # ------------------------------------------------------------------
+    # Step 0e: Episodic-to-semantic abstraction
+    # ------------------------------------------------------------------
+
+    async def _abstract_experiences(
+        self,
+        result: ConsolidationResult,
+        scope: str,
+    ) -> None:
+        """Promote clusters of similar experiences into generalised facts.
+
+        When the same experience recurs across multiple sessions the system
+        should stop treating it as a one-off anecdote and recognise it as a
+        general truth.  This method:
+
+        1. Finds ``experience`` atoms that are old enough to have had time to
+           be corroborated (``abstraction_min_age_days``).
+        2. For each candidate, searches for similar experiences using vector
+           search (similarity >= ``abstraction_similarity``).
+        3. Skips candidates already linked to a fact via a ``part-of`` synapse
+           (they were abstracted in a previous cycle).
+        4. If the cluster has >= ``abstraction_min_cluster`` members, creates
+           a new ``fact`` atom whose content is taken from the most-accessed
+           experience in the cluster (the one the system has found most useful
+           as evidence).
+        5. Confidence of the new fact scales with cluster size, capped at 0.85.
+        6. Links all cluster members to the fact with ``part-of`` synapses so
+           future cycles skip them.
+        7. At most ``abstraction_max_per_cycle`` facts are created per run to
+           keep consolidation fast.
+
+        Parameters
+        ----------
+        result:
+            The running consolidation result to update in place.
+        scope:
+            Region filter — ``"all"`` or a specific region name.
+        """
+        min_similarity = self._cfg.abstraction_similarity
+        min_cluster = self._cfg.abstraction_min_cluster
+        min_age_days = self._cfg.abstraction_min_age_days
+        max_per_cycle = self._cfg.abstraction_max_per_cycle
+
+        # Fetch eligible experience atoms.
+        if scope == "all":
+            rows = await self._storage.execute(
+                """
+                SELECT * FROM atoms
+                WHERE type = 'experience'
+                  AND is_deleted = 0
+                  AND created_at < datetime('now', ?)
+                ORDER BY access_count DESC
+                """,
+                (f"-{min_age_days} days",),
+            )
+        else:
+            rows = await self._storage.execute(
+                """
+                SELECT * FROM atoms
+                WHERE type = 'experience'
+                  AND is_deleted = 0
+                  AND region = ?
+                  AND created_at < datetime('now', ?)
+                ORDER BY access_count DESC
+                """,
+                (scope, f"-{min_age_days} days"),
+            )
+
+        candidates = [Atom.from_row(r) for r in rows]
+        if len(candidates) < min_cluster:
+            return
+
+        # Pre-fetch IDs already abstracted (have a part-of synapse to a fact).
+        abstracted_rows = await self._storage.execute(
+            """
+            SELECT DISTINCT s.source_id
+            FROM synapses s
+            JOIN atoms a ON a.id = s.target_id
+            WHERE s.relationship = 'part-of'
+              AND s.strength > 0
+              AND a.type = 'fact'
+              AND a.is_deleted = 0
+            """
+        )
+        already_abstracted: set[int] = {r["source_id"] for r in abstracted_rows}
+
+        processed_ids: set[int] = set()
+
+        # ------------------------------------------------------------------
+        # Phase 1: Build clusters — separate reuse vs. new-fact candidates.
+        # We collect all clusters before writing so concurrent LLM distillation
+        # (W3-D) can fire over all pending new-fact clusters in one gather call.
+        # ------------------------------------------------------------------
+
+        reuse_items: list[tuple[list[Atom], Atom]] = []
+        new_items: list[tuple[list[Atom], Atom, float, float]] = []
+
+        for seed in candidates:
+            if len(reuse_items) + len(new_items) >= max_per_cycle:
+                break
+            if seed.id in already_abstracted or seed.id in processed_ids:
+                continue
+
+            try:
+                similar_raw = await self._embeddings.search_similar(
+                    seed.content, k=min_cluster * 4
+                )
+            except RuntimeError:
+                logger.warning(
+                    "Embedding unavailable for abstraction scan of atom %d; skipping",
+                    seed.id,
+                )
+                continue
+
+            # Build the cluster: seed + similar experiences above threshold.
+            # Collect eligible candidate IDs first, then batch-fetch atoms.
+            candidate_ids = [
+                cid
+                for cid, dist in similar_raw
+                if cid != seed.id
+                and cid not in already_abstracted
+                and cid not in processed_ids
+                and EmbeddingEngine.distance_to_similarity(dist) >= min_similarity
+            ]
+            id_to_atom = await self._atoms.get_batch_without_tracking(candidate_ids)
+
+            cluster: list[Atom] = [seed]
+            for candidate_id in candidate_ids:
+                member = id_to_atom.get(candidate_id)
+                if member is None or member.is_deleted or member.type != "experience":
+                    continue
+                if scope != "all" and member.region != scope:
+                    continue
+                cluster.append(member)
+
+            if len(cluster) < min_cluster:
+                continue
+
+            # The most-accessed experience is the best template for the fact.
+            template = max(cluster, key=lambda a: a.access_count)
+            # M-3: Log-scale confidence preserves cluster-size signal beyond 4.
+            fact_confidence = min(0.95, 0.5 + 0.15 * math.log1p(len(cluster)))
+            fact_importance = sum(a.importance for a in cluster) / len(cluster)
+
+            # Dedup guard: reuse an existing similar fact instead of creating
+            # a near-duplicate.  This prevents repeated consolidation cycles
+            # from accumulating facts that cover the same ground.
+            existing_fact: Atom | None = None
+            try:
+                existing_raw = await self._embeddings.search_similar(
+                    template.content, k=5
+                )
+                # M1: Batch-fetch all candidate IDs instead of per-item lookups.
+                eligible_eids = [
+                    eid
+                    for eid, edist in existing_raw
+                    if EmbeddingEngine.distance_to_similarity(edist) >= self._cfg.merge_threshold
+                ]
+                if eligible_eids:
+                    eid_map = await self._atoms.get_batch_without_tracking(eligible_eids)
+                    existing_fact = next(
+                        (
+                            eid_map[eid]
+                            for eid in eligible_eids
+                            if eid_map.get(eid)
+                            and not eid_map[eid].is_deleted
+                            and eid_map[eid].type == "fact"
+                        ),
+                        None,
+                    )
+            except RuntimeError:
+                pass  # Vector search unavailable; proceed without dedup check.
+
+            if existing_fact is not None:
+                reuse_items.append((cluster, existing_fact))
+            else:
+                new_items.append((cluster, template, fact_confidence, fact_importance))
+
+            processed_ids.update(a.id for a in cluster)
+
+        # ------------------------------------------------------------------
+        # Phase 2 (W3-D): Concurrently distil all new-fact clusters via LLM.
+        # When distillation is disabled or fails, verbatim template content
+        # is used as the fallback (no exception is ever raised to the caller).
+        # ------------------------------------------------------------------
+
+        if self._distill_enabled and new_items:
+            distilled_contents = await self._distill_clusters_concurrent(
+                [cluster for cluster, _, _, _ in new_items]
+            )
+        else:
+            # Distillation disabled: use verbatim template content.
+            distilled_contents = [template.content for _, template, _, _ in new_items]
+
+        # ------------------------------------------------------------------
+        # Phase 3: Write results to the database.
+        # ------------------------------------------------------------------
+
+        # Link cluster members to existing facts (reuse path).
+        reuse_link_params: list[tuple[int, int]] = []
+        for cluster, existing_fact in reuse_items:
+            cluster_template = max(cluster, key=lambda a: a.access_count)
+            result.details.append({
+                "action": "abstract_reuse",
+                "existing_fact_id": existing_fact.id,
+                "cluster_size": len(cluster),
+                "cluster_ids": [a.id for a in cluster],
+                "content_preview": cluster_template.content[:80],
+            })
+            if not result.dry_run:
+                for exp in cluster:
+                    reuse_link_params.append((exp.id, existing_fact.id))
+        if reuse_link_params:
+            await self._storage.execute_many(
+                """
+                INSERT OR IGNORE INTO synapses
+                    (source_id, target_id, relationship, strength, bidirectional)
+                VALUES (?, ?, 'part-of', 0.8, 0)
+                """,
+                reuse_link_params,
+            )
+
+        # Create new facts using distilled (or verbatim) content.
+        for (cluster, template, fact_confidence, fact_importance), fact_content in zip(
+            new_items, distilled_contents
+        ):
+            result.details.append({
+                "action": "abstract",
+                "cluster_size": len(cluster),
+                "cluster_ids": [a.id for a in cluster],
+                "template_id": template.id,
+                "fact_confidence": round(fact_confidence, 2),
+                "content_preview": fact_content[:80],
+            })
+
+            if not result.dry_run:
+                fact = await self._atoms.create(
+                    content=fact_content,
+                    type="fact",
+                    region=template.region,
+                    confidence=fact_confidence,
+                    importance=fact_importance,
+                    tags=template.tags,
+                    source_project=template.source_project,
+                    source_session=template.source_session,
+                )
+                # Batch-link all cluster members → new fact.
+                link_params = [(exp.id, fact.id) for exp in cluster]
+                await self._storage.execute_many(
+                    """
+                    INSERT OR IGNORE INTO synapses
+                        (source_id, target_id, relationship, strength, bidirectional)
+                    VALUES (?, ?, 'part-of', 0.8, 0)
+                    """,
+                    link_params,
+                )
+
+            result.abstracted += 1
+
+        if result.abstracted:
+            logger.info(
+                "Abstracted %d experience cluster(s) into facts "
+                "(min_cluster=%d, similarity=%.2f)",
+                result.abstracted,
+                min_cluster,
+                min_similarity,
+            )
+
+    # ------------------------------------------------------------------
+    # Step 0d2: Pattern detection — auto-create antipatterns from errors
+    # ------------------------------------------------------------------
+
+    # Error/failure indicators in experience content.  An experience must
+    # contain at least one of these to be considered an error occurrence.
+    _ERROR_INDICATORS: frozenset[str] = frozenset([
+        "error", "failed", "failure", "broke", "broken", "crash",
+        "timeout", "timed out", "exception", "traceback", "stack trace",
+        "doesn't work", "didn't work", "not working", "won't work",
+        "bug", "regression", "unexpected", "incorrect", "corrupted",
+        "rejected", "denied", "blocked", "rate limit", "429",
+        "out of memory", "oom", "segfault", "panic",
+        "data loss", "lost data", "missing data", "wrong result",
+    ])
+
+    async def _detect_error_patterns(
+        self,
+        result: ConsolidationResult,
+        scope: str,
+    ) -> None:
+        """Auto-create antipatterns from recurring error experiences.
+
+        Scans experience atoms containing error/failure language, clusters
+        them by embedding similarity, and promotes clusters above
+        ``pattern_min_cluster`` to antipatterns.  The new antipattern is
+        linked to each cluster member via ``warns-against`` synapses.
+
+        This implements the biological "sensitisation" mechanism: repeated
+        exposure to a noxious stimulus (error) creates a defensive memory
+        (antipattern) that triggers warnings on future similar contexts.
+        """
+        if not self._cfg.pattern_detection_enabled:
+            return
+
+        min_cluster = self._cfg.pattern_min_cluster
+        min_similarity = self._cfg.pattern_similarity
+        min_age_days = self._cfg.pattern_min_age_days
+        max_per_cycle = self._cfg.pattern_max_per_cycle
+
+        # Fetch eligible error experiences.
+        if scope == "all":
+            rows = await self._storage.execute(
+                """
+                SELECT * FROM atoms
+                WHERE type = 'experience'
+                  AND is_deleted = 0
+                  AND created_at < datetime('now', ?)
+                ORDER BY access_count DESC
+                """,
+                (f"-{min_age_days} days",),
+            )
+        else:
+            rows = await self._storage.execute(
+                """
+                SELECT * FROM atoms
+                WHERE type = 'experience'
+                  AND is_deleted = 0
+                  AND region = ?
+                  AND created_at < datetime('now', ?)
+                ORDER BY access_count DESC
+                """,
+                (scope, f"-{min_age_days} days"),
+            )
+
+        # Filter to experiences containing error indicators.
+        error_atoms: list[Atom] = []
+        for r in rows:
+            atom = Atom.from_row(r)
+            lower = atom.content.lower()
+            if any(ind in lower for ind in self._ERROR_INDICATORS):
+                error_atoms.append(atom)
+
+        if len(error_atoms) < min_cluster:
+            return
+
+        # Pre-fetch IDs already linked to an antipattern via warns-against
+        # (either the experience already IS an antipattern target, or it has
+        # already been pattern-detected in a prior cycle).
+        warned_rows = await self._storage.execute(
+            """
+            SELECT DISTINCT s.target_id
+            FROM synapses s
+            JOIN atoms a ON a.id = s.source_id
+            WHERE s.relationship = 'warns-against'
+              AND a.type = 'antipattern'
+              AND a.is_deleted = 0
+            """
+        )
+        already_warned: set[int] = {r["target_id"] for r in warned_rows}
+
+        # Also exclude experiences already abstracted into facts.
+        abstracted_rows = await self._storage.execute(
+            """
+            SELECT DISTINCT s.source_id
+            FROM synapses s
+            JOIN atoms a ON a.id = s.target_id
+            WHERE s.relationship = 'part-of'
+              AND a.type = 'fact'
+              AND a.is_deleted = 0
+            """
+        )
+        already_abstracted: set[int] = {r["source_id"] for r in abstracted_rows}
+
+        processed_ids: set[int] = set()
+        from memories.learning import ANTIPATTERN_CATEGORY_PREFIX
+
+        for seed in error_atoms:
+            if result.patterns_detected >= max_per_cycle:
+                break
+            if seed.id in already_warned or seed.id in already_abstracted:
+                continue
+            if seed.id in processed_ids:
+                continue
+
+            try:
+                similar_raw = await self._embeddings.search_similar(
+                    seed.content, k=min_cluster * 4
+                )
+            except RuntimeError:
+                continue
+
+            # Build cluster from similar error experiences.
+            candidate_ids = [
+                cid
+                for cid, dist in similar_raw
+                if cid != seed.id
+                and cid not in already_warned
+                and cid not in already_abstracted
+                and cid not in processed_ids
+                and EmbeddingEngine.distance_to_similarity(dist) >= min_similarity
+            ]
+            id_to_atom = await self._atoms.get_batch_without_tracking(candidate_ids)
+
+            cluster: list[Atom] = [seed]
+            for cid in candidate_ids:
+                member = id_to_atom.get(cid)
+                if member is None or member.is_deleted or member.type != "experience":
+                    continue
+                if scope != "all" and member.region != scope:
+                    continue
+                # Member must also contain error language.
+                if not any(ind in member.content.lower() for ind in self._ERROR_INDICATORS):
+                    continue
+                cluster.append(member)
+
+            if len(cluster) < min_cluster:
+                processed_ids.add(seed.id)
+                continue
+
+            # Use most-accessed experience as template.
+            template = max(cluster, key=lambda a: a.access_count)
+
+            # Check no near-identical antipattern already exists.
+            existing_ap: bool = False
+            try:
+                existing_raw = await self._embeddings.search_similar(
+                    template.content, k=5
+                )
+                check_ids = [
+                    eid for eid, edist in existing_raw
+                    if EmbeddingEngine.distance_to_similarity(edist) >= self._cfg.merge_threshold
+                ]
+                if check_ids:
+                    eid_map = await self._atoms.get_batch_without_tracking(check_ids)
+                    existing_ap = any(
+                        a and not a.is_deleted and a.type == "antipattern"
+                        for a in eid_map.values()
+                    )
+            except RuntimeError:
+                pass
+
+            if existing_ap:
+                processed_ids.update(a.id for a in cluster)
+                continue
+
+            # Synthesise antipattern content with prescriptive framing.
+            # Use LLM distillation when available for quality output;
+            # fall back to heuristic cleanup of the template content.
+            ap_content = await self._synthesise_antipattern(template, cluster)
+            ap_instead = await self._synthesise_antipattern_instead(template, cluster)
+
+            result.details.append({
+                "action": "pattern_detect",
+                "cluster_size": len(cluster),
+                "cluster_ids": [a.id for a in cluster],
+                "template_id": template.id,
+                "content_preview": ap_content[:80],
+            })
+
+            if not result.dry_run:
+                # Classify category before creating.
+                category = await self._learning_engine.suggest_antipattern_category(ap_content, [])
+
+                ap_tags = [f"{ANTIPATTERN_CATEGORY_PREFIX}{category}", "auto-detected"]
+                ap_atom = await self._atoms.create(
+                    content=ap_content,
+                    type="antipattern",
+                    region=template.region,
+                    confidence=min(0.90, 0.5 + 0.10 * math.log1p(len(cluster))),
+                    importance=0.7,
+                    tags=ap_tags,
+                    source_project=template.source_project,
+                    source_session=template.source_session,
+                    severity="medium",
+                    instead=ap_instead,
+                )
+
+                # Link antipattern → each cluster member with warns-against.
+                link_params = [(ap_atom.id, exp.id) for exp in cluster]
+                await self._storage.execute_many(
+                    """
+                    INSERT OR IGNORE INTO synapses
+                        (source_id, target_id, relationship, strength, bidirectional)
+                    VALUES (?, ?, 'warns-against', 0.6, 0)
+                    """,
+                    link_params,
+                )
+
+            result.patterns_detected += 1
+            processed_ids.update(a.id for a in cluster)
+
+        if result.patterns_detected:
+            logger.info(
+                "Pattern detection: auto-created %d antipattern(s) from recurring errors "
+                "(min_cluster=%d, similarity=%.2f)",
+                result.patterns_detected,
+                min_cluster,
+                min_similarity,
+            )
+
+    # ------------------------------------------------------------------
+    # Step 0e: Reconsolidation of superseded atoms
+    # ------------------------------------------------------------------
+
+    async def _reconsolidate_superseded(
+        self,
+        result: ConsolidationResult,
+    ) -> None:
+        """Transfer synapse context from superseded atoms to their superseder.
+
+        When atom B supersedes atom A, the old atom A may still hold valuable
+        synapses to other atoms in the graph.  Reconsolidation (Nader et al.
+        2000) transfers those network connections to the newer atom B so that
+        the updated information inherits the old version's graph position.
+
+        Criteria for reconsolidation:
+
+        - A ``supersedes`` synapse exists from B (superseder) to A (superseded).
+        - The superseded atom A has been accessed within the last 30 days
+          (reconsolidation is triggered by re-access making the trace labile).
+        - The superseded atom A has outgoing ``related-to`` synapses that the
+          superseder B lacks.
+
+        Actions:
+
+        1. For each ``related-to`` synapse from A to neighbor N, if B has no
+           synapse to N, create a weak ``related-to`` synapse B→N at 50% of
+           A→N's strength.
+        2. Weaken A's outgoing ``related-to`` synapses by 30%.
+        """
+        # Find superseded atoms that were recently accessed (labile state).
+        rows = await self._storage.execute(
+            """
+            SELECT s.source_id AS superseder_id,
+                   s.target_id AS superseded_id
+            FROM synapses s
+            JOIN atoms a ON a.id = s.target_id
+            WHERE s.relationship = 'supersedes'
+              AND s.strength > 0.5
+              AND a.is_deleted = 0
+              AND a.last_accessed_at IS NOT NULL
+              AND a.last_accessed_at > datetime('now', ?)
+            """,
+            (f"-{self._cfg.decay_after_days} days",),
+        )
+        if not rows:
+            return
+
+        if result.dry_run:
+            result.details.append({
+                "action": "reconsolidate",
+                "would_process": len(rows),
+            })
+            return
+
+        # Batch-fetch all related-to synapses for all superseded AND
+        # superseder atoms in 2 queries instead of 2*N per-pair queries.
+        all_superseded_ids = [row["superseded_id"] for row in rows]
+        all_superseder_ids = [row["superseder_id"] for row in rows]
+        all_ids = list(set(all_superseded_ids + all_superseder_ids))
+
+        if not all_ids:
+            return
+
+        placeholders = ",".join("?" * len(all_ids))
+        # Use UNION ALL instead of OR so SQLite can use indexes on each
+        # branch independently (perf M4 — OR across columns skips indexes).
+        all_related = await self._storage.execute(
+            f"""
+            SELECT source_id, target_id, strength, bidirectional FROM synapses
+            WHERE source_id IN ({placeholders}) AND relationship = 'related-to'
+            UNION ALL
+            SELECT source_id, target_id, strength, bidirectional FROM synapses
+            WHERE target_id IN ({placeholders}) AND bidirectional = 1
+              AND relationship = 'related-to'
+              AND source_id NOT IN ({placeholders})
+            """,
+            tuple(all_ids) + tuple(all_ids) + tuple(all_ids),
+        )
+
+        # Build lookup: atom_id → list of (neighbor_id, strength).
+        # For bidirectional synapses, index in both directions so that
+        # incoming connections on the superseded atom are also transferred.
+        neighbors_by_source: dict[int, list[tuple[int, float]]] = {}
+        existing_targets_by_source: dict[int, set[int]] = {}
+        for r in all_related:
+            src = r["source_id"]
+            tgt = r["target_id"]
+            strength = r["strength"]
+            # Forward direction: source → target
+            neighbors_by_source.setdefault(src, []).append((tgt, strength))
+            existing_targets_by_source.setdefault(src, set()).add(tgt)
+            # Reverse direction for bidirectional synapses: target → source
+            if r["bidirectional"]:
+                neighbors_by_source.setdefault(tgt, []).append((src, strength))
+                existing_targets_by_source.setdefault(tgt, set()).add(src)
+
+        transferred = 0
+        all_new_synapses: list[tuple[int, int, float]] = []
+        weakened_ids: list[tuple[int,]] = []
+
+        for row in rows:
+            superseder_id = row["superseder_id"]
+            superseded_id = row["superseded_id"]
+
+            old_neighbors = [
+                (tid, s) for tid, s in neighbors_by_source.get(superseded_id, [])
+                if s > 0.1
+            ]
+            if not old_neighbors:
+                continue
+
+            existing_targets = existing_targets_by_source.get(superseder_id, set())
+
+            for neighbor_id, strength in old_neighbors:
+                if neighbor_id in existing_targets or neighbor_id == superseder_id:
+                    continue
+                new_strength = min(1.0, strength * 0.5)
+                all_new_synapses.append((superseder_id, neighbor_id, new_strength))
+
+            weakened_ids.append((superseded_id,))
+
+        # H-2: Only weaken superseded atoms when synapses were actually
+        # transferred.  Hub-cap filtering may block all transfers, in which
+        # case weakening the superseded atom is pure loss with no compensation.
+        # must not bypass the 50-outbound related-to limit.
+        if all_new_synapses:
+            superseder_ids = list({s[0] for s in all_new_synapses})
+            ph = ",".join("?" * len(superseder_ids))
+            outbound_rows = await self._storage.execute(
+                f"SELECT source_id, COUNT(*) AS cnt FROM synapses "
+                f"WHERE source_id IN ({ph}) AND relationship = 'related-to' "
+                f"GROUP BY source_id",
+                tuple(superseder_ids),
+            )
+            outbound_counts = {r["source_id"]: r["cnt"] for r in outbound_rows}
+            outbound_added: dict[int, int] = {}
+            capped_synapses = []
+            for src_id, tgt_id, strength in all_new_synapses:
+                existing = outbound_counts.get(src_id, 0)
+                added = outbound_added.get(src_id, 0)
+                if existing + added < 50:
+                    capped_synapses.append((src_id, tgt_id, strength))
+                    outbound_added[src_id] = added + 1
+            all_new_synapses = capped_synapses
+
+        # Single batch INSERT for all new synapses.
+        if all_new_synapses:
+            await self._storage.execute_many(
+                """
+                INSERT OR IGNORE INTO synapses
+                    (source_id, target_id, relationship, strength, bidirectional)
+                VALUES (?, ?, 'related-to', ?, 1)
+                """,
+                all_new_synapses,
+            )
+            transferred = len(all_new_synapses)
+
+        # Single batch UPDATE to weaken superseded atoms whose synapses were
+        # actually transferred (H-2: skip atoms where hub cap blocked transfer).
+        transferred_superseders = {src for src, _, _ in all_new_synapses}
+        weakened_ids = [
+            wid for wid in weakened_ids
+            if any(
+                row["superseder_id"] in transferred_superseders
+                for row in rows
+                if row["superseded_id"] == wid[0]
+            )
+        ]
+        if weakened_ids:
+            weakened_set = list({wid[0] for wid in weakened_ids})
+            ph = ",".join("?" * len(weakened_set))
+            await self._storage.execute_write(
+                f"""
+                UPDATE synapses
+                SET strength = strength * 0.7
+                WHERE source_id IN ({ph})
+                  AND relationship = 'related-to'
+                """,
+                tuple(weakened_set),
+            )
+
+        if transferred:
+            result.details.append({
+                "action": "reconsolidate",
+                "synapses_transferred": transferred,
+                "pairs_processed": len(rows),
+            })
+            logger.info(
+                "Reconsolidation: transferred %d synapses from %d superseded atoms",
+                transferred,
+                len(rows),
+            )
+
+    # ------------------------------------------------------------------
+    # Step 1: Decay atom confidence
+    # ------------------------------------------------------------------
+
+    async def _decay_atoms(
+        self,
+        result: ConsolidationResult,
+        scope: str,
+    ) -> None:
+        """Decay confidence for atoms not accessed within the staleness window.
+
+        For each stale atom the confidence is multiplied by the configured
+        ``decay_rate`` (default 0.95), but never reduced below
+        :data:`_CONFIDENCE_FLOOR` (0.1).
+
+        Parameters
+        ----------
+        result:
+            The running consolidation result to update in place.
+        scope:
+            Region filter -- ``"all"`` or a specific region name.
+        """
+        stale_atoms = await self._atoms.get_stale(self._cfg.decay_after_days)
+
+        if scope != "all":
+            stale_atoms = [a for a in stale_atoms if a.region == scope]
+
+        if not stale_atoms:
+            logger.debug("No stale atoms to decay")
+            return
+
+        decay_rate = self._cfg.decay_rate
+        decay_after_days = self._cfg.decay_after_days
+        type_decay = self._cfg.type_decay_multipliers
+        transition_days = self._cfg.hybrid_decay_transition_days
+        power_exponent = self._cfg.hybrid_decay_power_exponent
+        ltp_tiers = self._cfg.ltp_tiers
+        # Pre-sort LTP thresholds descending so we can break on first match
+        # (highest qualifying tier).  Hoisted outside the loop to avoid
+        # re-sorting on every atom.
+        ltp_thresholds = sorted(ltp_tiers.keys(), reverse=True)
+        affected_ids: list[int] = []
+        confidence_updates: list[tuple[float, int]] = []
+        now = datetime.now(tz=timezone.utc)
+
+        for atom in stale_atoms:
+            # Time-aware decay: older atoms decay more per cycle.
+            # exponent = days_since_access / decay_after_days, so a just-stale
+            # atom (exponent=1) decays by decay_rate^1, a twice-as-old atom
+            # decays by decay_rate^2, etc.  Preserves backward compatibility
+            # for newly-stale atoms while punishing truly abandoned memories.
+            if atom.last_accessed_at:
+                try:
+                    last_accessed = datetime.fromisoformat(atom.last_accessed_at)
+                    if last_accessed.tzinfo is None:
+                        last_accessed = last_accessed.replace(tzinfo=timezone.utc)
+                    days_since = max(decay_after_days, (now - last_accessed).days)
+                except (ValueError, TypeError):
+                    days_since = decay_after_days
+            else:
+                days_since = decay_after_days
+
+            exponent = days_since / decay_after_days
+
+            # Multi-scale LTP: frequently accessed atoms are protected from
+            # decay.  Higher access_count → lower protection factor → smaller
+            # effective exponent → slower decay.  Iterates highest threshold
+            # first and breaks on match to pick the strongest qualifying tier.
+            ltp_factor = 1.0
+            for threshold in ltp_thresholds:
+                if atom.access_count >= threshold:
+                    ltp_factor = ltp_tiers[threshold]
+                    break
+            exponent *= ltp_factor
+
+            # Importance-modulated decay: high-importance atoms decay more
+            # slowly.  Maps importance [0, 1] to a protection factor [0.5, 1.0]
+            # so the most important atoms (importance=1.0) have their exponent
+            # halved — dramatically slower decay — while unimportant atoms
+            # (importance=0.0) decay at full rate.  Implements amygdala
+            # modulation of hippocampal consolidation (McGaugh 2004).
+            importance_protection = 1.0 - (atom.importance * 0.5)
+            exponent *= importance_protection
+
+            # B1: Per-type decay multiplier — skills/facts decay slowly,
+            # experiences decay faster.
+            effective_rate = decay_rate * type_decay.get(atom.type, 1.0)
+
+            # Hybrid decay: use max(exponential, power-law) so we always
+            # pick the more favorable (slower) decay curve.
+            # - Short-term: exponential is more favorable.
+            # - Long-term: power-law is more favorable (heavy tail).
+            # Implements Wixted & Ebbesen (1991) dual-process forgetting.
+            exp_confidence = atom.confidence * (effective_rate ** exponent)
+            if days_since > transition_days:
+                transition_exponent = (transition_days / decay_after_days) * ltp_factor * importance_protection
+                exp_part = effective_rate ** transition_exponent
+                power_part = (transition_days / days_since) ** power_exponent
+                power_confidence = atom.confidence * exp_part * power_part
+                new_confidence = max(exp_confidence, power_confidence)
+            else:
+                new_confidence = exp_confidence
+
+            # Enforce confidence floor.
+            new_confidence = max(_CONFIDENCE_FLOOR, new_confidence)
+
+            # Skip if the atom is already at or below the floor.
+            if atom.confidence <= _CONFIDENCE_FLOOR:
+                continue
+
+            affected_ids.append(atom.id)
+            confidence_updates.append((new_confidence, atom.id))
+
+            result.details.append({
+                "action": "decay",
+                "atom_id": atom.id,
+                "old_confidence": round(atom.confidence, 4),
+                "new_confidence": round(new_confidence, 4),
+                "days_since_access": days_since,
+                "exponent": round(exponent, 2),
+            })
+
+        result.decayed = len(affected_ids)
+
+        # E1: Batch all confidence updates in one execute_many instead of N updates.
+        if not result.dry_run and confidence_updates:
+            await self._storage.execute_many(
+                "UPDATE atoms SET confidence = ?, updated_at = datetime('now') WHERE id = ?",
+                confidence_updates,
+            )
+
+        if affected_ids:
+            logger.info(
+                "Decayed %d stale atoms (rate=%.2f, floor=%.2f)",
+                len(affected_ids),
+                decay_rate,
+                _CONFIDENCE_FLOOR,
+            )
+
+    # ------------------------------------------------------------------
+    # Step 2: Decay synapse strengths (relationship-aware)
+    # ------------------------------------------------------------------
+
+    async def _should_run_decay(self) -> bool:
+        """Return True if enough time has passed since the last decay run.
+
+        Checks the consolidation_log for the last 'reflect' action.
+        Decay runs at most once per ``decay_min_interval_hours`` (default 20h)
+        to prevent destructive compounding when consolidation is triggered
+        multiple times per day via MCP tool calls or manual reflect commands.
+        """
+        min_hours = self._cfg.decay_min_interval_hours
+        rows = await self._storage.execute(
+            "SELECT created_at FROM consolidation_log "
+            "WHERE action = 'reflect' ORDER BY created_at DESC LIMIT 1",
+        )
+        if not rows:
+            return True  # First run ever — always decay
+        try:
+            last_run = datetime.fromisoformat(rows[0]["created_at"])
+            if last_run.tzinfo is None:
+                last_run = last_run.replace(tzinfo=timezone.utc)
+            hours_since = (
+                datetime.now(tz=timezone.utc) - last_run
+            ).total_seconds() / 3600
+            return hours_since >= min_hours
+        except (ValueError, TypeError):
+            return True
+
+    async def _compute_decay_elapsed_fraction(self) -> float:
+        """Return elapsed time since last decay as a fraction of 24 hours.
+
+        Returns 1.0 if no prior decay timestamp exists (first run),
+        capped at 3.0 to prevent catastrophic decay after long offline periods.
+        """
+        last_decay_str = await self._storage.get_metadata("last_synapse_decay_at")
+        if not last_decay_str:
+            return 1.0  # First run — apply exactly one full day's worth
+
+        try:
+            last_decay = datetime.fromisoformat(last_decay_str)
+            if last_decay.tzinfo is None:
+                last_decay = last_decay.replace(tzinfo=timezone.utc)
+            elapsed_seconds = (datetime.now(tz=timezone.utc) - last_decay).total_seconds()
+            elapsed_fraction = elapsed_seconds / 86400.0
+            # Cap at 3 days to prevent catastrophic decay after long offline periods
+            return min(max(elapsed_fraction, 0.0), 3.0)
+        except (ValueError, TypeError):
+            return 1.0
+
+    async def _decay_synapses(self, result: ConsolidationResult) -> None:
+        """Apply time-proportional multiplicative decay to synapse strengths.
+
+        Uses ``decay_rate ** elapsed_fraction`` where elapsed_fraction is the
+        time since last decay divided by 24 hours.  This makes total daily
+        decay always equal to ``decay_rate^1.0`` regardless of how many times
+        consolidation runs per day.
+
+        Decay rates (per full day):
+        - encoded-with: decay_rate * 0.95 (faster for session links)
+        - supersedes (>180d old): 0.999 (very slow, prevents graph bloat)
+        - All other types: decay_rate
+        """
+        if result.dry_run:
+            stats = await self._synapses.get_stats()
+            total = stats.get("total", 0)
+            related_to_count = stats.get("by_relationship", {}).get("related-to", 0)
+            encoded_with_count = stats.get("by_relationship", {}).get("encoded-with", 0)
+            result.details.append({
+                "action": "decay_synapses",
+                "note": f"Would decay {total} synapses (time-proportional, related-to: {related_to_count}, encoded-with: {encoded_with_count})",
+                "total_synapses": total,
+                "related_to_count": related_to_count,
+                "encoded_with_count": encoded_with_count,
+            })
+            # base_decay is not used in the dry_run branch of _protect_ltp_synapses
+            await self._protect_ltp_synapses(result, base_decay=0.0)
+            return
+
+        # Compute elapsed fraction for time-proportional decay
+        elapsed_fraction = await self._compute_decay_elapsed_fraction()
+
+        base_decay = self._cfg.decay_rate ** elapsed_fraction
+        encoded_with_decay = (self._cfg.decay_rate * 0.95) ** elapsed_fraction
+        supersedes_decay = 0.999 ** elapsed_fraction
+
+        # Apply decay to related-to synapses
+        await self._storage.execute_write(
+            """
+            UPDATE synapses
+            SET strength = strength * ?
+            WHERE relationship = 'related-to'
+            """,
+            (base_decay,),
+        )
+
+        # Accelerated decay for "encoded-with" contextual bindings — these are
+        # session-temporal links that should fade faster than semantic links
+        # (Tulving encoding specificity: context drifts over time).
+        await self._storage.execute_write(
+            """
+            UPDATE synapses
+            SET strength = strength * ?
+            WHERE relationship = 'encoded-with'
+            """,
+            (encoded_with_decay,),
+        )
+
+        # Base decay for all other types (except supersedes).
+        # H-1: warns-against receives base_decay like other semantic synapses;
+        # active antipatterns are maintained by Hebbian co-activation.
+        await self._storage.execute_write(
+            """
+            UPDATE synapses
+            SET strength = strength * ?
+            WHERE relationship NOT IN ('related-to', 'encoded-with', 'supersedes')
+            """,
+            (base_decay,),
+        )
+
+        # Supersedes: very slow decay for old provenance pointers to prevent
+        # unbounded graph bloat from contradiction resolutions.
+        await self._storage.execute_write(
+            """
+            UPDATE synapses
+            SET strength = strength * ?
+            WHERE relationship = 'supersedes'
+              AND created_at < datetime('now', '-180 days')
+            """,
+            (supersedes_decay,),
+        )
+
+        # Re-strengthen synapses whose endpoints both qualify for LTP protection,
+        # partially counteracting the decay that was just applied.
+        await self._protect_ltp_synapses(result, base_decay)
+
+        # Record the timestamp of this decay run for future elapsed calculation
+        now_iso = datetime.now(tz=timezone.utc).isoformat()
+        await self._storage.set_metadata("last_synapse_decay_at", now_iso)
+
+        result.details.append({
+            "action": "decay_synapses",
+            "elapsed_fraction": round(elapsed_fraction, 4),
+            "base_factor": round(base_decay, 6),
+            "encoded_with_factor": round(encoded_with_decay, 6),
+        })
+
+        logger.info(
+            "Time-proportional synapse decay applied (elapsed=%.2f days, base=%.4f, encoded-with=%.4f)",
+            elapsed_fraction,
+            base_decay,
+            encoded_with_decay,
+        )
+
+    async def _protect_ltp_synapses(
+        self,
+        result: ConsolidationResult,
+        base_decay: float,
+    ) -> None:
+        """Re-strengthen synapses connecting frequently-accessed atoms.
+
+        After decay, synapses where BOTH endpoints qualify for LTP protection
+        (access_count >= minimum LTP tier, default 5) are partially restored.
+        The restoration factor is the geometric mean of the two endpoints' LTP
+        factors, applied as::
+
+            net_decay_exponent = base_decay ** protection
+            boost = 1 / (base_decay ** (1 - protection))
+
+        So the net effect on strength is ``strength *= base_decay ** protection``
+        rather than the full ``strength *= base_decay``.  An atom pair both in
+        the strongest tier (factor=0.1) keeps ``0.97^0.1 ≈ 99.7%`` of its
+        strength rather than the normal ``97%``.
+
+        Synapses with the ``supersedes`` relationship are excluded — those have
+        their own specialised decay rules in :meth:`_decay_synapses`.
+
+        Parameters
+        ----------
+        result:
+            Running consolidation result; a ``protect_ltp_synapses`` entry is
+            appended to ``result.details``.
+        base_decay:
+            The ``decay_rate ** elapsed_fraction`` factor that was just applied
+            to synapses in this cycle.  Passed in to avoid recomputing it.
+        """
+        ltp_tiers = self._cfg.ltp_tiers
+        min_tier = min(ltp_tiers.keys())  # 5 by default
+
+        if result.dry_run:
+            rows = await self._storage.execute(
+                """
+                SELECT COUNT(*) as cnt FROM synapses s
+                JOIN atoms a1 ON s.source_id = a1.id
+                JOIN atoms a2 ON s.target_id = a2.id
+                WHERE a1.access_count >= ? AND a2.access_count >= ?
+                  AND a1.is_deleted = 0 AND a2.is_deleted = 0
+                  AND s.relationship NOT IN ('supersedes')
+                """,
+                (min_tier, min_tier),
+            )
+            count = rows[0]["cnt"] if rows else 0
+            result.details.append({
+                "action": "protect_ltp_synapses",
+                "note": f"Would protect {count} synapses with LTP-qualifying endpoints",
+            })
+            return
+
+        # Skip protection when decay is negligible to avoid floating-point
+        # division instability (base_decay very close to 1.0 means elapsed_fraction
+        # is near zero — nothing meaningful to counteract).
+        if base_decay > 0.9999:
+            result.details.append({
+                "action": "protect_ltp_synapses",
+                "note": "Skipped — decay factor too close to 1.0 (negligible elapsed time)",
+            })
+            return
+
+        # Fetch all qualifying synapses together with each endpoint's LTP factor.
+        # The CASE expression maps access_count to the highest qualifying LTP tier
+        # factor (checked highest-first so the strongest tier wins).
+        # Tiers sorted descending: e.g. [(20, 0.1), (10, 0.33), (5, 0.5)]
+        reversed_tiers = sorted(ltp_tiers.items(), reverse=True)
+        # Build: CASE WHEN access_count >= 20 THEN 0.1 WHEN ... ELSE 1.0 END
+        when_clauses = " ".join(
+            f"WHEN access_count >= {threshold} THEN {factor}"
+            for threshold, factor in reversed_tiers
+        )
+        ltp_case = f"CASE {when_clauses} ELSE 1.0 END"
+
+        rows = await self._storage.execute(
+            f"""
+            SELECT s.id, s.strength,
+                   ({ltp_case.replace('access_count', 'a1.access_count')}) AS ltp_source,
+                   ({ltp_case.replace('access_count', 'a2.access_count')}) AS ltp_target
+            FROM synapses s
+            JOIN atoms a1 ON s.source_id = a1.id
+            JOIN atoms a2 ON s.target_id = a2.id
+            WHERE a1.access_count >= ? AND a2.access_count >= ?
+              AND a1.is_deleted = 0 AND a2.is_deleted = 0
+              AND s.relationship NOT IN ('supersedes')
+            """,
+            (min_tier, min_tier),
+        )
+
+        if not rows:
+            result.details.append({
+                "action": "protect_ltp_synapses",
+                "protected_count": 0,
+            })
+            return
+
+        updates: list[tuple[float, int]] = []
+        for row in rows:
+            ltp_source: float = row["ltp_source"]
+            ltp_target: float = row["ltp_target"]
+            # Geometric mean of the two LTP factors.
+            # Both factors are in (0, 1] — lower means more protected.
+            # A pair both at tier-20 (0.1) → protection = sqrt(0.1 * 0.1) = 0.1
+            # A mixed pair (0.1, 0.5) → protection = sqrt(0.05) ≈ 0.224
+            protection = math.sqrt(ltp_source * ltp_target)
+            # The boost exactly counteracts the (1 - protection) portion of decay:
+            #   strength_after_decay = strength * base_decay
+            #   boost = 1 / base_decay^(1 - protection)
+            #   net = strength * base_decay * boost = strength * base_decay^protection
+            boost = 1.0 / (base_decay ** (1.0 - protection))
+            new_strength = min(row["strength"] * boost, 1.0)
+            if abs(new_strength - row["strength"]) > 1e-8:
+                updates.append((new_strength, row["id"]))
+
+        if updates:
+            await self._storage.execute_many(
+                "UPDATE synapses SET strength = ? WHERE id = ?",
+                updates,
+            )
+
+        result.details.append({
+            "action": "protect_ltp_synapses",
+            "protected_count": len(updates),
+            "base_decay_used": round(base_decay, 6),
+        })
+
+        logger.info(
+            "LTP synapse protection: boosted %d synapses with high-access endpoints",
+            len(updates),
+        )
+
+    # ------------------------------------------------------------------
+    # Step 3: Prune weak synapses
+    # ------------------------------------------------------------------
+
+    async def _prune_synapses(self, result: ConsolidationResult) -> None:
+        """Remove synapses whose strength is below the prune threshold.
+
+        Uses :meth:`SynapseManager.prune_weak`.  This is an explicit pass
+        that catches any stragglers not already removed during synapse decay.
+        """
+        threshold = self._cfg.prune_threshold
+
+        if result.dry_run:
+            # Count how many would be pruned without actually deleting.
+            rows = await self._storage.execute(
+                "SELECT COUNT(*) AS cnt FROM synapses WHERE strength < ?",
+                (threshold,),
+            )
+            would_prune = rows[0]["cnt"] if rows else 0
+            result.details.append({
+                "action": "prune_synapses",
+                "note": f"Would prune {would_prune} synapses below threshold {threshold}",
+                "would_prune": would_prune,
+            })
+            result.pruned += would_prune
+            return
+
+        pruned = await self._synapses.prune_weak(threshold)
+        result.pruned += pruned
+
+        result.details.append({
+            "action": "prune_synapses",
+            "threshold": threshold,
+            "pruned": pruned,
+        })
+
+        if pruned > 0:
+            logger.info(
+                "Pruned %d weak synapses (threshold=%.4f)",
+                pruned,
+                threshold,
+            )
+
+    # ------------------------------------------------------------------
+    # Step 4a: Merge exact duplicates (fast, hash-based)
+    # ------------------------------------------------------------------
+
+    async def _merge_exact_duplicates(
+        self,
+        result: ConsolidationResult,
+        scope: str,
+    ) -> None:
+        """Merge atoms with identical normalized content (fast, O(n) pass).
+
+        Uses content hashing to quickly identify exact duplicates before
+        the more expensive embedding-based merge pass. This catches cases
+        where the same memory was stored multiple times verbatim.
+
+        Parameters
+        ----------
+        result:
+            The running consolidation result to update in place.
+        scope:
+            Region filter -- ``"all"`` or a specific region name.
+        """
+        # L-2: Fetch only the minimal columns needed for signature grouping.
+        # The previous SELECT * materialised full Atom objects for every active
+        # atom (O(n) memory).  We now:
+        #  1. Select only id + content + type to compute signatures (~3× smaller)
+        #  2. Only fully hydrate atoms in groups with actual duplicates
+        _MERGE_COLS = "id, content, type"
+        if scope == "all":
+            rows = await self._storage.execute(
+                f"SELECT {_MERGE_COLS} FROM atoms WHERE is_deleted = 0"
+            )
+        else:
+            rows = await self._storage.execute(
+                f"SELECT {_MERGE_COLS} FROM atoms WHERE is_deleted = 0 AND region = ?",
+                (scope,),
+            )
+
+        if not rows:
+            return
+
+        # Group by content signature + type using only lightweight dicts.
+        signature_groups: dict[tuple[str, str], list[int]] = {}
+        for row in rows:
+            sig = _content_signature(row["content"])
+            key = (sig, row["type"])
+            if key not in signature_groups:
+                signature_groups[key] = []
+            signature_groups[key].append(row["id"])
+
+        # Collect IDs of groups with duplicates (2+); batch-fetch full atoms.
+        dup_ids: list[int] = []
+        dup_groups: list[tuple[str, str, list[int]]] = []
+        for (sig, atom_type), ids in signature_groups.items():
+            if len(ids) >= 2:
+                dup_ids.extend(ids)
+                dup_groups.append((sig, atom_type, ids))
+
+        if not dup_ids:
+            return
+
+        full_atoms = await self._atoms.get_batch_without_tracking(dup_ids)
+
+        merged_count = 0
+        for sig, atom_type, ids in dup_groups:
+            group = [full_atoms[aid] for aid in ids if aid in full_atoms]
+            if len(group) < 2:
+                continue
+
+            # Sort by confidence (desc) then creation time (desc)
+            group.sort(
+                key=lambda a: (a.confidence, a.created_at),
+                reverse=True,
+            )
+
+            survivor = group[0]
+            for duplicate in group[1:]:
+                result.details.append({
+                    "action": "merge_exact",
+                    "survivor_id": survivor.id,
+                    "duplicate_id": duplicate.id,
+                    "content_signature": sig,
+                    "type": atom_type,
+                })
+
+                if not result.dry_run:
+                    await self._execute_merge(survivor, duplicate)
+
+                merged_count += 1
+                logger.info(
+                    "Merged exact duplicate: atom %d into %d (type=%s)",
+                    duplicate.id,
+                    survivor.id,
+                    atom_type,
+                )
+
+        result.merged += merged_count
+
+        if merged_count > 0:
+            logger.info("Merged %d exact duplicate atoms", merged_count)
+
+    # ------------------------------------------------------------------
+    # Step 4b: Merge near-duplicate atoms (embedding-based)
+    # ------------------------------------------------------------------
+
+    async def _merge_duplicates(
+        self,
+        result: ConsolidationResult,
+        scope: str,
+    ) -> None:
+        """Find and merge near-duplicate atom pairs.
+
+        Algorithm
+        ---------
+        1. Fetch all active (non-deleted) atoms in scope.
+        2. For each atom, perform a vector similarity search.
+        3. If a pair has similarity above ``merge_threshold`` (0.95) and
+           shares the same type:
+
+           a. **Keep** the atom with higher confidence (or the more recently
+              created one if confidences are equal).
+           b. Merge tags from both atoms onto the survivor.
+           c. Redirect all synapses from the duplicate to the survivor.
+           d. Create a ``supersedes`` synapse from survivor to duplicate.
+           e. Soft-delete the duplicate.
+
+        4. Already-processed pairs are tracked to avoid re-processing
+           (since ``A -> B`` and ``B -> A`` would both be discovered).
+
+        Parameters
+        ----------
+        result:
+            The running consolidation result to update in place.
+        scope:
+            Region filter -- ``"all"`` or a specific region name.
+        """
+        # Fetch all active atoms, optionally filtered by region.
+        if scope == "all":
+            rows = await self._storage.execute(
+                "SELECT * FROM atoms WHERE is_deleted = 0 "
+                "ORDER BY confidence DESC, created_at DESC"
+            )
+        else:
+            rows = await self._storage.execute(
+                "SELECT * FROM atoms WHERE is_deleted = 0 AND region = ? "
+                "ORDER BY confidence DESC, created_at DESC",
+                (scope,),
+            )
+
+        atoms_list = [Atom.from_row(r) for r in rows]
+
+        if not atoms_list:
+            logger.debug("No active atoms to check for duplicates")
+            return
+
+        # Track pairs we have already considered to avoid double processing.
+        merged_ids: set[int] = set()
+
+        # H-1: Batch-embed all atom contents in a single Ollama call, then
+        # use the pre-computed vectors for ANN search — avoids O(n) HTTP
+        # round-trips to the embedding server.
+        try:
+            all_embeddings = await self._embeddings.embed_batch(
+                [a.content for a in atoms_list]
+            )
+        except RuntimeError:
+            logger.warning(
+                "Embedding unavailable for merge scan; skipping _merge_duplicates"
+            )
+            return
+
+        embedding_by_id: dict[int, list[float]] = {
+            atom.id: emb for atom, emb in zip(atoms_list, all_embeddings)
+        }
+
+        for atom in atoms_list:
+            # Skip atoms that have already been consumed by a merge.
+            if atom.id in merged_ids:
+                continue
+
+            emb = embedding_by_id.get(atom.id)
+            if emb is None:
+                continue
+
+            try:
+                similar = await self._embeddings.search_similar(emb, k=10)
+            except RuntimeError:
+                logger.warning(
+                    "Vector search failed for atom %d; skipping",
+                    atom.id,
+                )
+                continue
+
+            # D1: Filter candidates above threshold, then batch-fetch atoms
+            # instead of issuing per-candidate get_without_tracking calls.
+            filtered_candidates = [
+                (candidate_id, distance)
+                for candidate_id, distance in similar
+                if candidate_id != atom.id
+                and candidate_id not in merged_ids
+                and EmbeddingEngine.distance_to_similarity(distance) >= self._cfg.merge_threshold
+            ]
+            if not filtered_candidates:
+                continue
+
+            candidate_ids = [cid for cid, _ in filtered_candidates]
+            candidates_map = await self._atoms.get_batch_without_tracking(candidate_ids)
+
+            for candidate_id, distance in filtered_candidates:
+                candidate = candidates_map.get(candidate_id)
+                if candidate is None or candidate.is_deleted:
+                    continue
+
+                # Must be the same type to merge.
+                if candidate.type != atom.type:
+                    continue
+
+                # Apply scope filter to the candidate as well.
+                if scope != "all" and candidate.region != scope:
+                    continue
+
+                similarity = EmbeddingEngine.distance_to_similarity(distance)
+
+                # Determine which atom survives.
+                survivor, duplicate = self._pick_survivor(atom, candidate)
+
+                result.details.append({
+                    "action": "merge",
+                    "survivor_id": survivor.id,
+                    "duplicate_id": duplicate.id,
+                    "similarity": round(similarity, 4),
+                    "survivor_confidence": round(survivor.confidence, 4),
+                    "duplicate_confidence": round(duplicate.confidence, 4),
+                })
+
+                if not result.dry_run:
+                    await self._execute_merge(survivor, duplicate)
+
+                merged_ids.add(duplicate.id)
+                result.merged += 1
+
+                logger.info(
+                    "Merged atom %d into %d (similarity=%.4f, type=%s)",
+                    duplicate.id,
+                    survivor.id,
+                    similarity,
+                    atom.type,
+                )
+
+    @staticmethod
+    def _pick_survivor(atom_a: Atom, atom_b: Atom) -> tuple[Atom, Atom]:
+        """Decide which atom survives a merge.
+
+        The atom with higher confidence wins.  On a tie the more recently
+        created atom is preferred (it likely contains fresher information).
+
+        Parameters
+        ----------
+        atom_a:
+            First candidate.
+        atom_b:
+            Second candidate.
+
+        Returns
+        -------
+        tuple[Atom, Atom]
+            ``(survivor, duplicate)`` -- the first element is kept, the
+            second is soft-deleted.
+        """
+        if atom_a.confidence > atom_b.confidence:
+            return atom_a, atom_b
+        if atom_b.confidence > atom_a.confidence:
+            return atom_b, atom_a
+
+        # Equal confidence -- prefer the more recent atom.
+        if atom_a.created_at >= atom_b.created_at:
+            return atom_a, atom_b
+        return atom_b, atom_a
+
+    async def _execute_merge(self, survivor: Atom, duplicate: Atom) -> None:
+        """Carry out the actual merge of *duplicate* into *survivor*.
+
+        The entire merge is executed inside a single transaction to
+        guarantee crash-safety.  Steps:
+
+        1. Merge tags from both atoms (union, deduplicated).
+        2. Redirect all synapses from the duplicate to the survivor.
+        3. Create a ``supersedes`` synapse from survivor to duplicate.
+        4. Soft-delete the duplicate atom and decrement its region counter.
+
+        Parameters
+        ----------
+        survivor:
+            The atom that will remain active.
+        duplicate:
+            The atom that will be absorbed and soft-deleted.
+        """
+        merged_tags = list(dict.fromkeys(survivor.tags + duplicate.tags))
+        tags_json = json.dumps(merged_tags) if merged_tags else None
+
+        def _do_merge(conn: sqlite3.Connection) -> int:
+            # 1. Merge tags onto survivor.
+            conn.execute(
+                "UPDATE atoms SET tags = ?, updated_at = datetime('now') WHERE id = ?",
+                (tags_json, survivor.id),
+            )
+
+            # 2. Redirect synapses inline.
+            rows = conn.execute(
+                "SELECT id, source_id, target_id, relationship FROM synapses "
+                "WHERE source_id = ? OR target_id = ?",
+                (duplicate.id, duplicate.id),
+            ).fetchall()
+
+            redirected = 0
+            for row in rows:
+                sid = row["id"]
+                source = row["source_id"]
+                target = row["target_id"]
+                rel = row["relationship"]
+
+                new_source = survivor.id if source == duplicate.id else source
+                new_target = survivor.id if target == duplicate.id else target
+
+                if new_source == new_target:
+                    conn.execute("DELETE FROM synapses WHERE id = ?", (sid,))
+                    continue
+
+                conflict = conn.execute(
+                    "SELECT id FROM synapses "
+                    "WHERE source_id = ? AND target_id = ? AND relationship = ?",
+                    (new_source, new_target, rel),
+                ).fetchone()
+
+                if conflict:
+                    conn.execute("DELETE FROM synapses WHERE id = ?", (sid,))
+                else:
+                    conn.execute(
+                        "UPDATE synapses SET source_id = ?, target_id = ? WHERE id = ?",
+                        (new_source, new_target, sid),
+                    )
+                    redirected += 1
+
+            # 3. Create supersedes synapse (ignore if self-reference).
+            if survivor.id != duplicate.id:
+                conn.execute(
+                    """
+                    INSERT INTO synapses
+                        (source_id, target_id, relationship, strength, bidirectional)
+                    VALUES (?, ?, 'supersedes', 1.0, 0)
+                    ON CONFLICT(source_id, target_id, relationship) DO UPDATE SET
+                        strength = 1.0,
+                        activated_count = synapses.activated_count + 1,
+                        last_activated_at = datetime('now')
+                    """,
+                    (survivor.id, duplicate.id),
+                )
+
+            # 4. Soft-delete the duplicate and adjust region counter.
+            conn.execute(
+                "UPDATE atoms SET is_deleted = 1, updated_at = datetime('now') WHERE id = ?",
+                (duplicate.id,),
+            )
+            conn.execute(
+                "UPDATE regions SET atom_count = MAX(atom_count - 1, 0) WHERE name = ?",
+                (duplicate.region,),
+            )
+
+            return redirected
+
+        redirected = await self._storage.execute_transaction(_do_merge)
+        logger.debug(
+            "Merged atom %d into %d (redirected %d synapses)",
+            duplicate.id,
+            survivor.id,
+            redirected,
+        )
+
+    # ------------------------------------------------------------------
+    # Step 5: Promote frequently accessed atoms
+    # ------------------------------------------------------------------
+
+    async def _promote_strong(
+        self,
+        result: ConsolidationResult,
+        scope: str,
+    ) -> None:
+        """Boost confidence for frequently accessed atoms.
+
+        Atoms with ``access_count >= promote_access_count`` (default 20)
+        receive a tiered confidence boost: each full multiple of
+        ``promote_access_count`` earns +0.05, capped at 4 tiers (+0.20 max).
+        More frequently accessed atoms earn larger boosts, rewarding core
+        memories proportional to how heavily the system relies on them.
+
+        Parameters
+        ----------
+        result:
+            The running consolidation result to update in place.
+        scope:
+            Region filter -- ``"all"`` or a specific region name.
+        """
+        min_access = self._cfg.promote_access_count
+
+        if scope == "all":
+            rows = await self._storage.execute(
+                """
+                SELECT * FROM atoms
+                WHERE is_deleted = 0
+                  AND access_count >= ?
+                  AND confidence < 1.0
+                ORDER BY access_count DESC
+                """,
+                (min_access,),
+            )
+        else:
+            rows = await self._storage.execute(
+                """
+                SELECT * FROM atoms
+                WHERE is_deleted = 0
+                  AND access_count >= ?
+                  AND confidence < 1.0
+                  AND region = ?
+                ORDER BY access_count DESC
+                """,
+                (min_access, scope),
+            )
+
+        candidates = [Atom.from_row(r) for r in rows]
+
+        if not candidates:
+            logger.debug("No atoms eligible for promotion")
+            return
+
+        # E1: Collect all confidence updates and batch into one execute_many.
+        confidence_updates: list[tuple[float, int]] = []
+
+        for atom in candidates:
+            # Tiered boost: each full multiple of promote_access_count earns +0.05,
+            # capped at 4 tiers (+0.20 max).  More-accessed atoms get more credit.
+            tiers = min(4, atom.access_count // min_access)
+            boost = tiers * 0.05
+            new_confidence = min(1.0, atom.confidence + boost)
+
+            result.details.append({
+                "action": "promote",
+                "atom_id": atom.id,
+                "access_count": atom.access_count,
+                "old_confidence": round(atom.confidence, 4),
+                "new_confidence": round(new_confidence, 4),
+            })
+            confidence_updates.append((new_confidence, atom.id))
+            result.promoted += 1
+
+        if not result.dry_run and confidence_updates:
+            await self._storage.execute_many(
+                "UPDATE atoms SET confidence = ?, updated_at = datetime('now') WHERE id = ?",
+                confidence_updates,
+            )
+
+        logger.info(
+            "Promoted %d frequently accessed atoms (min_access=%d)",
+            result.promoted,
+            min_access,
+        )
+
+    # ------------------------------------------------------------------
+    # Consolidation logging
+    # ------------------------------------------------------------------
+
+    async def _log_consolidation(self, result: ConsolidationResult) -> None:
+        """Write a summary record to the ``consolidation_log`` table.
+
+        Encodes the detail log and affected atom IDs as JSON strings for
+        the ``details`` and ``atoms_affected`` columns respectively.
+
+        Parameters
+        ----------
+        result:
+            The completed consolidation result.
+        """
+        # Extract all unique atom IDs mentioned in the details.
+        affected_ids: set[int] = set()
+        for detail in result.details:
+            for key in ("atom_id", "survivor_id", "duplicate_id"):
+                if key in detail:
+                    affected_ids.add(detail[key])
+
+        summary = {
+            "merged": result.merged,
+            "decayed": result.decayed,
+            "pruned": result.pruned,
+            "promoted": result.promoted,
+        }
+
+        # Write one summary row per consolidation cycle.
+        await self._storage.execute_write(
+            """
+            INSERT INTO consolidation_log (action, details, atoms_affected)
+            VALUES (?, ?, ?)
+            """,
+            (
+                "reflect",
+                json.dumps(summary),
+                json.dumps(sorted(affected_ids)),
+            ),
+        )
+
+        # Optionally write per-action rows for fine-grained auditing.
+        action_types = {"merge", "decay", "promote"}
+        for action_type in action_types:
+            action_details = [
+                d for d in result.details if d.get("action") == action_type
+            ]
+            if not action_details:
+                continue
+
+            action_atom_ids: set[int] = set()
+            for detail in action_details:
+                for key in ("atom_id", "survivor_id", "duplicate_id"):
+                    if key in detail:
+                        action_atom_ids.add(detail[key])
+
+            await self._storage.execute_write(
+                """
+                INSERT INTO consolidation_log (action, details, atoms_affected)
+                VALUES (?, ?, ?)
+                """,
+                (
+                    action_type,
+                    json.dumps(action_details),
+                    json.dumps(sorted(action_atom_ids)),
+                ),
+            )
+
+        logger.debug("Consolidation actions logged to consolidation_log table")
+
+    # ------------------------------------------------------------------
+    # Auto-skill generation
+    # ------------------------------------------------------------------
+
+    async def _maybe_generate_skills(
+        self, dry_run: bool = False
+    ) -> dict[str, list[str]]:
+        """Auto-generate SKILL.md for project regions that have matured.
+
+        Queries every distinct ``project:*`` region.  For regions with
+        ``>= skill_gen_min_atoms`` high-importance atoms (importance >= 0.6,
+        not deleted), calls :func:`~memories.skill_gen.generate_skill` and
+        writes to ``skill_output_dir``.
+
+        Uses a count-based dirty check via
+        :func:`~memories.skill_gen._count_project_atoms` — no write if the
+        region has not changed since last run.
+
+        Parameters
+        ----------
+        dry_run:
+            If ``True``, report which projects *would* generate but skip I/O.
+
+        Returns
+        -------
+        dict[str, list[str]]
+            Mapping of ``project_name`` → list of action strings, each one
+            of ``"generated"``, ``"skipped"``, ``"would_generate"``, or
+            ``"error"``.
+        """
+        import os
+        from pathlib import Path as _Path
+
+        from memories.skill_gen import _count_project_atoms, generate_skill
+
+        cfg = get_config()
+        min_atoms = cfg.consolidation.skill_gen_min_atoms
+
+        if min_atoms <= 0:
+            return {}
+
+        # Collect all project regions present in the atoms table.
+        rows = await self._storage.execute(
+            """
+            SELECT DISTINCT region FROM atoms
+            WHERE region LIKE 'project:%'
+              AND is_deleted = 0
+            """,
+        )
+
+        if not rows:
+            return {}
+
+        results: dict[str, list[str]] = {}
+        db_path = self._storage.db_path
+
+        for row in rows:
+            region = row["region"]
+            project = region[len("project:"):]
+
+            count = _count_project_atoms(
+                project, min_importance=0.6, db_path=db_path
+            )
+
+            if count < min_atoms:
+                results.setdefault(project, []).append("skipped")
+                continue
+
+            if dry_run:
+                results.setdefault(project, []).append("would_generate")
+                continue
+
+            try:
+                output_path: str | None = None
+                skill_dir = cfg.skill_output_dir
+                if skill_dir:
+                    out_dir = _Path(os.getcwd()) / skill_dir / project
+                    output_path = str(out_dir / "SKILL.md")
+
+                await generate_skill(project, output_path=output_path, db_path=db_path)
+                results.setdefault(project, []).append("generated")
+                logger.info(
+                    "Auto-generated SKILL.md for project '%s' (%d high-importance atoms)",
+                    project,
+                    count,
+                )
+            except Exception as exc:  # noqa: BLE001
+                results.setdefault(project, []).append("error")
+                logger.warning(
+                    "Failed to auto-generate SKILL.md for '%s': %s", project, exc
+                )
+
+        return results
+
+    # ------------------------------------------------------------------
+    # Rejection pattern learning
+    # ------------------------------------------------------------------
+
+    async def _learn_from_rejections(self, result: ConsolidationResult) -> None:
+        """Analyze recent atom rejections and learn new junk patterns.
+
+        Queries atom_rejections for the last 30 days, groups by reason,
+        and for reasons with sufficient volume (>= 10 hits) that don't
+        already have a static or learned pattern, extracts common
+        substrings and stores them in rejection_patterns.
+        """
+        try:
+            rows = await self._storage.execute(
+                """
+                SELECT reason, COUNT(*) AS cnt
+                FROM atom_rejections
+                WHERE created_at >= datetime('now', '-30 days')
+                GROUP BY reason
+                HAVING cnt >= 10
+                ORDER BY cnt DESC
+                """,
+            )
+        except Exception:
+            return
+
+        if not rows:
+            return
+
+        # Load existing patterns to avoid duplicates.
+        try:
+            existing = await self._storage.execute(
+                "SELECT pattern FROM rejection_patterns"
+            )
+            existing_patterns = {r["pattern"] for r in existing}
+        except Exception:
+            existing_patterns = set()
+
+        # Import the static patterns for comparison.
+        from memories.cli import _JUNK_PATTERNS
+        static_substrings = {p[0] for p in _JUNK_PATTERNS}
+
+        learned_count = 0
+        for row in rows:
+            reason = row["reason"]
+
+            # Fetch the actual rejected content for this reason.
+            try:
+                content_rows = await self._storage.execute(
+                    """
+                    SELECT content FROM atom_rejections
+                    WHERE reason = ?
+                      AND created_at >= datetime('now', '-30 days')
+                    LIMIT 50
+                    """,
+                    (reason,),
+                )
+            except Exception:
+                continue
+
+            contents = [r["content"].lower() for r in content_rows if r["content"]]
+            if len(contents) < 10:
+                continue
+
+            # Find common substrings (ngrams of 3-6 words) that appear
+            # in >= 60% of the rejected content for this reason.
+            # Run in thread to avoid blocking the event loop with O(N*W^2) work.
+            import anyio
+            common = await anyio.to_thread.run_sync(
+                lambda: self._find_common_substrings(contents)
+            )
+
+            for substring in common:
+                if substring in static_substrings or substring in existing_patterns:
+                    continue
+
+                try:
+                    await self._storage.execute_write(
+                        """
+                        INSERT OR IGNORE INTO rejection_patterns
+                            (pattern, reason, source, hit_count)
+                        VALUES (?, ?, 'learned', ?)
+                        """,
+                        (substring, reason, len(contents)),
+                    )
+                    existing_patterns.add(substring)
+                    learned_count += 1
+                except Exception:
+                    continue
+
+        result.rejection_patterns_learned = learned_count
+        if learned_count:
+            result.details.append({
+                "action": "learn_rejection_patterns",
+                "patterns_learned": learned_count,
+            })
+            logger.info("Learned %d new rejection patterns from atom_rejections", learned_count)
+            # Invalidate the cached learned patterns so they're reloaded
+            # on the next _is_junk() call within this process.
+            import memories.cli as _cli_mod
+            _cli_mod._learned_patterns = None
+
+        # Purge old rejections (>30 days) to prevent unbounded table growth.
+        try:
+            await self._storage.execute_write(
+                "DELETE FROM atom_rejections WHERE created_at < datetime('now', '-30 days')"
+            )
+        except Exception:
+            pass  # Best-effort purge
+
+    @staticmethod
+    def _find_common_substrings(
+        contents: list[str],
+        min_words: int = 3,
+        max_words: int = 6,
+        min_frequency: float = 0.6,
+    ) -> list[str]:
+        """Find word ngrams common across >= min_frequency of the contents."""
+        from collections import Counter
+
+        ngram_counts: Counter[str] = Counter()
+        total = len(contents)
+
+        for text in contents:
+            words = text.split()
+            seen_in_this: set[str] = set()
+            for n in range(min_words, min(max_words + 1, len(words) + 1)):
+                for i in range(len(words) - n + 1):
+                    ngram = " ".join(words[i:i + n])
+                    if ngram not in seen_in_this:
+                        seen_in_this.add(ngram)
+                        ngram_counts[ngram] += 1
+
+        # Filter to ngrams appearing in >= min_frequency of documents.
+        threshold = max(2, int(total * min_frequency))
+        common = [
+            ngram for ngram, count in ngram_counts.most_common()
+            if count >= threshold and len(ngram) >= 10
+        ]
+
+        # Remove ngrams that are substrings of other common ngrams.
+        filtered: list[str] = []
+        for ngram in common:
+            if not any(ngram != other and ngram in other for other in common):
+                filtered.append(ngram)
+
+        return filtered[:5]  # Cap at 5 new patterns per reason
