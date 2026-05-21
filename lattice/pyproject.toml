@@ -1,6 +1,6 @@
 [project]
 name = "lattice"
-version = "0.0.1"
+version = "0.1.0"
 description = "A compositional, self-improving reasoning substrate for small coding LLMs"
 readme = "README.md"
 license = {text = "Apache-2.0"}
@@ -17,12 +17,13 @@ keywords = [
     "structured-reasoning",
 ]
 classifiers = [
-    "Development Status :: 2 - Pre-Alpha",
+    "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
     "License :: OSI Approved :: Apache Software License",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.13",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Code Generators",
 ]
 dependencies = [
     "pydantic>=2.9",
