@@ -60,7 +60,7 @@ _PATTERNS: list[tuple[re.Pattern[str], str]] = [
             \s+of\s+type\s+
             ['"`]?(?P<typ>[A-Za-z_][\w\[\].,\s|]*?)['"`]?
             (?:\s+(?:with\s+)?defaul[tT]\s+
-                ['"`]?(?P<default>[^'"`\s,;]+)['"`]?
+                (?P<default>"[^"]*"|'[^']*'|`[^`]*`|[^\s,;]+)
             )?
             \s+to\s+(?:function|method)\s+
             ['"`]?(?P<func>[A-Za-z_][\w.]*)['"`]?
@@ -83,7 +83,7 @@ _PATTERNS: list[tuple[re.Pattern[str], str]] = [
             ['"`]?(?P<name>[A-Za-z_]\w*)['"`]?
             (?:\s+of\s+type\s+['"`]?(?P<typ>[A-Za-z_][\w\[\].,\s|]*?)['"`]?)?
             (?:\s+(?:with\s+)?defaul[tT]\s+
-                ['"`]?(?P<default>[^'"`\s,;]+)['"`]?
+                (?P<default>"[^"]*"|'[^']*'|`[^`]*`|[^\s,;]+)
             )?
             \s+to\s+(?:class\s+)?
             ['"`]?(?P<cls>[A-Za-z_]\w*)['"`]?
