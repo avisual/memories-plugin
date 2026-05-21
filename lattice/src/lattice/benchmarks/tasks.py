@@ -159,6 +159,32 @@ TASKS: tuple[BenchTask, ...] = (
         flags=("--two-stage", "--model", "Qwen/Qwen2.5-0.5B-Instruct"),
         timeout_s=600.0,
     ),
+    # Multi-step LLM-tier task — exercises plan-DAG end-to-end with a
+    # real small model. Step 1 (AddImport) is pattern-routable; step 2
+    # (AddStatement) needs the LLM. Plan-DAG advances after each
+    # successful edit; both must land for the task to pass. The
+    # demonstration the user asked for: a 'simple one line change' is
+    # NOT what the harness handles — it handles ordered multi-step
+    # work, with the second step seeing the first step's edit already
+    # applied via the overlay.
+    BenchTask(
+        name="multistep-llm-plan-dag",
+        tier="llm",
+        task=(
+            "Add an import of flask_cors to src/app.py; "
+            "then use AddStatement to insert a single statement "
+            "cors = CORS(app) at the end of src/app.py"
+        ),
+        files={"src/app.py": _flask_app()},
+        expects={
+            "src/app.py": (
+                "from flask_cors",
+                "cors = CORS(app)",
+            ),
+        },
+        flags=("--two-stage", "--model", "Qwen/Qwen2.5-0.5B-Instruct"),
+        timeout_s=900.0,
+    ),
     BenchTask(
         name="multi-step-pattern",
         tier="pattern",

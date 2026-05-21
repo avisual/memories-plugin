@@ -71,12 +71,18 @@ def test_brain_score_zero_when_brain_disabled():
 
 def test_brain_score_positive_for_matching_success_atom(tmp_path):
     """A SKILL atom in region='steps' whose embedding cosines >= 0.35
-    with the query → positive delta and IDs returned for reinforcement."""
+    with the query → positive delta and IDs returned for reinforcement.
+
+    Atom must carry the verb tag — the verb filter (added so atoms
+    from one verb don't score candidates from another) discards
+    untagged atoms.
+    """
     store = _store(tmp_path)
     store.add(
         "Success: verb=AddImport on task 'add an import of json'",
         type=AtomType.SKILL,
         region="steps",
+        tags=("agent-step", "success", "AddImport"),
     )
     loop = AgentLoop(
         proposer=MockProposer.empty(),
@@ -100,6 +106,7 @@ def test_brain_score_negative_for_matching_antipattern_atom(tmp_path):
         "Failure: verb=AddImport on task 'add an import of json' — broke parse",
         type=AtomType.ANTIPATTERN,
         region="steps",
+        tags=("agent-step", "failure", "AddImport"),
     )
     loop = AgentLoop(
         proposer=MockProposer.empty(),
@@ -123,6 +130,7 @@ def test_brain_score_bounded(tmp_path):
             "Success: verb=AddImport on task 'add an import of json'",
             type=AtomType.SKILL,
             region="steps",
+            tags=("agent-step", "success", "AddImport"),
         )
     loop = AgentLoop(
         proposer=MockProposer.empty(),
@@ -392,16 +400,19 @@ def test_brain_flips_candidate_choice_end_to_end(tmp_path):
     store_path = tmp_path / "brain.db"
     store = SQLiteAtomStore(store_path, embedder=_KeywordEmbedder())
     # Seed: positive history on stripe; negative history on json.
+    # Both tagged with the verb so they pass the verb filter.
     store.add(
         "verb=AddImport file=src/main.py module=stripe task add stripe import",
         type=AtomType.SKILL,
         region="steps",
+        tags=("agent-step", "success", "AddImport"),
         importance=0.6,
     )
     store.add(
         "verb=AddImport file=src/main.py module=json task add json import broken",
         type=AtomType.ANTIPATTERN,
         region="steps",
+        tags=("agent-step", "failure", "AddImport"),
         importance=0.6,
     )
 
@@ -472,11 +483,13 @@ def test_brain_off_picks_first_candidate_same_setup(tmp_path):
         "verb=AddImport file=src/main.py module=stripe",
         type=AtomType.SKILL,
         region="steps",
+        tags=("agent-step", "success", "AddImport"),
     )
     store.add(
         "verb=AddImport file=src/main.py module=json broken",
         type=AtomType.ANTIPATTERN,
         region="steps",
+        tags=("agent-step", "failure", "AddImport"),
     )
 
     candidate_json = AddImport(
@@ -519,6 +532,7 @@ def test_winning_brain_contributors_get_reinforced(tmp_path):
         "verb=AddImport file=src/main.py module=json :: Success",
         type=AtomType.SKILL,
         region="steps",
+        tags=("agent-step", "success", "AddImport"),
         importance=0.5,
     )
     proposer = MockProposer(
@@ -761,6 +775,38 @@ def test_multi_step_plan_accumulates_brain_atoms_across_cycles(tmp_path):
         f"expected at least one outcome atom to be reinforced, "
         f"importances: {[s.atom.importance for s in skills]}"
     )
+    store.close()
+
+
+def test_brain_score_filters_by_verb_tag(tmp_path):
+    """An atom written for verb X does NOT score a candidate of verb Y.
+
+    Before the verb filter, two atoms in region='steps' with similar
+    signatures could cross-pollinate: an AddField outcome atom would
+    boost an AddImport candidate because cosine over the (verb, slot,
+    task) text was high enough to clear 0.35. With the verb-in-tag
+    filter, only atoms tagged with the candidate's verb participate.
+    """
+    store = _store(tmp_path)
+    # SKILL atom for a DIFFERENT verb than the candidate.
+    store.add(
+        "Success: verb=AddField on task 'add a field'",
+        type=AtomType.SKILL,
+        region="steps",
+        tags=("agent-step", "success", "AddField"),
+    )
+    loop = AgentLoop(
+        proposer=MockProposer.empty(),
+        workspace=_ws(),
+        atom_store=store,
+        use_brain=True,
+    )
+    # Candidate is AddImport (not AddField).
+    action = AddImport(file=FileRef(path="src/main.py"), module="json", confidence=0.9)
+    delta, ids = loop._brain_score(action, "add an import of json")
+    # Verb mismatch → no contribution even though cosine is 1.0.
+    assert delta == 0.0
+    assert ids == []
     store.close()
 
 

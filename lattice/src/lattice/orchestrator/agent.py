@@ -518,8 +518,9 @@ class AgentLoop:
         from lattice.atoms import AtomType
 
         query = _signature_with_task(self._action_signature(action), task)
+        verb = getattr(action, "verb", None)
         try:
-            hits = self.atom_store.recall(query, k=4, region="steps")
+            hits = self.atom_store.recall(query, k=8, region="steps")
         except Exception:  # noqa: BLE001
             return 0.0, []
         delta = 0.0
@@ -527,6 +528,14 @@ class AgentLoop:
         for hit in hits:
             sim = float(hit.score)
             if sim < 0.35:
+                continue
+            # VERB FILTER: atoms in region='steps' are tagged with the
+            # verb of the action that produced them. Without this
+            # filter, an AddField SKILL atom can score an AddImport
+            # candidate because MiniLM embeds the signature prefixes
+            # similarly enough to clear the 0.35 threshold. Filtering
+            # by verb gives precise (verb, slot, task) attribution.
+            if verb is not None and verb not in (hit.atom.tags or ()):
                 continue
             atype = hit.atom.type
             if atype in (AtomType.SKILL, AtomType.EXPERIENCE):
