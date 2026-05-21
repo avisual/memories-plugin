@@ -133,6 +133,12 @@ class AgentLoop:
         # The plan is built at the start of each run() so a single
         # AgentLoop instance can run many tasks back-to-back.
         self._plan: Plan | None = None
+        # Atom IDs recalled into the CURRENT cycle's observation.
+        # Captured here so the post-step Hebbian update knows which
+        # atoms 'participated' (and should be reinforced/decayed by
+        # the outcome of the step). Reset each cycle in
+        # _build_observation.
+        self._cycle_recalled_ids: list[int] = []
 
     def run(self, task: str) -> AgentTrace:
         steps: list[StepRecord] = []
@@ -171,6 +177,14 @@ class AgentLoop:
             record, should_stop, stop_reason = self._handle_action(action, step_idx)
             steps.append(record)
             self._record_step_outcome(record, task=task)
+            # HEBBIAN REINFORCEMENT: atoms that participated in THIS
+            # cycle's decision (i.e. were recalled into the observation)
+            # get nudged up on success or down on failure. The brain
+            # actually learns from outcome here — atoms that helped get
+            # surfaced more readily next time; atoms that misled get
+            # buried. This is the missing teeth that turns recall from
+            # decoration into a learning loop.
+            self._reinforce_recalled(record)
 
             # PLAN-DAG advance: when the just-recorded step is a clean
             # mutating edit (no verify error), the CURRENT plan step is
@@ -386,6 +400,42 @@ class AgentLoop:
             elif atype == AtomType.ANTIPATTERN:
                 delta -= 0.40 * sim
         return max(-0.5, min(0.5, delta))
+
+    def _reinforce_recalled(self, record: "StepRecord") -> None:
+        """Hebbian update on the atoms recalled into THIS cycle's obs.
+
+        On a clean mutating edit (kind=='edit' and no error) → positive
+        nudge: atoms that participated in a winning decision get more
+        important and will surface higher in future recall.
+
+        On a verify error → small negative nudge: atoms that showed up
+        for a failing decision get pushed down a bit so they don't keep
+        misleading the next attempt. Decay is gentler than reinforcement
+        because a failed step can still have useful recalled atoms (the
+        cause may be elsewhere) — overcorrecting buries them too fast.
+
+        No-ops, non-mutating steps, and the case where brain is off all
+        skip the update.
+        """
+        if not self._use_brain or self.atom_store is None:
+            return
+        if not self._cycle_recalled_ids:
+            return
+        if record.action is None:
+            return
+        if not self._is_mutating(record.action):
+            return
+        # Decide direction & magnitude.
+        if record.kind == "edit" and not record.error:
+            delta = +0.05
+        elif record.kind == "error":
+            delta = -0.03
+        else:
+            return
+        try:
+            self.atom_store.reinforce(self._cycle_recalled_ids, delta)
+        except Exception:  # noqa: BLE001
+            pass
 
     def _persist_plan_atom(self, plan: Plan) -> None:
         """Write a TASK atom that summarizes the plan shape.
@@ -699,6 +749,10 @@ class AgentLoop:
         # Recall atoms EVERY cycle, not just the first. New atoms
         # written by mid-loop Research are exactly the ones that need
         # to surface on the very next turn.
+        # Reset the participating-IDs list each cycle; reinforce() at
+        # end of step uses what's collected here as 'the atoms that
+        # showed up for THIS decision'.
+        self._cycle_recalled_ids = []
         if self._use_brain and self.atom_store is not None:
             try:
                 hits = self.atom_store.recall(task, k=4)
@@ -708,6 +762,9 @@ class AgentLoop:
                 hints.append(
                     f"{r.atom.type.value} (score {r.score:.2f}): {r.atom.content[:600]}"
                 )
+                atom_id = getattr(r.atom, "id", None)
+                if atom_id is not None:
+                    self._cycle_recalled_ids.append(int(atom_id))
 
         # Semble code-search: per-task, focused chunks rather than the
         # whole symbol list. Same per-cycle cadence as atom recall.

@@ -193,3 +193,112 @@ def test_no_outcome_atom_when_brain_off(tmp_path):
     skills = [h for h in hits if h.atom.type == AtomType.SKILL]
     assert not skills
     store.close()
+
+
+def test_reinforce_bumps_importance_for_recalled_atoms_on_success(tmp_path):
+    """Atoms recalled into the obs of a successful step get importance up.
+
+    Wiring: store has an atom that will be recalled (constant embedder →
+    cosine 1.0 with anything). Run a single successful mutating step.
+    Read the same atom back — its importance should have moved up by
+    +0.05.
+    """
+    store = _store(tmp_path)
+    seeded = store.add(
+        "Skill: useful for adding imports cleanly",
+        type=AtomType.SKILL,
+        region="general",
+        importance=0.5,
+    )
+    proposer = MockProposer(
+        batches=[
+            [AddImport(file=FileRef(path="src/main.py"), module="json", confidence=0.9)],
+            [MarkDone(summary="done", confidence=0.9)],
+        ]
+    )
+    loop = AgentLoop(
+        proposer=proposer, workspace=_ws(), atom_store=store, use_brain=True
+    )
+    loop.run("add an import of json")
+    # Fetch the atom's current importance by recalling.
+    hits = store.recall("useful for adding imports", k=3)
+    same_atom = next((h for h in hits if h.atom.id == seeded.id), None)
+    assert same_atom is not None, "expected to find the seeded atom"
+    # +0.05 from successful step participation. (Allow tiny floor for
+    # double-recall on cycle 2.)
+    assert same_atom.atom.importance >= 0.5 + 0.04
+    store.close()
+
+
+def test_reinforce_decays_importance_for_recalled_atoms_on_failure(tmp_path):
+    """Atoms recalled into the obs of a FAILED step get importance down."""
+    from lattice.actions import AddParameter, SymbolRef, TypeExpr
+
+    store = _store(tmp_path)
+    seeded = store.add(
+        "skill: misleading guidance",
+        type=AtomType.SKILL,
+        region="general",
+        importance=0.6,
+    )
+    bad = AddParameter(
+        function=SymbolRef(file="src/main.py", name="does_not_exist"),
+        name="x",
+        type=TypeExpr(expr="int"),
+        confidence=0.8,
+    )
+    proposer = MockProposer(
+        batches=[[bad], [MarkDone(summary="give up", confidence=0.5)]]
+    )
+    loop = AgentLoop(
+        proposer=proposer, workspace=_ws(), atom_store=store, use_brain=True
+    )
+    loop.run("attempt the bad action")
+    hits = store.recall("misleading guidance", k=3)
+    same_atom = next((h for h in hits if h.atom.id == seeded.id), None)
+    assert same_atom is not None
+    # -0.03 from being recalled into a failed step.
+    assert same_atom.atom.importance <= 0.6 - 0.02
+    store.close()
+
+
+def test_reinforce_skipped_when_brain_off(tmp_path):
+    """use_brain=False → no importance updates after a step."""
+    store = _store(tmp_path)
+    seeded = store.add(
+        "Skill: useful for adding imports",
+        type=AtomType.SKILL,
+        importance=0.5,
+    )
+    proposer = MockProposer(
+        batches=[
+            [AddImport(file=FileRef(path="src/main.py"), module="json", confidence=0.9)],
+            [MarkDone(summary="done", confidence=0.9)],
+        ]
+    )
+    loop = AgentLoop(
+        proposer=proposer, workspace=_ws(), atom_store=store, use_brain=False
+    )
+    loop.run("add an import of json")
+    hits = store.recall("useful for adding imports", k=3)
+    same_atom = next((h for h in hits if h.atom.id == seeded.id), None)
+    assert same_atom is not None
+    # Importance unchanged from initial 0.5.
+    assert abs(same_atom.atom.importance - 0.5) < 0.001
+    store.close()
+
+
+def test_store_reinforce_clips_to_zero_and_ninety_five(tmp_path):
+    """The reinforce API clips importance to [0.0, 0.95]."""
+    store = _store(tmp_path)
+    a = store.add("low", importance=0.04)
+    b = store.add("high", importance=0.94)
+    # Try to push below 0.
+    store.reinforce([a.id], delta=-0.10)
+    # Try to push above 0.95.
+    store.reinforce([b.id], delta=+0.10)
+    new_low = next(h for h in store.recall("low", k=2) if h.atom.id == a.id).atom.importance
+    new_high = next(h for h in store.recall("high", k=2) if h.atom.id == b.id).atom.importance
+    assert new_low == 0.0
+    assert new_high == 0.95
+    store.close()

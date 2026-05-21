@@ -48,6 +48,8 @@ class AtomStore(Protocol):
         types: tuple[AtomType, ...] | None = None,
     ) -> list[RecallResult]: ...
 
+    def reinforce(self, atom_ids: list[int], delta: float) -> int: ...
+
     def count(self) -> int: ...
 
     def close(self) -> None: ...
@@ -219,6 +221,32 @@ class SQLiteAtomStore:
                 [(_now(), aid) for aid in recalled_ids],
             )
         return out
+
+    def reinforce(self, atom_ids: list[int], delta: float) -> int:
+        """Hebbian update — bump importance for atoms that participated
+        in a successful step (or decay them when they participated in a
+        failed step). Clipped to [0.0, 0.95] so seed atoms with
+        importance>=0.95 stay dominant.
+
+        Returns the count of atoms actually updated.
+        """
+        if not atom_ids or delta == 0.0:
+            return 0
+        rows = self._conn.execute(
+            f"SELECT id, importance FROM atoms WHERE id IN ({','.join('?' * len(atom_ids))})",
+            atom_ids,
+        ).fetchall()
+        updates = [
+            (max(0.0, min(0.95, importance + delta)), aid)
+            for aid, importance in rows
+        ]
+        if not updates:
+            return 0
+        self._conn.executemany(
+            "UPDATE atoms SET importance = ? WHERE id = ?",
+            updates,
+        )
+        return len(updates)
 
     def close(self) -> None:
         self._conn.close()
