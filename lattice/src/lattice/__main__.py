@@ -102,6 +102,54 @@ def _apply(args: argparse.Namespace) -> int:
 _intent_adapter: TypeAdapter[Intent] = TypeAdapter(Intent)
 
 
+def _agent(args: argparse.Namespace) -> int:
+    from lattice.atoms import SQLiteAtomStore
+    from lattice.orchestrator import AgentLoop
+    from lattice.propose.local import LocalLLMProposer
+
+    workspace = FilesystemWorkspace(args.workspace)
+    atom_store = SQLiteAtomStore(args.atom_db) if args.atom_db else None
+    try:
+        sys.stderr.write(f"loading model{(' ' + args.model) if args.model else ''}...\n")
+        proposer = (
+            LocalLLMProposer(model_name=args.model)
+            if args.model
+            else LocalLLMProposer()
+        )
+        loop = AgentLoop(
+            proposer=proposer,
+            workspace=workspace,
+            atom_store=atom_store,
+            max_steps=args.max_steps,
+        )
+        trace = loop.run(args.task)
+    finally:
+        if atom_store is not None:
+            atom_store.close()
+
+    sys.stderr.write(f"\nterminated_by={trace.terminated_by}\n")
+    for step in trace.steps:
+        sys.stderr.write(
+            f"  step {step.step} [{step.kind}] {step.action.verb}"
+            + (f" :: {step.error[:120]}" if step.error else "")
+            + (f" :: {step.payload[:120]}" if step.payload else "")
+            + "\n"
+        )
+
+    for diff in trace.consolidated_diffs:
+        sys.stdout.write(diff)
+        if not diff.endswith("\n"):
+            sys.stdout.write("\n")
+
+    if args.write and trace.final_files:
+        from lattice.apply import write_final
+
+        written = write_final(trace, root=args.workspace)
+        sys.stderr.write(f"wrote {len(written)} file(s)\n")
+
+    return 0 if trace.ok else 1
+
+
 def _atom_add(args: argparse.Namespace) -> int:
     from lattice.atoms import AtomType, SQLiteAtomStore
 
@@ -347,6 +395,28 @@ def main(argv: list[str] | None = None) -> int:
         help="Actually write the compiled changes to disk after verify passes.",
     )
     propose_p.set_defaults(func=_propose)
+
+    agent_p = sub.add_parser(
+        "agent",
+        help="Run a multi-step agent loop with a local LLM; one action per turn.",
+    )
+    agent_p.add_argument("workspace")
+    agent_p.add_argument("--task", required=True)
+    agent_p.add_argument(
+        "--atom-db", default=None, help="Atom store DB; used for hints + RecallMore."
+    )
+    agent_p.add_argument(
+        "--model",
+        default=None,
+        help="HuggingFace model name. Default: Qwen/Qwen2.5-0.5B-Instruct.",
+    )
+    agent_p.add_argument("--max-steps", type=int, default=6)
+    agent_p.add_argument(
+        "--write",
+        action="store_true",
+        help="Write the agent's final files to disk after the loop ends.",
+    )
+    agent_p.set_defaults(func=_agent)
 
     atom_p = sub.add_parser("atom", help="Manage the lattice atom store.")
     atom_sub = atom_p.add_subparsers(dest="atom_cmd", required=True)

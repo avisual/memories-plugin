@@ -64,8 +64,33 @@ Plus a minimal lattice-native atom store (Organ 1, v0):
   Observation so recalls become typed hints to the LLM.
 - CLI: `lattice atom add` / `lattice atom recall`.
 
-Not yet: world model, activation steering, full memories-plugin
-integration, apprentice, evolution, interface surfaces beyond the CLI.
+Plus a multi-step **agent loop** (Organ 6 stub, linear v0):
+- Drives a Proposer one action per turn; history + atom recall become
+  hints in the next turn's Observation. Terminates on `MarkDone`,
+  `MarkBlocked`, max-steps exhaustion, empty proposal, or harness-
+  detected no-op cycles (`stuck`). The cycle detector exists because
+  small models will repeat themselves; the right longer-term fix is
+  the unbuilt organs (world model + population search + apprentice).
+- CLI: `lattice agent <workspace> --task "..." [--atom-db DB]
+  [--max-steps N] [--model NAME] [--write]`.
+
+### What's been observed live on this CPU
+
+- **Single-step propose+compile+verify+diff:** Qwen2.5-0.5B-Instruct
+  produces a valid action from a structured Observation in ~7 seconds.
+  With recall hints, picks project-specific values (e.g. `stripe`
+  when the project standardizes on it). Solid.
+- **Multi-step planning:** at this scale (0.5B and 1.5B Qwen), the
+  model gets the first step right but tends to repeat itself rather
+  than tracking what's already done. The harness detects this and
+  terminates with `stuck`, so the first real edit ships and the loop
+  doesn't spin. Multi-step quality unlocks with either a bigger model
+  or the unbuilt LATTICE organs (population search and an apprentice
+  trained on successful traces — both in DESIGN.md).
+
+Not yet: world model, activation steering, population search,
+apprentice (Organ 8), evolution (Organ 9), full memories-plugin
+integration, interface surfaces beyond the CLI.
 
 ## Try it
 

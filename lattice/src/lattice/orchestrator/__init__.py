@@ -11,6 +11,7 @@ of compile, the population search around it, and the apprentice taking
 over the easy cases.
 """
 
+from lattice.orchestrator.agent import AgentLoop, AgentTrace, StepRecord
 from lattice.orchestrator.intent import (
     AddParameterToAllMatching,
     Intent,
@@ -20,8 +21,11 @@ from lattice.orchestrator.run import ExecutionReport, execute_plan
 
 __all__ = [
     "AddParameterToAllMatching",
+    "AgentLoop",
+    "AgentTrace",
     "ExecutionReport",
     "Intent",
+    "StepRecord",
     "execute_plan",
     "expand_intent",
 ]

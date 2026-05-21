@@ -19,6 +19,7 @@ from lattice.actions import (
     AddTest,
     Branch,
     MarkBlocked,
+    MarkDone,
     RecallMore,
     RenameSymbol,
     RevealBody,
@@ -59,7 +60,7 @@ def compile_action(action: Action, workspace: Workspace) -> CompiledAction:
                     f"compiler does not yet implement {action.verb!r} "
                     "(needs cross-file reference rewrite via the lattice store)"
                 )
-            case RecallMore() | RevealBody() | MarkBlocked() | Branch():
+            case RecallMore() | RevealBody() | MarkBlocked() | MarkDone() | Branch():
                 raise NonMutatingAction(
                     f"{action.verb!r} does not produce file changes; "
                     "the orchestrator handles it directly"

@@ -189,3 +189,14 @@ class Branch(_Verb):
 
     verb: Literal["Branch"] = "Branch"
     rationale: str = Field(min_length=1, max_length=280)
+
+
+class MarkDone(_Verb):
+    """Signal that the agent considers the task complete.
+
+    The orchestrator stops iterating on this verb. Carries a short
+    summary the user (and future recall) can see.
+    """
+
+    verb: Literal["MarkDone"] = "MarkDone"
+    summary: str = Field(min_length=1, max_length=280)

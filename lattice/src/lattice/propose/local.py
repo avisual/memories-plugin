@@ -54,6 +54,7 @@ AddTest       - {"verb":"AddTest", "target":{"file":"src/x.py","name":"func"}, "
 RecallMore    - {"verb":"RecallMore", "query":"rate-limit middleware", "confidence":0.5}
 RevealBody    - {"verb":"RevealBody", "symbol":{"file":"src/x.py","name":"func"}, "confidence":0.5}
 MarkBlocked   - {"verb":"MarkBlocked", "reason_code":"missing_context", "detail":"need to see User model", "confidence":0.6}
+MarkDone      - {"verb":"MarkDone", "summary":"added stripe import and dry_run param", "confidence":0.9}
 Branch        - {"verb":"Branch", "rationale":"try alternative approach", "confidence":0.5}
 
 Rules:
@@ -220,16 +221,29 @@ class LocalLLMProposer:
         )
         self._model.eval()
 
-    def _generate(self, prompt: str, *, sticky_correction: str | None = None) -> str:
+    def _generate(self, user_msg: str, *, sticky_correction: str | None = None) -> str:
         messages = [
             {
                 "role": "system",
                 "content": (
-                    "You are an action emitter for the LATTICE coding harness. "
-                    "Read the task and emit exactly one JSON action from the vocabulary."
+                    "You are the action emitter for the LATTICE coding harness. "
+                    "On each turn you receive: a TASK, RELEVANT SYMBOLS, and HINTS "
+                    "(which include the history of edits already applied this task). "
+                    "Emit exactly ONE JSON action from the vocabulary below.\n\n"
+                    "RULES:\n"
+                    "- Look at HINTS. If FILES ALREADY EDITED contains your target "
+                    "  and the task says it's done, emit MarkDone.\n"
+                    "- Do NOT repeat an edit listed under 'added' in a previous "
+                    "  step — it is already applied.\n"
+                    "- Make progress on each turn: pick an edit that is NOT YET in "
+                    "  the history.\n"
+                    "- 'module' in AddImport is a Python package (e.g. 'stripe'), "
+                    "  NEVER a file path.\n"
+                    "- Output ONLY one JSON object. No markdown fences, no prose.\n\n"
+                    + _VOCAB_DOC
                 ),
             },
-            {"role": "user", "content": prompt},
+            {"role": "user", "content": user_msg},
         ]
         if sticky_correction is not None:
             messages.append({"role": "user", "content": sticky_correction})
@@ -255,7 +269,10 @@ class LocalLLMProposer:
     def propose(self, obs: ObservationContext, n: int = 1) -> list[Action]:
         self._load()
 
-        prompt = f"{_VOCAB_DOC}\n\n{_render_observation(obs)}\n\nJSON action:"
+        prompt = _render_observation(obs) + "\n\nJSON action:"
+        if os.environ.get("LATTICE_LLM_DEBUG"):
+            import sys
+            sys.stderr.write("\n--- prompt ---\n" + prompt + "\n--- end ---\n")
 
         correction: str | None = None
         last_error: str | None = None
