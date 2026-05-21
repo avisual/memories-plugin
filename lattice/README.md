@@ -27,13 +27,58 @@ The full design is in [DESIGN.md](DESIGN.md).
 
 ## Status
 
-v0 scaffolding — Months 1–2 of the build sketch in DESIGN.md.
-Currently in this package:
+v0 working end-to-end on the action → diff path (Months 1–2 of the
+build sketch). What runs today:
 
-- The typed action DSL (10 starter verbs, Pydantic-validated)
-- Module skeletons for the remaining nine organs
+- **Action DSL** (Organ 3): 10 typed verbs, Pydantic-validated,
+  discriminated-union parser, JSON-schema export for constrained
+  decoding.
+- **Action compiler** (Python, libcst): `AddImport`, `AddField`,
+  `AddParameter` produce real file diffs. Idempotent (no-op on
+  already-present state). `WrapInTry`, `AddTest`, `RenameSymbol`
+  raise `UnsupportedAction` until they land.
+- **Syntactic verify** (Organ 7, partial): every compiled diff is
+  parsed with `ast.parse` before being printed.
+- **CLI**: `python -m lattice apply <workspace> --action <json>` takes
+  a typed action as JSON and emits a unified diff on stdout.
 
-Nothing wires to an LLM yet. That comes next.
+Not yet: world model, steering, lattice store, apprentice, evolution,
+interface surfaces beyond the CLI.
+
+## Try it
+
+```bash
+cd lattice
+uv pip install -e ".[dev]"
+
+mkdir -p /tmp/latticedemo
+cat > /tmp/latticedemo/charge.py <<'PY'
+"""Charge a customer's card."""
+import os
+
+class ChargeProcessor:
+    api_key: str = ""
+
+    def charge(self, amount: int) -> None:
+        pass
+PY
+
+echo '{"verb":"AddImport","file":{"path":"charge.py"},"module":"stripe","confidence":0.9}' \
+  | uv run python -m lattice apply /tmp/latticedemo --action -
+```
+
+Output:
+
+```diff
+--- a/charge.py
++++ b/charge.py
+@@ -1,5 +1,6 @@
+ """Charge a customer's card."""
+ import os
++import stripe
+
+ class ChargeProcessor:
+```
 
 ## Layout
 
