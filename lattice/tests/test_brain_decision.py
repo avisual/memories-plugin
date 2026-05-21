@@ -288,6 +288,166 @@ def test_reinforce_skipped_when_brain_off(tmp_path):
     store.close()
 
 
+def test_brain_flips_candidate_choice_end_to_end(tmp_path):
+    """End-to-end proof: brain ON vs OFF picks a DIFFERENT candidate.
+
+    Setup: pre-flight gets two equally-confident candidates (AddImport
+    of 'json' vs AddImport of 'stripe'). The atom store is pre-loaded
+    with:
+      - a SKILL atom whose content embeds near the 'stripe' candidate
+      - an ANTIPATTERN atom whose content embeds near the 'json' candidate
+    Brain ON: stripe wins (+SKILL boost + ANTIPATTERN penalty makes the
+    delta strongly favor stripe).
+    Brain OFF: ties broken by score-on-ties (first in scored list); the
+    json candidate (listed first) wins.
+
+    Uses HashEmbedder so embeddings are deterministic and keyword-tied.
+    """
+    import hashlib
+
+    import numpy as np
+
+    from lattice.atoms.embedder import Embedder
+
+    class _KeywordEmbedder:
+        """Per-word hash → vector; strings sharing words have similar vectors."""
+
+        def __init__(self, dim: int = 32) -> None:
+            self._dim = dim
+
+        @property
+        def dim(self) -> int:
+            return self._dim
+
+        def embed(self, texts):
+            out = np.zeros((len(texts), self._dim), dtype=np.float32)
+            for i, text in enumerate(texts):
+                words = [w.lower() for w in text.split() if w.strip()]
+                for w in words:
+                    h = hashlib.sha1(w.encode()).digest()
+                    for j in range(self._dim):
+                        out[i, j] += (h[j % len(h)] / 255.0) - 0.5
+                n = np.linalg.norm(out[i])
+                if n > 0:
+                    out[i] /= n
+            return out
+
+    _: Embedder = _KeywordEmbedder()
+
+    store_path = tmp_path / "brain.db"
+    store = SQLiteAtomStore(store_path, embedder=_KeywordEmbedder())
+    # Seed: positive history on stripe; negative history on json.
+    store.add(
+        "verb=AddImport file=src/main.py module=stripe task add stripe import",
+        type=AtomType.SKILL,
+        region="steps",
+        importance=0.6,
+    )
+    store.add(
+        "verb=AddImport file=src/main.py module=json task add json import broken",
+        type=AtomType.ANTIPATTERN,
+        region="steps",
+        importance=0.6,
+    )
+
+    # Both candidates have identical confidence — the brain_delta is the
+    # ONLY thing that should differentiate them.
+    candidate_json = AddImport(
+        file=FileRef(path="src/main.py"), module="json", confidence=0.5
+    )
+    candidate_stripe = AddImport(
+        file=FileRef(path="src/main.py"), module="stripe", confidence=0.5
+    )
+    proposer = MockProposer(
+        batches=[
+            [candidate_json, candidate_stripe],
+            [MarkDone(summary="done", confidence=0.9)],
+        ]
+    )
+    loop = AgentLoop(
+        proposer=proposer, workspace=_ws(), atom_store=store, use_brain=True
+    )
+    trace = loop.run("add stripe import")
+    assert trace.ok
+    final = trace.final_files["src/main.py"]
+    # Brain steered toward stripe (SKILL match) over json (ANTIPATTERN).
+    assert "import stripe" in final, (
+        "expected brain decision-weighting to pick the SKILL-matched "
+        "candidate (stripe) over the ANTIPATTERN-matched one (json)"
+    )
+    assert "import json" not in final
+    store.close()
+
+
+def test_brain_off_picks_first_candidate_same_setup(tmp_path):
+    """With brain OFF on the same setup, the first candidate (json) wins.
+
+    Proves the choice in the prior test came from the brain, not from
+    some other tie-breaker. With brain off, the json candidate (listed
+    first) wins because there's no decision-weighting and confidence is
+    identical."""
+    import hashlib
+
+    import numpy as np
+
+    class _KeywordEmbedder:
+        def __init__(self, dim: int = 32) -> None:
+            self._dim = dim
+
+        @property
+        def dim(self) -> int:
+            return self._dim
+
+        def embed(self, texts):
+            out = np.zeros((len(texts), self._dim), dtype=np.float32)
+            for i, text in enumerate(texts):
+                words = [w.lower() for w in text.split() if w.strip()]
+                for w in words:
+                    h = hashlib.sha1(w.encode()).digest()
+                    for j in range(self._dim):
+                        out[i, j] += (h[j % len(h)] / 255.0) - 0.5
+                n = np.linalg.norm(out[i])
+                if n > 0:
+                    out[i] /= n
+            return out
+
+    store_path = tmp_path / "brain.db"
+    store = SQLiteAtomStore(store_path, embedder=_KeywordEmbedder())
+    store.add(
+        "verb=AddImport file=src/main.py module=stripe",
+        type=AtomType.SKILL,
+        region="steps",
+    )
+    store.add(
+        "verb=AddImport file=src/main.py module=json broken",
+        type=AtomType.ANTIPATTERN,
+        region="steps",
+    )
+
+    candidate_json = AddImport(
+        file=FileRef(path="src/main.py"), module="json", confidence=0.5
+    )
+    candidate_stripe = AddImport(
+        file=FileRef(path="src/main.py"), module="stripe", confidence=0.5
+    )
+    proposer = MockProposer(
+        batches=[
+            [candidate_json, candidate_stripe],
+            [MarkDone(summary="done", confidence=0.9)],
+        ]
+    )
+    loop = AgentLoop(
+        proposer=proposer, workspace=_ws(), atom_store=store, use_brain=False
+    )
+    trace = loop.run("add an import")
+    assert trace.ok
+    final = trace.final_files["src/main.py"]
+    # With brain off, the brain delta is 0 for both — json (first in
+    # list, stable sort) wins.
+    assert "import json" in final
+    store.close()
+
+
 def test_store_reinforce_clips_to_zero_and_ninety_five(tmp_path):
     """The reinforce API clips importance to [0.0, 0.95]."""
     store = _store(tmp_path)
