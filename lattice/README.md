@@ -97,6 +97,22 @@ Optional extras:
 | `lattice brain inspect/dump/import/export` | Curate the atom store. |
 | `lattice atom add/recall/seed` | Lower-level brain operations. |
 
+## Benchmark scoreboard
+
+Run `python -m lattice.benchmarks.run` for the full suite. Last live
+run on this machine (Qwen-class CPU models):
+
+| Tier | Tasks | Passing | Typical time |
+|---|---|---|---|
+| **pattern** (deterministic regex routing) | 8 | 8/8 | ~13s/task |
+| **llm** (slot-filling, Qwen-1.5B two-stage) | 2 | 2/2 | 110–620s/task |
+| **research** (LLM emits `Research`, fetches docs, uses them) | 1 | 1/1 | ~500s |
+| **Total** | **11** | **11/11** | |
+
+This is "ran once and passed." Not robustness testing — that's `--repeat`
+and not implemented yet. But it IS coverage across every verb that
+should work plus the live web-research path.
+
 ## What's reliable, what's not (honest)
 
 | | What works | What doesn't yet |

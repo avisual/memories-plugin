@@ -142,8 +142,8 @@ TASKS: tuple[BenchTask, ...] = (
                 'return {"ok": True}',
             ),
         },
-        flags=("--two-stage", "--model", "Qwen/Qwen2.5-0.5B-Instruct"),
-        timeout_s=600.0,
+        flags=("--two-stage", "--model", "Qwen/Qwen2.5-1.5B-Instruct"),
+        timeout_s=900.0,
     ),
     BenchTask(
         name="add-statement-cors-wire",

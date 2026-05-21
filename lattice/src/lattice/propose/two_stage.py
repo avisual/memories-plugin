@@ -135,14 +135,16 @@ _VERB_SCHEMAS: dict[str, str] = {
         '"confidence":0..1}'
     ),
     "AddStatement": (
-        '{"verb":"AddStatement","file":{"path":"<rel.py>"},'
-        '"code":"<one or more Python statements>",'
-        '"position":"end"|"top_after_imports","confidence":0..1}'
+        '{"verb":"AddStatement","file":{"path":"src/app.py"},'
+        '"code":"cors = CORS(app)",'  # concrete shape — replace with YOUR statement
+        '"position":"end","confidence":0.8}'
     ),
     "AddFunction": (
-        '{"verb":"AddFunction","file":{"path":"<rel.py>"},'
-        '"source":"def name(args) -> ret:\\n    body",'
-        '"position":"end"|"top_after_imports","confidence":0..1}'
+        '{"verb":"AddFunction","file":{"path":"src/app.py"},'
+        '"source":"@app.route(\\"/health\\")\\ndef health() -> dict:\\n    return {\\"ok\\": True}\\n",'
+        '"position":"end","confidence":0.8}'
+        '  // The "source" value MUST be the EXACT function source you want '
+        'inserted — names, parameters, body, and decorators all real.'
     ),
     "RecallMore": '{"verb":"RecallMore","query":"<short query>","confidence":0..1}',
     "RevealBody": (
