@@ -17,7 +17,9 @@ there are noise. Default: --tier llm --repeat 2.
 from __future__ import annotations
 
 import argparse
+import shutil
 import sys
+import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -39,12 +41,19 @@ class AuditRow:
     runs: int = 0
 
 
-def _run_one_with_brain_flag(task: BenchTask, use_brain: bool, llm_cache: dict):
-    """Wrap _run_one_inprocess so brain on/off is toggled per run."""
-    # The simplest path: build the task's CLI flags with --no-brain
-    # appended when use_brain is False. _run_one_inprocess reads
-    # the flags through _parse_task_flags which already understands
-    # the agent CLI flags.
+def _run_one_with_brain_flag(
+    task: BenchTask,
+    use_brain: bool,
+    llm_cache: dict,
+    brain_db_path: Path | None,
+):
+    """Wrap _run_one_inprocess so brain on/off is toggled per run.
+
+    Passes `brain_db_path` straight through to the runner so the audit
+    can persist atoms across runs in the same condition. Without that
+    persistence, brain decision-weighting has no data to act on and
+    any 'brain helps' verdict gets masked by the fresh-store baseline.
+    """
     flags = task.flags
     if not use_brain and "--no-brain" not in flags:
         flags = (*flags, "--no-brain")
@@ -58,7 +67,7 @@ def _run_one_with_brain_flag(task: BenchTask, use_brain: bool, llm_cache: dict):
         flags=flags,
         timeout_s=task.timeout_s,
     )
-    return _run_one_inprocess(shadowed, llm_cache)
+    return _run_one_inprocess(shadowed, llm_cache, brain_db_path=brain_db_path)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -70,6 +79,16 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--repeat", type=int, default=2)
     parser.add_argument("--name", default="", help="Substring filter for task names.")
+    parser.add_argument(
+        "--fresh-brain",
+        action="store_true",
+        help=(
+            "Use a fresh brain DB per task (default: persistent across "
+            "tasks in the same condition). Persistent is the meaningful "
+            "audit — atoms accumulated in earlier runs are what the "
+            "decision-weighting actually scores future candidates against."
+        ),
+    )
     args = parser.parse_args(argv)
 
     selected = TASKS
@@ -94,33 +113,65 @@ def main(argv: list[str] | None = None) -> int:
     llm_cache_off: dict = {}
     rows: list[AuditRow] = []
 
-    for task in selected:
-        row = AuditRow(task_name=task.name, tier=task.tier, runs=args.repeat)
-        for i in range(args.repeat):
-            sys.stderr.write(f"  -> {task.name} run {i + 1}/{args.repeat} ... ")
-            sys.stderr.flush()
+    # PERSISTENT BRAIN ACROSS RUNS (in the same condition).
+    # Without this, every run starts with a fresh brain.db — the
+    # decision-weighting has nothing to score against, the audit only
+    # tests the (modest) effect of priming + recall hints on the LLM
+    # prompt. With shared persistence, atoms written during run N are
+    # visible when scoring candidates in run N+1, which is the actual
+    # mechanism by which the brain pays for itself.
+    audit_root: Path | None = None
+    brain_on_path: Path | None = None
+    brain_off_path: Path | None = None
+    if not args.fresh_brain:
+        audit_root = Path(tempfile.mkdtemp(prefix="lattice-audit-"))
+        brain_on_path = audit_root / "brain-on.db"
+        brain_off_path = audit_root / "brain-off.db"
+        sys.stderr.write(
+            f"persistent brain mode: on={brain_on_path} off={brain_off_path}\n"
+        )
 
-            t0 = time.time()
-            res_on = _run_one_with_brain_flag(task, use_brain=True, llm_cache=llm_cache_on)
-            row.brain_on_time_s += time.time() - t0
-            if res_on.passed:
-                row.brain_on_passes += 1
-            else:
-                row.brain_on_failures.append(res_on.detail[:200])
+    try:
+        for task in selected:
+            row = AuditRow(task_name=task.name, tier=task.tier, runs=args.repeat)
+            for i in range(args.repeat):
+                sys.stderr.write(f"  -> {task.name} run {i + 1}/{args.repeat} ... ")
+                sys.stderr.flush()
 
-            t0 = time.time()
-            res_off = _run_one_with_brain_flag(task, use_brain=False, llm_cache=llm_cache_off)
-            row.brain_off_time_s += time.time() - t0
-            if res_off.passed:
-                row.brain_off_passes += 1
-            else:
-                row.brain_off_failures.append(res_off.detail[:200])
+                t0 = time.time()
+                res_on = _run_one_with_brain_flag(
+                    task,
+                    use_brain=True,
+                    llm_cache=llm_cache_on,
+                    brain_db_path=brain_on_path,
+                )
+                row.brain_on_time_s += time.time() - t0
+                if res_on.passed:
+                    row.brain_on_passes += 1
+                else:
+                    row.brain_on_failures.append(res_on.detail[:200])
 
-            sys.stderr.write(
-                f"on={'P' if res_on.passed else 'F'} "
-                f"off={'P' if res_off.passed else 'F'}\n"
-            )
-        rows.append(row)
+                t0 = time.time()
+                res_off = _run_one_with_brain_flag(
+                    task,
+                    use_brain=False,
+                    llm_cache=llm_cache_off,
+                    brain_db_path=brain_off_path,
+                )
+                row.brain_off_time_s += time.time() - t0
+                if res_off.passed:
+                    row.brain_off_passes += 1
+                else:
+                    row.brain_off_failures.append(res_off.detail[:200])
+
+                sys.stderr.write(
+                    f"on={'P' if res_on.passed else 'F'} "
+                    f"off={'P' if res_off.passed else 'F'}\n"
+                )
+            rows.append(row)
+    finally:
+        if audit_root is not None and audit_root.exists():
+            shutil.rmtree(audit_root, ignore_errors=True)
 
     _print_audit(rows)
     return 0

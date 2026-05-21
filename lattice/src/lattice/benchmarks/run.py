@@ -172,8 +172,21 @@ def _build_inproc_proposer(cfg: dict[str, str | bool], cache: dict) -> Any:
     return CompositeProposer([PatternProposer(), cache[key]])
 
 
-def _run_one_inprocess(task: BenchTask, llm_cache: dict) -> TaskResult:
-    """Run a single task in-process, reusing cached LLM weights across tasks."""
+def _run_one_inprocess(
+    task: BenchTask,
+    llm_cache: dict,
+    *,
+    brain_db_path: Path | None = None,
+) -> TaskResult:
+    """Run a single task in-process, reusing cached LLM weights across tasks.
+
+    When `brain_db_path` is provided, it overrides the per-task tempdir
+    brain location. The audit harness uses this to persist a single
+    brain.db across multiple task runs, so atoms accumulated in run N
+    are available when scoring candidates in run N+1. Without that
+    override, brain decision-weighting has no data to act on and any
+    'brain helps' verdict is masked by the fresh-store condition.
+    """
     from lattice.apply import write_final
     from lattice.atoms import SQLiteAtomStore, seed_store
     from lattice.compiler import FilesystemWorkspace
@@ -187,7 +200,10 @@ def _run_one_inprocess(task: BenchTask, llm_cache: dict) -> TaskResult:
     start = time.time()
     try:
         _setup_workspace(task, root)
-        brain_path = root / ".lattice" / "brain.db"
+        if brain_db_path is not None:
+            brain_path = brain_db_path
+        else:
+            brain_path = root / ".lattice" / "brain.db"
         brain_path.parent.mkdir(parents=True, exist_ok=True)
         store = SQLiteAtomStore(brain_path)
         try:
