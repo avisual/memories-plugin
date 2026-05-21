@@ -50,9 +50,14 @@ def compile_action(action: Action, workspace: Workspace) -> CompiledAction:
                 return _compile_add_field(action, workspace)
             case AddParameter():
                 return _compile_add_parameter(action, workspace)
-            case WrapInTry() | AddTest() | RenameSymbol():
+            case WrapInTry():
+                return _compile_wrap_in_try(action, workspace)
+            case AddTest():
+                return _compile_add_test(action, workspace)
+            case RenameSymbol():
                 raise UnsupportedAction(
-                    f"compiler does not yet implement {action.verb!r}"
+                    f"compiler does not yet implement {action.verb!r} "
+                    "(needs cross-file reference rewrite via the lattice store)"
                 )
             case RecallMore() | RevealBody() | MarkBlocked() | Branch():
                 raise NonMutatingAction(
@@ -361,6 +366,204 @@ def _compile_add_parameter(action: AddParameter, workspace: Workspace) -> Compil
                 diff=unified_diff(path=path, before=before, after=after),
             ),
         ),
+    )
+
+
+# ---------------------------------------------------------------------------
+# WrapInTry
+# ---------------------------------------------------------------------------
+
+
+def _compile_wrap_in_try(action: WrapInTry, workspace: Workspace) -> CompiledAction:
+    if action.handler_body or action.finally_body:
+        raise UnsupportedAction(
+            "WrapInTry handler_body/finally_body composition not yet supported; "
+            "emit an empty handler_body and compose follow-up actions instead"
+        )
+
+    path = action.span.file
+    before = workspace.read(path)
+    module = cst.parse_module(before)
+    wrapper = cst.MetadataWrapper(module)
+    positions = wrapper.resolve(cst.metadata.PositionProvider)
+
+    start = action.span.start_line
+    end = action.span.end_line
+
+    enclosing, parent_body, indices = _find_span_in_module(
+        wrapper.module, positions, start, end
+    )
+    if enclosing is None or not indices:
+        raise CompileError(
+            f"no top-level or block statements fall within lines {start}-{end} of {path}"
+        )
+
+    statements_to_wrap = [parent_body[i] for i in indices]
+    try_stmt = _build_try_stmt(statements_to_wrap, action.exception_type.expr)
+
+    new_body = list(parent_body)
+    first = indices[0]
+    last = indices[-1]
+    new_body[first : last + 1] = [try_stmt]
+
+    if enclosing is wrapper.module:
+        new_module = wrapper.module.with_changes(body=tuple(new_body))
+    else:
+        block = enclosing.body  # type: ignore[union-attr]
+        new_block = block.with_changes(body=tuple(new_body))
+        new_module = wrapper.module.deep_replace(
+            enclosing, enclosing.with_changes(body=new_block)
+        )
+
+    after = new_module.code
+    return CompiledAction(
+        verb=action.verb,
+        file_changes=(
+            FileChange(
+                path=path,
+                before=before,
+                after=after,
+                diff=unified_diff(path=path, before=before, after=after),
+            ),
+        ),
+    )
+
+
+def _find_span_in_module(
+    module: cst.Module,
+    positions: dict,
+    start_line: int,
+    end_line: int,
+) -> tuple[cst.CSTNode | None, list[cst.BaseStatement], list[int]]:
+    """Locate the statements that fall within [start_line, end_line].
+
+    Returns (enclosing_node, body_list, indices). enclosing_node is the
+    Module or the FunctionDef/ClassDef whose body holds the statements.
+    """
+
+    def scan(node: cst.CSTNode, body: list[cst.BaseStatement]) -> tuple[
+        cst.CSTNode | None, list[cst.BaseStatement], list[int]
+    ]:
+        indices: list[int] = []
+        for i, stmt in enumerate(body):
+            pos = positions[stmt]
+            if pos.end.line < start_line:
+                continue
+            if pos.start.line > end_line:
+                break
+            indices.append(i)
+            if isinstance(stmt, (cst.FunctionDef, cst.ClassDef)) and isinstance(
+                stmt.body, cst.IndentedBlock
+            ):
+                inner_indices = [
+                    j
+                    for j, child in enumerate(stmt.body.body)
+                    if positions[child].start.line >= start_line
+                    and positions[child].end.line <= end_line
+                ]
+                if inner_indices:
+                    return stmt, list(stmt.body.body), inner_indices
+        return node, body, indices
+
+    return scan(module, list(module.body))
+
+
+def _build_try_stmt(
+    statements: list[cst.BaseStatement], exception_expr: str
+) -> cst.Try:
+    """Build a try/except wrapping *statements* with `except <exc>: pass`."""
+    try_body = cst.IndentedBlock(body=tuple(statements))
+    handler = cst.ExceptHandler(
+        type=cst.parse_expression(exception_expr),
+        body=cst.IndentedBlock(body=(cst.SimpleStatementLine(body=[cst.Pass()]),)),
+    )
+    return cst.Try(body=try_body, handlers=[handler])
+
+
+# ---------------------------------------------------------------------------
+# AddTest
+# ---------------------------------------------------------------------------
+
+
+def _test_path_for(target_file: str) -> str:
+    """Default test-file convention: tests/test_<basename>.py at repo root."""
+    base = target_file.rsplit("/", 1)[-1]
+    stem = base[:-3] if base.endswith(".py") else base
+    return f"tests/test_{stem}.py"
+
+
+def _compile_add_test(action: AddTest, workspace: Workspace) -> CompiledAction:
+    test_path = _test_path_for(action.target.file)
+    before = workspace.read(test_path) if workspace.exists(test_path) else ""
+
+    if before:
+        module = cst.parse_module(before)
+        if _function_exists_in_module(module, action.test_name):
+            return CompiledAction(
+                verb=action.verb,
+                file_changes=(
+                    FileChange(path=test_path, before=before, after=before, diff=""),
+                ),
+            )
+
+    test_fn = _build_test_function(action)
+    if before:
+        module = cst.parse_module(before)
+        new_body = (*module.body, cst.EmptyLine(), test_fn)
+        new_module = module.with_changes(body=new_body)
+    else:
+        new_module = cst.Module(body=(test_fn,))
+    after = new_module.code
+
+    return CompiledAction(
+        verb=action.verb,
+        file_changes=(
+            FileChange(
+                path=test_path,
+                before=before,
+                after=after,
+                diff=unified_diff(path=test_path, before=before, after=after),
+            ),
+        ),
+    )
+
+
+def _function_exists_in_module(module: cst.Module, name: str) -> bool:
+    return any(
+        isinstance(stmt, cst.FunctionDef) and stmt.name.value == name
+        for stmt in module.body
+    )
+
+
+def _build_test_function(action: AddTest) -> cst.FunctionDef:
+    body_lines = [
+        cst.SimpleStatementLine(body=[_statement_from_code(action.given.code)]),
+        cst.SimpleStatementLine(body=[_statement_from_code(action.when.code)]),
+        cst.SimpleStatementLine(body=[_statement_from_code(action.then.code)]),
+    ]
+    return cst.FunctionDef(
+        name=cst.Name(action.test_name),
+        params=cst.Parameters(),
+        body=cst.IndentedBlock(body=tuple(body_lines)),
+        returns=cst.Annotation(annotation=cst.Name("None")),
+        leading_lines=(cst.EmptyLine(), cst.EmptyLine()),
+    )
+
+
+def _statement_from_code(code: str) -> cst.BaseSmallStatement:
+    """Parse *code* as a single small statement.
+
+    Accepts assert/assign/expression statements. Raises CompileError if
+    libcst can't parse the snippet as one statement.
+    """
+    try:
+        parsed = cst.parse_statement(code)
+    except cst.ParserSyntaxError as exc:
+        raise CompileError(f"could not parse statement {code!r}: {exc}") from exc
+    if isinstance(parsed, cst.SimpleStatementLine) and len(parsed.body) == 1:
+        return parsed.body[0]
+    raise CompileError(
+        f"expected a single small statement, got {type(parsed).__name__} for {code!r}"
     )
 
 

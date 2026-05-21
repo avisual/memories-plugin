@@ -21,6 +21,7 @@ from lattice.actions import (
     AddField,
     AddImport,
     AddParameter,
+    AddTest,
     Branch,
     Expr,
     FileRef,
@@ -407,17 +408,6 @@ class TestDispatch:
                 DictWorkspace(),
             )
 
-    def test_wrap_in_try_unsupported(self):
-        with pytest.raises(UnsupportedAction):
-            compile_action(
-                WrapInTry(
-                    span=SpanRef(file="a.py", start_line=1, end_line=2),
-                    exception_type=TypeExpr(expr="Exception"),
-                    confidence=0.5,
-                ),
-                DictWorkspace({"a.py": "pass\npass\n"}),
-            )
-
     def test_rename_symbol_unsupported(self):
         with pytest.raises(UnsupportedAction):
             compile_action(
@@ -510,6 +500,171 @@ def test_property_add_field_always_parses(field_name: str, type_expr: str) -> No
     )
     result = compile_action(action, ws)
     assert _parses(result.file_changes[0].after)
+
+
+class TestWrapInTry:
+    def _ws(self) -> DictWorkspace:
+        src = textwrap.dedent("""\
+            def charge(amount: int) -> None:
+                client = build_client()
+                client.charge(amount)
+        """)
+        return DictWorkspace({"a.py": src})
+
+    def test_wraps_lines_in_function(self):
+        ws = self._ws()
+        result = compile_action(
+            WrapInTry(
+                span=SpanRef(file="a.py", start_line=2, end_line=3),
+                exception_type=TypeExpr(expr="ConnectionError"),
+                confidence=0.8,
+            ),
+            ws,
+        )
+        out = result.file_changes[0].after
+        assert _parses(out)
+        assert "try:" in out
+        assert "except ConnectionError:" in out
+        # The original two statements live inside the try body.
+        assert "client = build_client()" in out
+        assert "client.charge(amount)" in out
+
+    def test_wraps_at_module_level(self):
+        src = "x = compute()\ny = compute()\n"
+        ws = DictWorkspace({"a.py": src})
+        result = compile_action(
+            WrapInTry(
+                span=SpanRef(file="a.py", start_line=1, end_line=2),
+                exception_type=TypeExpr(expr="ValueError"),
+                confidence=0.8,
+            ),
+            ws,
+        )
+        out = result.file_changes[0].after
+        assert _parses(out)
+        assert "try:" in out
+        assert "except ValueError:" in out
+
+    def test_empty_span_raises(self):
+        src = "pass\npass\n"
+        ws = DictWorkspace({"a.py": src})
+        with pytest.raises(Exception):
+            compile_action(
+                WrapInTry(
+                    span=SpanRef(file="a.py", start_line=99, end_line=100),
+                    exception_type=TypeExpr(expr="Exception"),
+                    confidence=0.8,
+                ),
+                ws,
+            )
+
+    def test_handler_body_unsupported(self):
+        from lattice.actions import Branch
+
+        ws = DictWorkspace({"a.py": "x = 1\n"})
+        with pytest.raises(UnsupportedAction):
+            compile_action(
+                WrapInTry(
+                    span=SpanRef(file="a.py", start_line=1, end_line=1),
+                    exception_type=TypeExpr(expr="Exception"),
+                    handler_body=[Branch(rationale="?", confidence=0.5)],
+                    confidence=0.8,
+                ),
+                ws,
+            )
+
+
+class TestAddTest:
+    def test_creates_test_file_if_absent(self):
+        ws = DictWorkspace(
+            {
+                "src/payments/charge.py": "def charge(amount: int) -> None: pass\n",
+            }
+        )
+        result = compile_action(
+            AddTest(
+                target=SymbolRef(file="src/payments/charge.py", name="charge"),
+                test_name="test_charge_smoke",
+                given=Expr(code="amount = 5"),
+                when=Expr(code="result = charge(amount)"),
+                then=Expr(code="assert result is None"),
+                confidence=0.8,
+            ),
+            ws,
+        )
+        change = result.file_changes[0]
+        assert change.path == "tests/test_charge.py"
+        out = change.after
+        assert _parses(out)
+        assert "def test_charge_smoke() -> None:" in out
+        assert "amount = 5" in out
+        assert "result = charge(amount)" in out
+        assert "assert result is None" in out
+
+    def test_appends_to_existing_test_file(self):
+        existing = textwrap.dedent("""\
+            def test_charge_existing() -> None:
+                assert True
+        """)
+        ws = DictWorkspace(
+            {
+                "src/payments/charge.py": "def charge(amount: int) -> None: pass\n",
+                "tests/test_charge.py": existing,
+            }
+        )
+        result = compile_action(
+            AddTest(
+                target=SymbolRef(file="src/payments/charge.py", name="charge"),
+                test_name="test_charge_new",
+                given=Expr(code="amount = 0"),
+                when=Expr(code="result = charge(amount)"),
+                then=Expr(code="assert result is None"),
+                confidence=0.8,
+            ),
+            ws,
+        )
+        out = result.file_changes[0].after
+        assert _parses(out)
+        assert "def test_charge_existing" in out
+        assert "def test_charge_new" in out
+
+    def test_idempotent_when_test_name_exists(self):
+        existing = "def test_charge_smoke() -> None:\n    assert True\n"
+        ws = DictWorkspace(
+            {
+                "src/payments/charge.py": "def charge(amount: int) -> None: pass\n",
+                "tests/test_charge.py": existing,
+            }
+        )
+        result = compile_action(
+            AddTest(
+                target=SymbolRef(file="src/payments/charge.py", name="charge"),
+                test_name="test_charge_smoke",
+                given=Expr(code="amount = 0"),
+                when=Expr(code="r = charge(amount)"),
+                then=Expr(code="assert r is None"),
+                confidence=0.8,
+            ),
+            ws,
+        )
+        assert result.is_noop
+
+    def test_bad_given_raises_compile_error(self):
+        ws = DictWorkspace(
+            {"src/payments/charge.py": "def charge(): pass\n"}
+        )
+        with pytest.raises(Exception):
+            compile_action(
+                AddTest(
+                    target=SymbolRef(file="src/payments/charge.py", name="charge"),
+                    test_name="test_charge_bad",
+                    given=Expr(code="@@@"),
+                    when=Expr(code="charge()"),
+                    then=Expr(code="assert True"),
+                    confidence=0.8,
+                ),
+                ws,
+            )
 
 
 @given(
