@@ -33,6 +33,7 @@ runs use the cache and complete in seconds.
 | `04_agent_multistep.sh` | The stack-machine model: a 2-edit task done in two cycles by a 0.5B model. |
 | `05_brain_grow.sh` | Import a custom atom pack and watch the brain absorb new project knowledge. |
 | `06_full_stack.sh` | **The headline.** Research + two-stage LLM (Planner+Executor) + atom feedback. Qwen-1.5B fetches Flask-CORS docs at runtime and uses what it just learned to emit `from flask_cors import CORS`. |
+| `07_real_codebase.sh` | **The credibility test.** Five PR-shaped tasks against lattice's own production source files (`atoms/evolve.py`, `atoms/feedback.py`). Real Python with type annotations, classes, decorators. Three real refactors land; two SymbolNotFound rejections happen on tasks targeting nonexistent symbols (the correct outcome). Both touched files still parse as Python afterward. |
 
 All examples run on a CPU-only machine in under a minute each (after
 the model is cached locally).
