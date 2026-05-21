@@ -1,0 +1,30 @@
+"""PROPOSE — sources of typed Actions.
+
+Every Proposer turns a typed Observation into one or more typed
+Actions. The boundary is intentional: the orchestrator's reasoning
+loop never knows whether the actions came from a rule, a small LLM,
+a hosted LLM, the apprentice (Organ 8), or a human.
+
+Implementations:
+- MockProposer: deterministic, for tests and the v0 demo.
+- LocalLLMProposer: a small instruct model via transformers, with
+  Pydantic-validated JSON output + retry-on-parse-failure.
+- (planned) AnthropicProposer: hosted small model via API.
+- (planned) ApprenticeProposer: the distilled policy net (Organ 8).
+"""
+
+from lattice.propose.base import (
+    ObservationContext,
+    Proposer,
+    ProposerError,
+    proposer_for_intent,
+)
+from lattice.propose.mock import MockProposer
+
+__all__ = [
+    "MockProposer",
+    "ObservationContext",
+    "Proposer",
+    "ProposerError",
+    "proposer_for_intent",
+]
