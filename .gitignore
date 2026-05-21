@@ -16,6 +16,11 @@ htmlcov/
 
 # Database files
 *.db
+*.db-shm
+*.db-wal
+
+# Lattice per-project brain (initialised by `lattice init`)
+.lattice/
 
 # Environment
 .env
