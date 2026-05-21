@@ -169,14 +169,26 @@ def test_boost_recurrent_traces_raises_importance(store: SQLiteAtomStore):
 
 
 def _extract_actions(content: str) -> list[str]:
-    """Test helper: pull the actions list out of a trace atom's JSON payload."""
+    """Test helper: pull verb names from a trace atom's JSON payload.
+
+    Tolerant of both the legacy verb-string form and the new structured
+    dict form. The tuple of strings is used as a dict key, so this must
+    return hashables.
+    """
     import json as _json
 
     marker = "\nJSON: "
     idx = content.rfind(marker)
     if idx < 0:
         return []
-    return _json.loads(content[idx + len(marker):]).get("actions", [])
+    raw = _json.loads(content[idx + len(marker):]).get("actions", [])
+    out: list[str] = []
+    for a in raw:
+        if isinstance(a, dict):
+            out.append(str(a.get("verb", "?")))
+        else:
+            out.append(str(a))
+    return out
 
 
 def test_boost_below_threshold_no_op(store: SQLiteAtomStore):

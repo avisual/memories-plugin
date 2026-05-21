@@ -21,19 +21,28 @@ def record_experience(
     *,
     store: AtomStore,
     task: str,
-    actions_summary: list[str],
+    actions_summary: list,
     files_touched: list[str],
     project_region: str | None = None,
 ) -> int:
     """Store a single experience atom summarizing a successful task.
 
-    Returns the atom id. Content is structured so it surfaces well
-    under future task recall (the task wording stays prominent).
-    Also writes a parallel TRACE atom (region='traces') that EVOLVE
-    (Organ 9) mines for macro-promotion candidates.
+    `actions_summary` now accepts either verb-name strings (legacy) or
+    full action dicts (preferred — Organ 8 template inference needs the
+    slot values). Stringification for the human-readable summary uses
+    only the verb names.
+
+    Returns the atom id. Also writes a parallel TRACE atom in
+    region='traces' that EVOLVE mines for macro-promotion candidates.
     """
     region = project_region or "experiences"
-    actions_clause = "; ".join(actions_summary[:5])
+    verb_names: list[str] = []
+    for a in actions_summary[:5]:
+        if isinstance(a, dict):
+            verb_names.append(str(a.get("verb", "?")))
+        else:
+            verb_names.append(str(a))
+    actions_clause = "; ".join(verb_names)
     files_clause = ", ".join(files_touched[:5]) if files_touched else "no files"
     content = (
         f"Did task: '{task[:140]}'. "
@@ -87,23 +96,45 @@ def record_antipattern(
     return atom.id  # type: ignore[return-value]
 
 
-def summarize_trace_for_experience(trace_or_report: Any) -> tuple[list[str], list[str]]:
-    """Extract (action_summaries, files_touched) from an AgentTrace or
+def summarize_trace_for_experience(trace_or_report: Any) -> tuple[list, list[str]]:
+    """Extract (action_records, files_touched) from an AgentTrace or
     MultiSubtaskReport. Tolerant of either shape via duck-typing.
+
+    `action_records` is a list of either:
+    - dicts (full action JSON: verb + slots), when the step's
+      StepRecord carries an Action (which carries model_dump_json),
+    - or verb-only strings, when the step had no Action (e.g.
+      proposer raised).
+
+    Downstream (Organ 8 apprentice template inference) needs the slot
+    values, so we prefer the dict form.
     """
-    actions: list[str] = []
+    actions: list = []
     files: list[str] = list(getattr(trace_or_report, "final_files", {}).keys())
+
+    def _record_for(step: Any):
+        if step.kind != "edit" or not step.verb or not step.diff:
+            return None
+        action = getattr(step, "action", None)
+        if action is None:
+            return step.verb
+        try:
+            return action.model_dump(mode="json")
+        except Exception:  # noqa: BLE001
+            return step.verb
 
     traces = getattr(trace_or_report, "traces", None)
     if traces is not None:
         for t in traces:
             for s in t.steps:
-                if s.kind == "edit" and s.verb and s.diff:
-                    actions.append(s.verb)
+                rec = _record_for(s)
+                if rec is not None:
+                    actions.append(rec)
         return actions, files
 
     steps = getattr(trace_or_report, "steps", ())
     for s in steps:
-        if s.kind == "edit" and s.verb and s.diff:
-            actions.append(s.verb)
+        rec = _record_for(s)
+        if rec is not None:
+            actions.append(rec)
     return actions, files

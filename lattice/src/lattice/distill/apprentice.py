@@ -68,13 +68,56 @@ class ApprenticeProposer:
     def propose(self, obs: ObservationContext, n: int = 1) -> list[Action]:
         if self.atom_store is None or n <= 0 or not obs.task.strip():
             return []
+
+        # TEMPLATE PATH (the real DISTILL): learned templates inferred
+        # from recurring traces match novel task wording directly. When
+        # one matches, we emit the substituted action WITHOUT consulting
+        # recall or the LLM. This is the path that actually saves LLM
+        # calls on new-but-shaped-the-same tasks.
+        actions: list[Action] = []
+        seen_dumps: set[str] = set()
+        try:
+            from lattice.atoms import apply_template, learned_templates, parse_action_from_dict  # noqa: F401
+        except ImportError:
+            pass
+        try:
+            from lattice.actions import parse_action
+            from lattice.atoms.evolve import apply_template, learned_templates
+
+            for tmpl in learned_templates(
+                self.atom_store, min_recurrence=2
+            ):
+                # Skip templates that come from un-boosted traces. A
+                # template MUST also be importance-boosted to fire — the
+                # gate is 'lattice has lived through this pattern enough
+                # to commit to it'.
+                if tmpl.sample_count < 2:
+                    continue
+                substituted = apply_template(tmpl, obs.task)
+                if substituted is None:
+                    continue
+                try:
+                    action = parse_action(substituted)
+                except Exception:  # noqa: BLE001
+                    continue
+                dump = action.model_dump_json()
+                if dump in seen_dumps:
+                    continue
+                seen_dumps.add(dump)
+                actions.append(action)
+                if len(actions) >= n:
+                    return actions
+        except Exception:  # noqa: BLE001
+            # Template path is best-effort; fall through to recall.
+            pass
+
+        # RECALL PATH (legacy): nearest-neighbour trace replay. Useful
+        # when the task is similar but the template path didn't fire
+        # (e.g. only one prior trace, or variable-length task tokens).
         try:
             results = self.atom_store.recall(obs.task, k=max(n * 2, 4))
         except Exception:  # noqa: BLE001
-            return []
-
-        actions: list[Action] = []
-        seen_dumps: set[str] = set()
+            return actions
         for r in results:
             atom = r.atom
             if atom.region != _TRACE_REGION:
@@ -92,7 +135,12 @@ class ApprenticeProposer:
             recorded_actions = payload.get("actions") or []
             if not recorded_actions:
                 continue
-            recorded_first = _action_for_verb(recorded_actions[0], payload)
+            first = recorded_actions[0]
+            # Trace atoms can now hold full action JSON. If they do,
+            # rebuild the action directly from that JSON (the slot
+            # values are baked in). If they're just verb names (legacy),
+            # fall back to pattern-based reconstruction.
+            recorded_first = _action_from_dict_or_verb(first, payload)
             if recorded_first is None:
                 continue
             dump = recorded_first.model_dump_json()
@@ -116,40 +164,47 @@ def _parse_trace_payload(content: str) -> dict | None:
         return None
 
 
-def _action_for_verb(verb: str, payload: dict) -> Action | None:
-    """Best-effort reconstruction of an Action from a verb name + trace.
+def _action_from_dict_or_verb(first, payload: dict) -> Action | None:
+    """Reconstruct an Action from the recorded first-action.
 
-    The trace records the verb name only (no slots). For an apprentice
-    to emit a USEFUL candidate, we need slot values. For v0 we only
-    support verbs whose 'slots' are derivable from the task text or
-    workspace files via the existing PatternProposer. Falls back to
-    None for verbs the apprentice can't reconstruct yet.
+    Two paths:
 
-    The honest read of this method: v0 apprentice REQUIRES a matching
-    pattern at the task-text level to fill in slots. When that exists,
-    the apprentice's value is signaling 'this pattern has worked
-    before' — which the population scorer picks up via the recurrence
-    boost on the candidate's atom. Phase 2 will add slot-substitution
-    via pattern templates inferred from the trace's sample tasks.
+    1. Structured form (preferred): `first` is a dict with the full
+       action JSON — `parse_action` rebuilds the typed Action directly.
+       This is the path that lets the apprentice handle NOVEL tasks
+       (the slot values come from the trace, not from re-parsing the
+       new task text).
+
+    2. Legacy form: `first` is just a verb name string. Fall back to
+       reconstructing via PatternProposer on the trace's original
+       task text — narrow but honest.
+
+    Returns None when the action can't be rebuilt safely.
     """
-    # For v0 we delegate to PatternProposer on the trace's original
-    # task text: if the trace's task matches a known pattern, the
-    # pattern reconstructs the typed Action. This is intentionally
-    # narrow — it means the apprentice only fires for tasks the
-    # PatternProposer would have handled anyway, but with the bonus
-    # that the trace embedding finds them even when the task wording
-    # is slightly different.
-    try:
-        from lattice.propose.pattern import task_to_action
+    from lattice.actions import parse_action
+    from lattice.propose.pattern import task_to_action
 
+    if isinstance(first, dict):
+        try:
+            return parse_action(first)
+        except Exception:  # noqa: BLE001
+            verb = first.get("verb")
+            if verb is None:
+                return None
+            first = verb  # fall through to legacy path
+
+    if isinstance(first, str):
+        verb = first
         original_task = payload.get("task", "")
         if not original_task:
             return None
-        action = task_to_action(original_task)
+        try:
+            action = task_to_action(original_task)
+        except Exception:  # noqa: BLE001
+            return None
         if action is not None and action.verb == verb:
             return action
-    except Exception:  # noqa: BLE001
-        return None
+
     return None
 
 

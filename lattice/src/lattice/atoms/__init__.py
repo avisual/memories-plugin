@@ -15,9 +15,13 @@ from lattice.atoms.atom import Atom, AtomType
 from lattice.atoms.embedder import Embedder, MiniLMEmbedder
 from lattice.atoms.evolve import (
     EvolveReport,
+    LearnedTemplate,
     MacroCandidate,
+    apply_template,
     boost_recurrent_traces,
     discover,
+    infer_template,
+    learned_templates,
     write_trace,
 )
 from lattice.atoms.feedback import (
