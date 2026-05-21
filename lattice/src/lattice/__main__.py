@@ -1,15 +1,17 @@
 """Command-line driver for LATTICE.
 
-Currently exposes one subcommand:
+Subcommands:
 
-    python -m lattice apply <workspace_root> [--action JSON | -]
+    python -m lattice apply  <workspace> [--action JSON | -]
+    python -m lattice intent <workspace> [--intent JSON | -] [--files a.py,b.py]
 
-Reads a typed Action JSON, compiles it against the workspace, verifies
-the resulting source parses, and writes the unified diff to stdout.
-Exit code is 0 on success, 1 on compile/verify failure, 2 on input
-errors. No filesystem mutation — diffs are printed, not applied.
+`apply` takes a single typed Action and prints its diff.
+`intent` takes a high-level Intent, expands it into many typed Actions
+(the composition spine: intent → primitives), compiles and verifies
+each, and prints a multi-file unified diff. No filesystem mutation —
+diffs are printed, not applied.
 
-Used as the smoke-test entry point until the full reasoning loop lands.
+Exit: 0 on success, 1 on compile/verify failure, 2 on input errors.
 """
 
 from __future__ import annotations
@@ -19,13 +21,19 @@ import json
 import sys
 from typing import IO
 
-from pydantic import ValidationError
+from pydantic import TypeAdapter, ValidationError
 
 from lattice.actions import parse_action
 from lattice.compiler import (
     CompileError,
     FilesystemWorkspace,
     compile_action,
+)
+from lattice.orchestrator import (
+    ExecutionReport,
+    Intent,
+    execute_plan,
+    expand_intent,
 )
 from lattice.verify import verify_syntactic
 
@@ -80,6 +88,49 @@ def _apply(args: argparse.Namespace) -> int:
     return 0
 
 
+_intent_adapter: TypeAdapter[Intent] = TypeAdapter(Intent)
+
+
+def _intent(args: argparse.Namespace) -> int:
+    workspace = FilesystemWorkspace(args.workspace)
+    payload = _read_action_json(args.intent, sys.stdin)
+    try:
+        intent = _intent_adapter.validate_python(payload)
+    except ValidationError as exc:
+        sys.stderr.write(f"intent did not validate:\n{exc}\n")
+        return 2
+
+    if args.files:
+        files = [p.strip() for p in args.files.split(",") if p.strip()]
+    else:
+        files = workspace.iter_files(suffix=".py")
+
+    actions = expand_intent(intent, workspace, files)
+    if not actions:
+        sys.stderr.write("(intent expanded to zero actions — no matching symbols)\n")
+        return 0
+
+    sys.stderr.write(f"expanded to {len(actions)} action(s)\n")
+    report: ExecutionReport = execute_plan(actions, workspace)
+
+    if not report.ok:
+        for step in report.steps:
+            if step.ok:
+                continue
+            if step.error:
+                sys.stderr.write(f"  step failed: {step.error}\n")
+            elif step.verify and step.verify.errors:
+                for path, msg in step.verify.errors:
+                    sys.stderr.write(f"  verify failed {path}: {msg}\n")
+        return 1
+
+    for diff in report.diffs:
+        sys.stdout.write(diff)
+        if not diff.endswith("\n"):
+            sys.stdout.write("\n")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="lattice")
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -92,6 +143,23 @@ def main(argv: list[str] | None = None) -> int:
         help="Action JSON: literal string, '-' for stdin, or '@FILE' to read from a file.",
     )
     apply_p.set_defaults(func=_apply)
+
+    intent_p = sub.add_parser(
+        "intent",
+        help="Expand a high-level intent into many typed actions and print the diffs.",
+    )
+    intent_p.add_argument("workspace", help="Repository root the intent operates against.")
+    intent_p.add_argument(
+        "--intent",
+        default="-",
+        help="Intent JSON: literal string, '-' for stdin, or '@FILE' to read from a file.",
+    )
+    intent_p.add_argument(
+        "--files",
+        default="",
+        help="Comma-separated repository-relative .py paths. Default: walk workspace.",
+    )
+    intent_p.set_defaults(func=_intent)
 
     args = parser.parse_args(argv)
     return args.func(args)

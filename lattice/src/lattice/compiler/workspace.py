@@ -23,6 +23,15 @@ class Workspace(Protocol):
 
     def exists(self, path: str) -> bool: ...
 
+    def iter_files(self, *, suffix: str | None = None) -> list[str]:
+        """List repository-relative paths in the workspace.
+
+        If *suffix* is given (e.g. '.py'), only return paths ending with
+        it. Skips conventional non-source directories like .git, .venv,
+        __pycache__, node_modules.
+        """
+        ...
+
 
 class DictWorkspace:
     """In-memory workspace; for tests and the world model's imagination."""
@@ -38,6 +47,11 @@ class DictWorkspace:
 
     def exists(self, path: str) -> bool:
         return path in self._files
+
+    def iter_files(self, *, suffix: str | None = None) -> list[str]:
+        if suffix is None:
+            return sorted(self._files.keys())
+        return sorted(p for p in self._files if p.endswith(suffix))
 
 
 class FilesystemWorkspace:
@@ -72,3 +86,18 @@ class FilesystemWorkspace:
             return self._resolve(path).is_file()
         except WorkspaceError:
             return False
+
+    def iter_files(self, *, suffix: str | None = None) -> list[str]:
+        skip_dirs = {".git", ".venv", "__pycache__", "node_modules", ".pytest_cache", "dist", "build"}
+        out: list[str] = []
+        for full in self._root.rglob("*"):
+            if not full.is_file():
+                continue
+            rel = full.relative_to(self._root)
+            if any(part in skip_dirs for part in rel.parts):
+                continue
+            path = rel.as_posix()
+            if suffix is not None and not path.endswith(suffix):
+                continue
+            out.append(path)
+        return sorted(out)

@@ -27,47 +27,55 @@ The full design is in [DESIGN.md](DESIGN.md).
 
 ## Status
 
-v0 working end-to-end on the action → diff path (Months 1–2 of the
-build sketch). What runs today:
+v0 working end-to-end through the composition spine: one intent
+expands into many typed actions, every action compiles to a verified
+diff. What runs today:
 
 - **Action DSL** (Organ 3): 10 typed verbs, Pydantic-validated,
   discriminated-union parser, JSON-schema export for constrained
   decoding.
 - **Action compiler** (Python, libcst): `AddImport`, `AddField`,
-  `AddParameter` produce real file diffs. Idempotent (no-op on
-  already-present state). `WrapInTry`, `AddTest`, `RenameSymbol`
-  raise `UnsupportedAction` until they land.
+  `AddParameter` produce real file diffs. Idempotent on already-
+  present state. `WrapInTry`, `AddTest`, `RenameSymbol` raise
+  `UnsupportedAction` until they land.
+- **Symbol-graph extractor** (Organ 2, Python): walks files via
+  libcst, yields typed `Symbol{file, name, kind, line}` records.
+- **Orchestrator**: takes a high-level `Intent`, expands it into many
+  typed `Action`s, runs each through compile + verify, returns an
+  `ExecutionReport` bundling diffs and outcomes.
 - **Syntactic verify** (Organ 7, partial): every compiled diff is
-  parsed with `ast.parse` before being printed.
-- **CLI**: `python -m lattice apply <workspace> --action <json>` takes
-  a typed action as JSON and emits a unified diff on stdout.
+  parsed with `ast.parse`.
+- **CLI**: `python -m lattice apply` (single action) and
+  `python -m lattice intent` (multi-action expansion).
 
 Not yet: world model, steering, lattice store, apprentice, evolution,
 interface surfaces beyond the CLI.
 
 ## Try it
 
+Install:
+
 ```bash
 cd lattice
 uv pip install -e ".[dev]"
+```
 
-mkdir -p /tmp/latticedemo
-cat > /tmp/latticedemo/charge.py <<'PY'
+### Single action
+
+```bash
+mkdir -p /tmp/demo
+cat > /tmp/demo/charge.py <<'PY'
 """Charge a customer's card."""
 import os
 
 class ChargeProcessor:
-    api_key: str = ""
-
     def charge(self, amount: int) -> None:
         pass
 PY
 
 echo '{"verb":"AddImport","file":{"path":"charge.py"},"module":"stripe","confidence":0.9}' \
-  | uv run python -m lattice apply /tmp/latticedemo --action -
+  | uv run python -m lattice apply /tmp/demo --action -
 ```
-
-Output:
 
 ```diff
 --- a/charge.py
@@ -76,9 +84,28 @@ Output:
  """Charge a customer's card."""
  import os
 +import stripe
-
- class ChargeProcessor:
 ```
+
+### Multi-file intent (composition)
+
+One Intent expands into N typed Actions across the whole workspace:
+
+```bash
+echo '{
+  "kind": "AddParameterToAllMatching",
+  "function_name": "charge",
+  "parameter_name": "dry_run",
+  "parameter_type": "bool",
+  "parameter_default": "False",
+  "keyword_only": true
+}' | uv run python -m lattice intent /tmp/demo --intent -
+```
+
+The orchestrator walks the workspace, finds every `charge()` (function
+or method), emits one `AddParameter` action per match, compiles each
+through libcst, and verifies the output parses. Output is a sequence
+of unified diffs across all touched files. Nothing is written to disk
+— the diff is the deliverable.
 
 ## Layout
 
