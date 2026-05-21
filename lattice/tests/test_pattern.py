@@ -129,6 +129,52 @@ class TestAddField:
         assert a.name == "api_key"
 
 
+class TestWrapInTry:
+    def test_basic(self):
+        from lattice.actions import WrapInTry
+
+        a = task_to_action("Wrap lines 5-8 of src/io.py in a try/except for IOError")
+        assert isinstance(a, WrapInTry)
+        assert a.span.file == "src/io.py"
+        assert a.span.start_line == 5
+        assert a.span.end_line == 8
+        assert a.exception_type.expr == "IOError"
+
+    def test_through_keyword(self):
+        from lattice.actions import WrapInTry
+
+        a = task_to_action("Wrap lines 1 through 10 of src/a.py in try/except for ValueError")
+        assert isinstance(a, WrapInTry)
+        assert (a.span.start_line, a.span.end_line) == (1, 10)
+
+    def test_no_exception_defaults_to_exception(self):
+        from lattice.actions import WrapInTry
+
+        a = task_to_action("Wrap lines 5-8 of src/a.py in a try/except")
+        assert isinstance(a, WrapInTry)
+        assert a.exception_type.expr == "Exception"
+
+
+class TestAddTestPattern:
+    def test_basic(self):
+        from lattice.actions import AddTest
+
+        a = task_to_action("Add a smoke test for charge in src/billing.py")
+        assert isinstance(a, AddTest)
+        assert a.target.name == "charge"
+        assert a.target.file == "src/billing.py"
+        assert a.test_name == "test_charge"
+
+    def test_with_explicit_name(self):
+        from lattice.actions import AddTest
+
+        a = task_to_action(
+            "Add a test called test_charge_zero for charge in src/billing.py"
+        )
+        assert isinstance(a, AddTest)
+        assert a.test_name == "test_charge_zero"
+
+
 class TestNonMatches:
     def test_unrelated_task(self):
         assert task_to_action("Refactor the whole codebase") is None

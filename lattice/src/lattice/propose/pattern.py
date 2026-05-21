@@ -32,11 +32,14 @@ from lattice.actions import (
     AddField,
     AddImport,
     AddParameter,
+    AddTest,
     Expr,
     FileRef,
     RenameSymbol,
+    SpanRef,
     SymbolRef,
     TypeExpr,
+    WrapInTry,
 )
 from lattice.propose.base import ObservationContext, Proposer
 
@@ -145,6 +148,42 @@ _PATTERNS: list[tuple[re.Pattern[str], str]] = [
         ),
         "rename",
     ),
+    # 'wrap lines N-M of FILE in try/except for EXC' / 'wrap lines N to M in FILE with a try/except for EXC'
+    (
+        re.compile(
+            r"""
+            wrap\s+lines?\s+
+            (?P<start>\d+)
+            \s*(?:-|to|through)\s*
+            (?P<end>\d+)
+            \s+(?:of|in|inside)\s+
+            """ + _PATH + r"""
+            \s+(?:in|with|using)\s+(?:an?\s+)?try(?:\s*/\s*except|\s+except)
+            (?:\s+for\s+
+                ['"`]?(?P<exc>[A-Za-z_][\w.]*)['"`]?
+            )?
+            """,
+            re.IGNORECASE | re.VERBOSE,
+        ),
+        "wrap_in_try",
+    ),
+    # 'add a test NAME for FUNC in FILE' / 'add a smoke test for FUNC in FILE'
+    (
+        re.compile(
+            r"""
+            add\s+(?:an?\s+)?(?P<kind>smoke\s+|unit\s+|integration\s+)?test\s+
+            (?:(?:named\s+|called\s+)
+                ['"`]?(?P<tname>test_[A-Za-z_]\w*)['"`]?
+                \s+
+            )?
+            for\s+(?:function\s+|method\s+)?
+            ['"`]?(?P<func>[A-Za-z_][\w.]*)['"`]?
+            \s+(?:in|inside)\s+
+            """ + _PATH,
+            re.IGNORECASE | re.VERBOSE,
+        ),
+        "add_test",
+    ),
 ]
 
 
@@ -211,6 +250,32 @@ def task_to_action(task: str) -> Action | None:
             type=TypeExpr(expr=typ_str),
             default=Expr(code=default) if default else None,
             confidence=0.9,
+        )
+    if kind == "wrap_in_try":
+        try:
+            start = int(groups["start"])
+            end = int(groups["end"])
+        except (KeyError, TypeError, ValueError):
+            return None
+        if end < start:
+            return None
+        exc_expr = groups.get("exc") or "Exception"
+        return WrapInTry(
+            span=SpanRef(file=file_path, start_line=start, end_line=end),
+            exception_type=TypeExpr(expr=exc_expr),
+            confidence=0.85,
+        )
+    if kind == "add_test":
+        func = groups["func"]
+        leaf = func.rsplit(".", 1)[-1]
+        test_name = groups.get("tname") or f"test_{leaf}"
+        return AddTest(
+            target=SymbolRef(file=file_path, name=func),
+            test_name=test_name,
+            given=Expr(code="..."),
+            when=Expr(code=f"result = {leaf}()"),
+            then=Expr(code="assert result is not None"),
+            confidence=0.7,
         )
     return None
 
