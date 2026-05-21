@@ -429,11 +429,16 @@ def _brain_export(args: argparse.Namespace) -> int:
 
 
 def _evolve(args: argparse.Namespace) -> int:
-    from lattice.atoms import SQLiteAtomStore, discover
+    from lattice.atoms import SQLiteAtomStore, boost_recurrent_traces, discover
 
     store = SQLiteAtomStore(args.db)
     try:
         report = discover(store, min_recurrence=args.min_recurrence)
+        boosted = 0
+        if args.apply:
+            boosted = boost_recurrent_traces(
+                store, min_recurrence=args.min_recurrence
+            )
     finally:
         store.close()
 
@@ -454,6 +459,11 @@ def _evolve(args: argparse.Namespace) -> int:
         )
         for st in cand.sample_tasks[:3]:
             sys.stdout.write(f"      sample task: {st[:160]}\n")
+    if args.apply:
+        sys.stdout.write(
+            f"\napplied: boosted importance on {boosted} trace atom(s); "
+            "future recall will surface them as stronger hints.\n"
+        )
     return 0
 
 
@@ -895,6 +905,15 @@ def main(argv: list[str] | None = None) -> int:
         type=int,
         default=3,
         help="Minimum number of identical action-sequence runs to promote (default 3).",
+    )
+    evolve_p.add_argument(
+        "--apply",
+        action="store_true",
+        help=(
+            "Boost the importance of trace atoms whose action-sequence "
+            "recurs at least --min-recurrence times. After this, atom "
+            "recall surfaces those patterns as stronger hints to the LLM."
+        ),
     )
     evolve_p.set_defaults(func=_evolve)
 

@@ -142,3 +142,47 @@ def test_record_experience_also_writes_trace(store: SQLiteAtomStore):
     report = discover(store, min_recurrence=1)
     assert report.total_traces == 1
     assert report.candidates[0].action_sequence == ("AddImport",)
+
+
+def test_boost_recurrent_traces_raises_importance(store: SQLiteAtomStore):
+    """Phase 2: when a sequence recurs >= min_recurrence times, boost the
+    importance of its trace atoms so they surface higher in recall."""
+    from lattice.atoms import boost_recurrent_traces
+
+    # Three same-sequence traces.
+    for task in ("a", "b", "c"):
+        write_trace(store=store, task=task, actions=["AddImport"], files_touched=[])
+    # Two different-sequence traces (below threshold, should NOT boost).
+    for task in ("d", "e"):
+        write_trace(store=store, task=task, actions=["RenameSymbol"], files_touched=[])
+
+    boosted = boost_recurrent_traces(store, min_recurrence=3)
+    assert boosted == 3
+
+    # The three AddImport traces now carry the boosted importance.
+    rows = store._conn.execute(  # type: ignore[attr-defined]
+        "SELECT content, importance FROM atoms WHERE region = 'traces'"
+    ).fetchall()
+    importances = {tuple(_extract_actions(c)): imp for c, imp in rows}
+    assert importances[("AddImport",)] >= 0.85  # 0.55 + 3*0.1 = 0.85
+    assert importances[("RenameSymbol",)] < 0.85  # below threshold; not boosted
+
+
+def _extract_actions(content: str) -> list[str]:
+    """Test helper: pull the actions list out of a trace atom's JSON payload."""
+    import json as _json
+
+    marker = "\nJSON: "
+    idx = content.rfind(marker)
+    if idx < 0:
+        return []
+    return _json.loads(content[idx + len(marker):]).get("actions", [])
+
+
+def test_boost_below_threshold_no_op(store: SQLiteAtomStore):
+    """Below min_recurrence, no atom gets boosted."""
+    from lattice.atoms import boost_recurrent_traces
+
+    for task in ("a", "b"):
+        write_trace(store=store, task=task, actions=["AddImport"], files_touched=[])
+    assert boost_recurrent_traces(store, min_recurrence=3) == 0

@@ -16,6 +16,7 @@ from lattice.atoms.embedder import Embedder, MiniLMEmbedder
 from lattice.atoms.evolve import (
     EvolveReport,
     MacroCandidate,
+    boost_recurrent_traces,
     discover,
     write_trace,
 )

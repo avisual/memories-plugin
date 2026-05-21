@@ -157,3 +157,47 @@ def discover(
         candidates=tuple(candidates[:max_candidates]),
         total_traces=parsed_count,
     )
+
+
+def boost_recurrent_traces(store: AtomStore, *, min_recurrence: int = 3) -> int:
+    """Phase 2 of Organ 9: when a trace pattern reaches min_recurrence,
+    raise the importance of those trace atoms so atom recall surfaces
+    them as a stronger hint to the LLM.
+
+    The IMPROVES loop closes through the existing observation pipeline:
+    high-importance recurring traces flow into the next turn's HINTS
+    without any new code path — the LLM sees 'similar past tasks
+    consistently used this action sequence' and acts accordingly.
+
+    Returns the number of trace atoms whose importance was raised.
+    """
+    rows = store._conn.execute(  # type: ignore[attr-defined]
+        "SELECT id, content FROM atoms WHERE region = ? AND type = ?",
+        (_TRACE_REGION, _TRACE_TYPE.value),
+    ).fetchall()
+    if not rows:
+        return 0
+
+    by_sig: dict[tuple[str, ...], list[int]] = defaultdict(list)
+    for atom_id, content in rows:
+        payload = _parse_trace_payload(content)
+        if not payload:
+            continue
+        sig = _signature(payload.get("actions") or [])
+        if not sig:
+            continue
+        by_sig[sig].append(atom_id)
+
+    boosted = 0
+    for ids in by_sig.values():
+        if len(ids) < min_recurrence:
+            continue
+        # Cap at 0.95 so seed atoms with importance 0.95+ still dominate.
+        # Recurrence saturates after a while — 3 runs is enough to learn.
+        new_importance = min(0.95, 0.55 + 0.1 * len(ids))
+        store._conn.executemany(  # type: ignore[attr-defined]
+            "UPDATE atoms SET importance = ? WHERE id = ?",
+            [(new_importance, aid) for aid in ids],
+        )
+        boosted += len(ids)
+    return boosted

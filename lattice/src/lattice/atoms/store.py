@@ -177,11 +177,18 @@ class SQLiteAtomStore:
         if not rows:
             return []
 
-        # Cosine over normalized vectors == dot product.
+        # Cosine over normalized vectors == dot product. Importance adds
+        # a small additive bonus so EVOLVE's boost_recurrent_traces (which
+        # raises importance on patterns the system has seen N+ times)
+        # actually changes recall order. 0.10 is small enough that strong
+        # semantic mismatches still lose, large enough that two atoms with
+        # similar cosines get ordered by 'lattice has learned this matters.'
         matrix = np.vstack(
             [np.frombuffer(r[10], dtype=np.float32) for r in rows]
         )
-        scores = matrix @ q_vec
+        cosines = matrix @ q_vec
+        importances = np.array([r[5] for r in rows], dtype=np.float32)
+        scores = cosines + 0.10 * importances
         top_idx = np.argsort(-scores)[:k]
 
         # Update access stats for the recalled atoms (best-effort; failures
