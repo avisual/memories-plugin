@@ -3,6 +3,87 @@
 All notable changes to LATTICE will live here. Versions follow
 semantic versioning.
 
+## [0.1.1] — Composition that works
+
+The release where the parts actually started adding up. Live web
+research, the two-LLM split, and code search all landed and were
+proven on real multi-file, multi-step tasks driven by a 1.5B local
+model on a 4-CPU box.
+
+### Added
+
+- **`Research` verb** + curl-cffi browser-impersonating web fetcher:
+  the LLM can fetch documentation URLs at run time; the fetched
+  content becomes a `fact` atom in the brain; next-cycle recall
+  surfaces it. SSRF-guarded (localhost / private RFC1918 / file://
+  / javascript: all blocked).
+
+- **`TwoStageProposer`** (Planner picks a verb, Executor fills slots
+  for that verb only). Lifted directly from the small-model failure
+  mode observed live: one open-ended JSON call was overloaded; two
+  focused calls are reliable. CLI: `--two-stage` on `lattice agent`
+  and `lattice do`. `--executor-model` lets you mix sizes
+  (e.g. 0.5B Planner + 1.5B Executor).
+
+- **Semble code search** (Model2Vec + BM25, CPU, sub-second) for the
+  SENSE organ. Per-cycle task query surfaces top-K relevant chunks
+  in the observation instead of dumping the full symbol list.
+  Optional [`search`] extra. CLI: `--semble`.
+
+- **`--decompose`** on `lattice do` (previously `agent`-only):
+  conjunction-split a single task string into multiple subtasks
+  sharing one overlay.
+
+### Fixed
+
+- Observation builder: atom recall now runs every cycle (not just
+  the first). Mid-loop atoms written by `Research` were previously
+  invisible to the very next prompt.
+- Observation builder: `research` step payload is now rendered in
+  history hints so the model sees what it fetched.
+- Stuck detector now also catches the case where the same verb is
+  emitted N+ times consecutively regardless of kind (e.g. the
+  `Research`-spam pattern observed live with 1.5B).
+- Reverted an over-eager "LLM-first when task contains 'with/using/?'"
+  heuristic that misfired on tasks like "with default 5.0" and
+  bypassed a matching pattern.
+- Verify gate: mypy subprocess now uses `sys.executable` instead of
+  bare `python` so the venv's mypy is found.
+- `_Verb.confidence` now defaults to 0.5 — small models routinely
+  forget the field; defaulting unblocks correct-shape actions.
+
+### Live evidence (run on this machine)
+
+**Composition with web research + LLM + atom feedback**
+(Qwen-1.5B, two-stage, no patterns matched):
+```
+lattice do "Add Flask-CORS support to src/app.py. ... emit Research
+  with url=https://flask-cors.readthedocs.io/en/latest/. After
+  researching, emit AddImport for the flask_cors module." \
+  --model Qwen/Qwen2.5-1.5B-Instruct --two-stage --write
+# cycle 1: Planner→Research, Executor→Research(flask-cors-docs)
+# cycle 2: Planner→AddImport, Executor→AddImport(flask_cors, [CORS])
++from flask_cors import CORS
+```
+
+**Two-file multi-subtask** (Qwen-1.5B, two-stage, decompose, semble):
+```
+lattice do "Two subtasks. First: add an import of CORS from
+  flask_cors to src/app.py — if you don't know flask_cors, emit
+  Research(...) first. Second: add a bool field named cors_enabled
+  default True to class Config in src/config.py." \
+  --two-stage --semble --decompose
+# src/app.py: +from flask_cors import CORS
+# src/config.py: +    cors_enabled: bool = True
+```
+
+### Tests
+
+- 222 unit tests passing (+13 vs 0.1.0).
+- 4 live tests gated on `LATTICE_LIVE_WEB=1` or `LATTICE_LLM_SMOKE=1`
+  (real curl-cffi fetch, real MiniLM/Model2Vec embedding, real
+  transformers model generation).
+
 ## [0.1.0] — Alpha
 
 First releaseable cut. The system runs end-to-end on a 4-CPU box
