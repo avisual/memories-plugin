@@ -221,7 +221,14 @@ class LocalLLMProposer:
         )
         self._model.eval()
 
-    def _generate(self, user_msg: str, *, sticky_correction: str | None = None) -> str:
+    def _generate(
+        self,
+        user_msg: str,
+        *,
+        sticky_correction: str | None = None,
+        temperature: float | None = None,
+    ) -> str:
+        temp = self.temperature if temperature is None else temperature
         messages = [
             {
                 "role": "system",
@@ -259,8 +266,8 @@ class LocalLLMProposer:
             output = self._model.generate(
                 **inputs,
                 max_new_tokens=self.max_new_tokens,
-                do_sample=self.temperature > 0,
-                temperature=self.temperature if self.temperature > 0 else 1.0,
+                do_sample=temp > 0,
+                temperature=temp if temp > 0 else 1.0,
                 pad_token_id=self._tokenizer.eos_token_id,
             )
         new_tokens = output[0][inputs["input_ids"].shape[-1] :]
@@ -272,32 +279,55 @@ class LocalLLMProposer:
         prompt = _render_observation(obs) + "\n\nJSON action:"
         if os.environ.get("LATTICE_LLM_DEBUG"):
             import sys
+
             sys.stderr.write("\n--- prompt ---\n" + prompt + "\n--- end ---\n")
 
+        actions: list[Action] = []
+        seen_dumps: set[str] = set()
+
+        # First candidate at the proposer's configured temperature
+        # (default 0 = most likely). Subsequent candidates use sampling
+        # so we get genuinely different proposals for pre-flight selection.
+        candidate_temps: list[float] = [self.temperature]
+        for i in range(max(0, n - 1)):
+            candidate_temps.append(0.5 + 0.15 * i)  # 0.5, 0.65, 0.8, ...
+
+        for temp in candidate_temps:
+            action = self._propose_one(prompt, temperature=temp)
+            if action is None:
+                continue
+            dump = action.model_dump_json()
+            if dump in seen_dumps:
+                continue
+            seen_dumps.add(dump)
+            actions.append(action)
+            if len(actions) >= n:
+                break
+
+        if not actions:
+            raise ProposerError("local LLM produced no valid action after retries")
+        return actions
+
+    def _propose_one(self, prompt: str, *, temperature: float) -> Action | None:
         correction: str | None = None
-        last_error: str | None = None
         for _ in range(self.retries + 1):
-            raw = self._generate(prompt, sticky_correction=correction)
+            raw = self._generate(prompt, sticky_correction=correction, temperature=temperature)
             payload = _extract_json(raw)
             if payload is None:
-                last_error = "no JSON object found in model output"
                 correction = (
                     "Your previous response did not contain valid JSON. "
                     "Emit ONE JSON object only, on a single line, no fences, no prose."
                 )
                 continue
             try:
-                action = parse_action(_coerce_loose(payload))
+                return parse_action(_coerce_loose(payload))
             except ValidationError as exc:
-                last_error = str(exc)
                 correction = (
                     "Your JSON failed schema validation. "
                     f"Errors:\n{exc}\nFix the fields and try again."
                 )
                 continue
-            return [action]
-
-        raise ProposerError(f"local LLM produced no valid action after retries: {last_error}")
+        return None
 
 
 # Static check that LocalLLMProposer satisfies the Proposer protocol.

@@ -91,6 +91,7 @@ class AgentLoop:
         max_steps: int = 8,
         files: list[str] | None = None,
         noop_streak_limit: int = 2,
+        preflight_candidates: int = 3,
     ) -> None:
         self.proposer = proposer
         self.workspace = workspace
@@ -99,6 +100,7 @@ class AgentLoop:
         self.max_steps = max_steps
         self._files = files
         self._noop_streak_limit = noop_streak_limit
+        self._preflight_candidates = preflight_candidates
 
     def run(self, task: str) -> AgentTrace:
         steps: list[StepRecord] = []
@@ -107,7 +109,7 @@ class AgentLoop:
         for step_idx in range(1, self.max_steps + 1):
             obs = self._build_observation(task, steps)
             try:
-                actions = self.proposer.propose(obs, n=1)
+                action = self._propose_with_preflight(obs)
             except Exception as exc:  # noqa: BLE001
                 steps.append(
                     StepRecord(
@@ -119,10 +121,9 @@ class AgentLoop:
                 )
                 terminated_by = "blocked"
                 break
-            if not actions:
+            if action is None:
                 terminated_by = "empty"
                 break
-            action = actions[0]
             record, should_stop, stop_reason = self._handle_action(action, step_idx)
             steps.append(record)
             if should_stop:
@@ -148,6 +149,61 @@ class AgentLoop:
             final_files=final_files,
             consolidated_diffs=tuple(diffs),
             terminated_by=terminated_by,
+        )
+
+    # ----- pre-flight: simulate before commit -----
+
+    def _propose_with_preflight(self, obs: ObservationContext) -> Action | None:
+        """Ask the proposer for N candidates; pick the first non-no-op edit.
+
+        Pre-flight uses the real compiler against the current overlay so
+        the predicted outcome matches what would actually happen. This
+        is the v0 'world model': for mutating verbs, simulate cheaply
+        before commit. Non-mutating verbs (MarkDone/MarkBlocked/recall)
+        pass through unchanged — there's nothing to simulate.
+
+        Falls back to the first proposed action if every candidate is a
+        no-op (so the loop's stuck detector still has signal to break).
+        """
+        import os
+        import sys
+
+        actions = self.proposer.propose(obs, n=self._preflight_candidates)
+        if os.environ.get("LATTICE_LLM_DEBUG"):
+            sys.stderr.write(
+                f"preflight got {len(actions)} candidate(s): "
+                + ", ".join(a.verb for a in actions)
+                + "\n"
+            )
+        if not actions:
+            return None
+
+        for action in actions:
+            if not self._is_mutating(action):
+                return action
+            try:
+                compiled = compile_action(action, self.overlay)
+            except (CompileError, NonMutatingAction):
+                return action  # let _handle_action surface the error
+            if not compiled.is_noop:
+                return action
+
+        return actions[0]
+
+    @staticmethod
+    def _is_mutating(action: Action) -> bool:
+        from lattice.actions import (
+            AddField,
+            AddImport,
+            AddParameter,
+            AddTest,
+            RenameSymbol,
+            WrapInTry,
+        )
+
+        return isinstance(
+            action,
+            (AddImport, AddField, AddParameter, AddTest, WrapInTry, RenameSymbol),
         )
 
     # ----- per-action dispatch -----

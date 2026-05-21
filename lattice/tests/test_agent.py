@@ -209,6 +209,39 @@ def test_stuck_detection_breaks_no_op_loop():
     assert len(trace.steps) < 4
 
 
+def test_preflight_picks_non_noop_from_candidate_batch():
+    """When the proposer returns multiple candidates, pre-flight should
+    skip ones that would be no-ops against the current overlay.
+    """
+    ws = _ws()
+    proposer = MockProposer(
+        batches=[
+            [AddImport(file=FileRef(path="src/payments/charge.py"), module="stripe", confidence=0.9)],
+            [
+                # First candidate would be a no-op (import already present).
+                AddImport(file=FileRef(path="src/payments/charge.py"), module="stripe", confidence=0.9),
+                # Second candidate makes real progress.
+                AddParameter(
+                    function=SymbolRef(file="src/payments/charge.py", name="charge"),
+                    name="dry_run",
+                    type=TypeExpr(expr="bool"),
+                    keyword_only=True,
+                    confidence=0.9,
+                ),
+            ],
+            [MarkDone(summary="both applied", confidence=0.9)],
+        ]
+    )
+    loop = AgentLoop(proposer=proposer, workspace=ws, max_steps=5)
+    trace = loop.run("do both edits")
+    assert trace.ok
+    assert trace.terminated_by == "done"
+    assert len(trace.steps) == 3
+    final = trace.final_files["src/payments/charge.py"]
+    assert "import stripe" in final
+    assert "*, dry_run: bool" in final
+
+
 def test_branch_is_noop_in_linear_loop():
     proposer = MockProposer(
         batches=[
