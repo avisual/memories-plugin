@@ -1,0 +1,43 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch: {}
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install uv
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+
+      - name: Install dependencies (dev + typecheck only — no torch)
+        working-directory: lattice
+        run: |
+          uv venv --python 3.13
+          uv pip install -e ".[dev,typecheck]"
+
+      - name: Run tests
+        working-directory: lattice
+        run: |
+          uv run pytest tests/ -q -k "not local_llm and not minilm"
+
+      - name: Type-check (mypy on lattice itself)
+        working-directory: lattice
+        continue-on-error: true   # mypy on the codebase is not blocking yet
+        run: |
+          uv run mypy --ignore-missing-imports src/lattice

@@ -1,267 +1,124 @@
 # LATTICE
 
-A compositional, self-improving reasoning substrate for small coding LLMs.
+**A coding harness that makes small LLMs reliable.**
 
-> An organism, not a prompt. Senses, muscles, memory, dreams — and small
-> typed primitives that grow into bigger forms with use.
+LATTICE is built on a single observation: most "code changes a coding
+agent needs to make" are structural mappings — adding an import,
+renaming a symbol, adding a parameter. A regex can do those correctly;
+a 500M-parameter model gets them wrong. Reserve the LLM for the
+genuinely open-ended cases. Give the LLM a typed action vocabulary so
+it can't emit syntactically invalid code. Give it a brain so it knows
+your codebase's conventions. Verify every output before it touches a
+file.
 
-LATTICE is a coding harness for non-frontier LLMs. It replaces blob-text
-context and free-form code generation with:
+Built on the [`memories-plugin`](../) Hebbian graph as inspiration;
+ships its own atom store so no external service is required.
 
-- **Typed observations** of a code subgraph instead of file dumps.
-- **A typed action DSL** as the LLM's only code-modifying output —
-  invalid syntax, undefined symbols, and broken imports are deleted by
-  construction.
-- **Activation steering** from a Hebbian memory graph — recalled atoms
-  bias the model's hidden state instead of consuming context tokens.
-- **A world model** that simulates the consequence of an action before
-  it ever touches a file.
-- **A distilled apprentice** trained continuously from successful
-  traces — over time, most decisions stop needing the LLM at all.
-- **A DSL that grows itself**: macros → recipes → idioms emerge from
-  recurring action patterns by the same Hebbian rule that links memory
-  atoms.
+## What it actually does (live, today, on a 4-CPU box, no GPU)
 
-Built on the [`memories-plugin`](../) Hebbian graph as substrate.
-The full design is in [DESIGN.md](DESIGN.md).
+```bash
+$ lattice do "Add an import of request from flask to src/myapp/handlers.py"
++from flask import request
 
-## Status
+$ lattice do "Add a keyword-only parameter timeout of type float to function get of class Client in src/api.py"
+-    def get(self, url: str) -> str:
++    def get(self, url: str, *, timeout: float = None) -> str:
 
-v0 running end-to-end **with a real local LLM**: a small (~500MB)
-instruct model on CPU reads a structured Observation and emits a
-typed Action, which the harness compiles to a verified file diff.
-The thesis — "non-frontier LLM + this body beats a frontier model
-in a chat window" — has its first datapoint.
+$ lattice do "Rename charge to take_payment in src/billing.py"
+# Renames the definition in billing.py AND every reference across
+# every .py file in the project (3 files touched, 2 changed).
+```
 
-What runs today:
+Each command:
+1. Auto-initialises a brain (96 seed atoms) on first run.
+2. Tries pattern-matching first — these tasks need zero LLM calls.
+3. Falls back to a small local LLM (Qwen2.5-0.5B-Instruct, ~500MB)
+   for tasks the patterns don't cover.
+4. Compiles the action to a real file diff via libcst.
+5. Verifies the result parses (and optionally type-checks with mypy).
+6. Writes the file. Records what it did as an experience atom.
 
-- **Action DSL** (Organ 3): 10 typed verbs, Pydantic-validated with
-  identifier-shape guards, discriminated-union parser, JSON-schema
-  export for constrained decoding.
-- **Action compiler** (Python, libcst): `AddImport`, `AddField`,
-  `AddParameter` produce real file diffs. Idempotent on already-
-  present state. Chained execution: each action sees prior ones'
-  output via an overlay workspace.
-- **Symbol-graph extractor** (Organ 2, Python): walks files via
-  libcst, yields typed `Symbol` records with dotted names.
-- **Orchestrator**: expands a high-level Intent into typed Actions
-  OR consumes Actions from a Proposer; runs compile + verify per
-  step; returns an `ExecutionReport` with consolidated diffs.
-- **Proposer abstraction**: `MockProposer` for tests;
-  `LocalLLMProposer` driving a small instruct model (Qwen2.5-0.5B
-  default) with prompt-based JSON output, loose-coercion of
-  common small-model mistakes, retry-on-invalid with the schema
-  error as a correction signal.
-- **Syntactic verify** (Organ 7, partial): every compiled diff is
-  parsed with `ast.parse`.
-- **CLI**: `apply` (single action), `intent` (multi-action
-  expansion), `propose` (local-LLM-driven).
-
-Plus a minimal lattice-native atom store (Organ 1, v0):
-- SQLite-backed; embeddings via `sentence-transformers/all-MiniLM-L6-v2`
-  (~90MB, CPU). Same conceptual taxonomy as memories-plugin
-  (fact/experience/skill/antipattern/...). Wired into `propose`'s
-  Observation so recalls become typed hints to the LLM.
-- **Seed pack** (30 curated atoms): Python conventions, antipatterns
-  (bare except, mutable defaults, eval, raw SQL building, etc.),
-  library defaults (Stripe for payments, httpx/requests for HTTP,
-  SQLAlchemy for SQL, pathlib over os.path, etc.). Loaded with
-  `lattice atom seed --db DB`. The brain ships knowing things.
-- **Hebbian feedback**: after a successful agent run, the harness
-  writes an `experience` atom summarizing what was done so the
-  brain accumulates lived knowledge across runs.
-- CLI: `lattice atom add` / `lattice atom recall` / `lattice atom seed`.
-
-Plus a multi-step **agent loop** (Organ 6 stub, linear v0):
-- Drives a Proposer one action per turn; history + atom recall become
-  hints in the next turn's Observation. Terminates on `MarkDone`,
-  `MarkBlocked`, max-steps exhaustion, empty proposal, or harness-
-  detected no-op cycles (`stuck`). The cycle detector exists because
-  small models will repeat themselves; the right longer-term fix is
-  the unbuilt organs (world model + population search + apprentice).
-- CLI: `lattice agent <workspace> --task "..." [--atom-db DB]
-  [--max-steps N] [--model NAME] [--write]`.
-
-### The stack-machine model
-
-The LLM never plans. The harness is the fetch-decode-execute cycle;
-the LLM is the instruction emitter. Each turn:
-
-1. Observe (typed: code subgraph + atom hints + recent history).
-2. LLM emits **one** typed Action.
-3. Pre-flight simulates against the overlay.
-4. Compiler produces the diff; verify parses it.
-5. If the next instruction would be a no-op, the goal of the current
-   subtask is observably met → harness advances the program counter.
-
-This means a small (0.5B) model can complete real multi-step tasks
-because it doesn't have to remember what's already done — it just
-answers "what's the next single instruction?" each cycle. The
-observable state advances the loop.
-
-### What's been observed live on this CPU
-
-- **Single-step:** Qwen2.5-0.5B-Instruct produces a valid action from
-  a structured Observation in ~7 seconds. With recall hints, picks
-  project-specific values (e.g. `stripe` when the project
-  standardizes on it).
-- **Multi-step via planner-executor split:** caller supplies subtasks
-  (or `--decompose` deterministically splits on conjunctions), the
-  harness runs one agent loop per subtask with a shared overlay.
-  Two-edit task ("add stripe import; add dry_run keyword-only
-  parameter") completed end-to-end by Qwen2.5-0.5B on CPU. Final
-  diff applied both edits in one consolidated unified diff.
-
-Not yet: world model, activation steering, population search,
-apprentice (Organ 8), evolution (Organ 9), full memories-plugin
-integration, interface surfaces beyond the CLI.
-
-## Try it
+## Install + try it
 
 ```bash
 cd lattice
-uv pip install -e ".[llm]"        # ~1GB: torch + transformers + MiniLM
-lattice init /path/to/your/project  # seeds .lattice/brain.db with 30 atoms
-lattice agent /path/to/your/project \
-  --atom-db /path/to/your/project/.lattice/brain.db \
-  --task "Add an import of json to src/foo.py" \
-  --write
+uv venv --python 3.13
+uv pip install -e '.[llm]'        # ~1GB: torch + transformers + MiniLM
+source .venv/bin/activate
+lattice init                       # in your project root: seeds .lattice/brain.db
+lattice do "your task here"
 ```
 
-That's the minimum: a brain, a task, a written file. Everything below
-is detail on each piece.
+Optional extras:
+- `'.[hosted]'` for the Anthropic API path (requires `ANTHROPIC_API_KEY`).
+- `'.[typecheck]'` to add mypy verify (`--types` flag).
 
-### Single action
+## CLI
+
+| Command | What it does |
+|---|---|
+| `lattice do "task"` | One-shot: init if needed, run agent, write file. |
+| `lattice init [dir]` | Initialise a brain with 96 seed atoms. |
+| `lattice agent` | Multi-step agent with full control over model / brain / steps. |
+| `lattice intent` | Expand a high-level Intent into many typed actions (no LLM). |
+| `lattice apply` | Apply a single hand-written Action JSON. |
+| `lattice brain inspect/dump/import/export` | Curate the atom store. |
+| `lattice atom add/recall/seed` | Lower-level brain operations. |
+
+## What's reliable, what's not (honest)
+
+| | What works | What doesn't yet |
+|---|---|---|
+| **Verbs** | All 5 mutating verbs compile (AddImport, AddField, AddParameter, WrapInTry, AddTest) plus single-file & cross-file RenameSymbol | Aliased imports (`from x import y as z`) not yet resolved during rename |
+| **Patterns** | Imports (plain/from/alias), rename, add parameter, add field — deterministic, no LLM | WrapInTry, AddTest patterns not yet added |
+| **Small LLM (0.5–1.5B)** | Tasks within the pattern vocabulary; single-slot fills the LLM handles well (e.g. AddParameter on a known method) | Multi-step planning — model hallucinates after first action. Mitigated by stuck-detection and the planner-executor split. |
+| **Hosted LLM (Anthropic)** | Architecturally complete: tool-spec generation, retry, validation. Untested without an API key. | Live API call not verified in this environment. |
+| **Verify** | `ast.parse` always on; `mypy` opt-in via `--types` | Test-run gate (pytest on affected tests) — not built yet |
+| **Cross-language** | Python only | TS / JS / Rust / Go — not built |
+| **Brain** | 96 seed atoms, semantic recall via MiniLM, Hebbian feedback writes experience atoms on success, curatable via JSON | Activation steering, apprentice (Organ 8), macro evolution — design exists, not built |
+
+## The design (one paragraph)
+
+The harness is the fetch-decode-execute cycle; the LLM is the
+instruction emitter. The LLM never plans — it answers "given this
+observable state, what's the next single instruction?" each cycle.
+The harness manages the program counter, advances when the next
+instruction would be a no-op (the goal is observably met), and
+detects when the LLM is stuck repeating itself. A brain of atoms,
+recalled by semantic similarity, becomes hints in the observation
+so the LLM benefits from project knowledge without needing to
+remember it. A pattern proposer handles common natural-language
+phrasings deterministically before the LLM ever gets called.
+**This is what makes a small model usable for real work.**
+
+The full architecture (10 organs, the compositional spine, the
+build sketch) is in [DESIGN.md](DESIGN.md).
+
+## Tests
 
 ```bash
-mkdir -p /tmp/demo
-cat > /tmp/demo/charge.py <<'PY'
-"""Charge a customer's card."""
-import os
-
-class ChargeProcessor:
-    def charge(self, amount: int) -> None:
-        pass
-PY
-
-echo '{"verb":"AddImport","file":{"path":"charge.py"},"module":"stripe","confidence":0.9}' \
-  | uv run python -m lattice apply /tmp/demo --action -
+uv run pytest tests/ -q -k "not local_llm and not minilm"
+# 200+ passing tests in ~7 seconds
 ```
 
-```diff
---- a/charge.py
-+++ b/charge.py
-@@ -1,5 +1,6 @@
- """Charge a customer's card."""
- import os
-+import stripe
-```
-
-### Multi-file intent (composition)
-
-One Intent expands into N typed Actions across the whole workspace:
-
-```bash
-echo '{
-  "kind": "AddParameterToAllMatching",
-  "function_name": "charge",
-  "parameter_name": "dry_run",
-  "parameter_type": "bool",
-  "parameter_default": "False",
-  "keyword_only": true
-}' | uv run python -m lattice intent /tmp/demo --intent -
-```
-
-The orchestrator walks the workspace, finds every `charge()` (function
-or method), emits one `AddParameter` action per match, compiles each
-through libcst, and verifies the output parses. Output is a sequence
-of unified diffs across all touched files. Nothing is written to disk
-— the diff is the deliverable.
-
-### Local LLM (the headline)
-
-A small instruct model on CPU drives the loop end-to-end:
-
-```bash
-uv pip install -e ".[llm]"   # installs torch + transformers; ~1GB
-
-uv run python -m lattice propose /tmp/demo \
-  --task "Add an import of the 'stripe' module to src/payments/charge.py."
-```
-
-```
-loading model...
-proposed action:
-  {"verb":"AddImport","file":{"path":"src/payments/charge.py"},"module":"stripe",...}
---- a/src/payments/charge.py
-+++ b/src/payments/charge.py
-@@ -1,4 +1,5 @@
- """Charge processing."""
-+import stripe
-```
-
-Qwen2.5-0.5B-Instruct on a 4-core CPU, ~7 seconds from cold model
-load to verified diff. The LLM never sees source code as text; it
-sees a typed Observation (task + Symbol list) and emits one typed
-Action; the harness handles compile + verify. Override the model
-with `--model HuggingFace/name` or `LATTICE_LLM_MODEL`.
-
-### With recall (hints from the atom store)
-
-A local SQLite-backed atom store (MiniLM embeddings, ~90MB, CPU)
-provides relevant past experience and antipatterns as hints in the
-Observation. Same loop, smarter decisions.
-
-```bash
-# Seed the store with project context.
-uv run python -m lattice atom add --db /tmp/demo/atoms.db \
-  --type experience \
-  --content "Use 'stripe' for charges; the project standardizes on Stripe."
-
-uv run python -m lattice atom add --db /tmp/demo/atoms.db \
-  --type antipattern \
-  --content "Don't import network libraries at module top level in payment files."
-
-# Now ask vaguely — the recall surfaces 'stripe' as the standard.
-uv run python -m lattice propose /tmp/demo \
-  --task "Add the payment library dependency to src/payments/charge.py." \
-  --atom-db /tmp/demo/atoms.db
-```
-
-```
-recalled 3 hint(s) from atom store
-loading model...
-proposed action:
-  {"verb":"AddImport","file":{"path":"src/payments/charge.py"},
-   "module":"stripe", ...}
---- a/src/payments/charge.py
-+++ b/src/payments/charge.py
-@@ -1,4 +1,5 @@
- """Charge processing."""
-+import stripe
-```
-
-The small model picked `stripe` because the hint surfaced the project
-convention. This is what makes LATTICE *LATTICE* — the substrate
-informs every decision, no retraining required.
+Two tests are gated on real model downloads, enabled by setting
+`LATTICE_LLM_SMOKE=1`.
 
 ## Layout
 
 ```
 lattice/
-├── DESIGN.md                 # the full architecture & rationale
+├── DESIGN.md                          # full architecture & rationale
+├── examples/                          # runnable shell scripts
 ├── pyproject.toml
 ├── src/lattice/
-│   ├── actions/              # ACT: typed action DSL  (Organ 3)
-│   ├── store/                # Lattice store          (Organ 1)
-│   ├── sense/                # Typed observations     (Organ 2)
-│   ├── steer/                # Activation steering    (Organ 4)
-│   ├── world_model/          # Imagination            (Organ 5)
-│   ├── population/           # Evolutionary search    (Organ 6)
-│   ├── verify/               # Silent ground truth    (Organ 7)
-│   ├── learn/                # Hebbian updates        (LEARN)
-│   ├── distill/              # The apprentice         (Organ 8)
-│   ├── evolve/               # DSL growth             (Organ 9)
-│   └── interface/            # Human surfaces         (Organ 10)
+│   ├── actions/                       # ACT: typed action DSL  (Organ 3)
+│   ├── atoms/                         # the brain                (Organ 1)
+│   ├── compiler/                      # action → diff
+│   ├── orchestrator/                  # agent loop + planner    (Organ 6)
+│   ├── propose/                       # pattern + LLM + hosted   (Organ 4)
+│   ├── sense/                         # symbol graph            (Organ 2)
+│   ├── verify/                        # syntactic + type-check  (Organ 7)
+│   └── apply/                         # write-to-disk
 └── tests/
 ```
