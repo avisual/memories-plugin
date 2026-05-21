@@ -20,6 +20,7 @@ from lattice.actions import (
     AddImport,
     FileRef,
     MarkDone,
+    SymbolRef,
 )
 from lattice.atoms import AtomType, SQLiteAtomStore
 from lattice.compiler import DictWorkspace
@@ -873,6 +874,64 @@ def test_brain_accumulates_then_boosts_repeat_run(tmp_path):
         f"expected importance bump from {initial_importance} after run 2; "
         f"got {same_atom_after.atom.importance}"
     )
+    store.close()
+
+
+def test_brain_routes_cross_verb_candidates_to_their_own_atoms(tmp_path):
+    """In a single cycle, two candidates of DIFFERENT verbs each get
+    scored from atoms tagged with THEIR OWN verb, not bleeding across.
+
+    Setup: brain has a SKILL for AddImport and an ANTIPATTERN for
+    AddField. Two candidates this cycle: one AddImport (should get
+    positive delta), one AddField (should get negative delta). The
+    verb filter routes each candidate's brain_score query to its
+    own verb's atoms — no cross-pollination.
+    """
+    from lattice.actions import AddField, TypeExpr
+
+    store = _store(tmp_path)
+    # SKILL for AddImport.
+    store.add(
+        "verb=AddImport file=src/main.py module=json :: Success",
+        type=AtomType.SKILL,
+        region="steps",
+        tags=("agent-step", "success", "AddImport"),
+    )
+    # ANTIPATTERN for AddField.
+    store.add(
+        "verb=AddField on class Client :: Failure",
+        type=AtomType.ANTIPATTERN,
+        region="steps",
+        tags=("agent-step", "failure", "AddField"),
+    )
+
+    loop = AgentLoop(
+        proposer=MockProposer.empty(),
+        workspace=_ws(),
+        atom_store=store,
+        use_brain=True,
+    )
+
+    add_import = AddImport(
+        file=FileRef(path="src/main.py"), module="json", confidence=0.9
+    )
+    add_field = AddField(
+        cls=SymbolRef(file="src/main.py", name="Client"),
+        name="x",
+        type=TypeExpr(expr="int"),
+        confidence=0.9,
+    )
+
+    di, ii = loop._brain_score(add_import, "task")
+    df, fi = loop._brain_score(add_field, "task")
+
+    # AddImport candidate sees only its own SKILL → positive.
+    assert di > 0.0
+    # AddField candidate sees only its own ANTIPATTERN → negative.
+    assert df < 0.0
+    # Contributors differ between the two scoring calls — proves the
+    # verb filter actually routed correctly.
+    assert set(ii).isdisjoint(set(fi))
     store.close()
 
 
