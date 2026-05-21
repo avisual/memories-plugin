@@ -677,6 +677,93 @@ def test_winning_brain_ids_cleared_at_cycle_start(tmp_path):
     store.close()
 
 
+def test_multi_step_plan_accumulates_brain_atoms_across_cycles(tmp_path):
+    """Deep integration: a 3-step plan run with brain ON should
+    leave behind outcome atoms for each step in region='steps'.
+
+    Plan-DAG advances after each successful edit (no MarkDone needed).
+    Each step's outcome atom is written keyed on that step's
+    active_task (per the active_task correctness fix). After the
+    run, all 3 outcome atoms should exist with importance bumped
+    by the success reinforcement (+0.05 over the 0.65 default).
+    """
+    from lattice.actions import (
+        AddDecorator,
+        AddImport,
+        FileRef,
+        ModifyDocstring,
+        SymbolRef,
+    )
+
+    store = _store(tmp_path)
+
+    from lattice.compiler import DictWorkspace
+
+    ws = DictWorkspace(
+        {"src/util.py": "def compute(n: int) -> int:\n    return n * n\n"}
+    )
+    # MockProposer returns one action per cycle; the plan-DAG drives
+    # advancement after each successful edit.
+    proposer = MockProposer(
+        batches=[
+            [AddImport(
+                file=FileRef(path="src/util.py"),
+                module="functools",
+                confidence=0.9,
+            )],
+            [AddDecorator(
+                symbol=SymbolRef(file="src/util.py", name="compute"),
+                decorator="cached",
+                confidence=0.9,
+            )],
+            [ModifyDocstring(
+                file=FileRef(path="src/util.py"),
+                symbol=SymbolRef(file="src/util.py", name="compute"),
+                docstring="Run the computation.",
+                confidence=0.9,
+            )],
+        ]
+    )
+    loop = AgentLoop(
+        proposer=proposer,
+        workspace=ws,
+        atom_store=store,
+        use_brain=True,
+        use_plan=True,
+    )
+    trace = loop.run(
+        "Add an import of functools to src/util.py; "
+        "Add @cached decorator to function compute in src/util.py; "
+        'Add a docstring to function compute in src/util.py saying "Run the computation."'
+    )
+    assert trace.ok, f"expected plan to complete; got {trace.terminated_by}"
+
+    # Three mutating steps → three SKILL atoms in region='steps'.
+    step_atoms = store.recall(
+        "verb=AddImport",  # matches step 1's signature
+        k=20,
+        region="steps",
+    )
+    skills = [h for h in step_atoms if h.atom.type == AtomType.SKILL]
+    # Constant embedder returns all atoms with cosine 1.0, so all
+    # three step atoms come back — the count is the assertion.
+    assert len(skills) >= 3, (
+        f"expected >=3 step-outcome SKILL atoms, got {len(skills)}; "
+        f"contents: {[s.atom.content[:60] for s in skills]}"
+    )
+
+    # Importance got bumped by +0.05 from being the contributor for
+    # the next cycle's brain_score recall (constant embedder => each
+    # atom matched as a brain_score contributor on subsequent cycles).
+    # Default 0.65 + at least one +0.05 = 0.70.
+    bumped = [s for s in skills if s.atom.importance > 0.65]
+    assert len(bumped) >= 1, (
+        f"expected at least one outcome atom to be reinforced, "
+        f"importances: {[s.atom.importance for s in skills]}"
+    )
+    store.close()
+
+
 def test_store_reinforce_clips_to_zero_and_ninety_five(tmp_path):
     """The reinforce API clips importance to [0.0, 0.95]."""
     store = _store(tmp_path)

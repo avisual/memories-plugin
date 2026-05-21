@@ -127,6 +127,16 @@ class AgentLoop:
         self._type_check = type_check
         self._run_tests = run_tests
         self._workspace_root = workspace_root
+        # Fail fast: tests requested but no real path to run them
+        # against would silently skip the verify-tests gate, giving
+        # the caller a false sense of verification. Better to surface
+        # the misconfiguration at construction than have the brain
+        # learn from outcomes that bypassed the test gate.
+        if run_tests and workspace_root is None:
+            raise ValueError(
+                "run_tests=True requires workspace_root to be set "
+                "(otherwise verify_tests silently skips)."
+            )
         self._code_search = code_search
         self._use_brain = use_brain
         self._use_plan = use_plan
@@ -403,18 +413,52 @@ class AgentLoop:
 
     @staticmethod
     def _is_mutating(action: Action) -> bool:
+        """All verbs that produce a real diff against the overlay.
+
+        Used by the pre-flight scorer (only these need brain_score),
+        by _record_step_outcome (only these write atoms), and by
+        _reinforce_recalled (only these contribute to Hebbian
+        updates). Adding a new mutating verb means adding it HERE
+        or the brain will silently ignore it — every audit of the
+        brain wiring missed this because the original list captured
+        only the first 6 verbs and was never updated as the
+        vocabulary grew to 14. Fixed now.
+        """
         from lattice.actions import (
+            AddDecorator,
             AddField,
+            AddFunction,
             AddImport,
             AddParameter,
+            AddStatement,
             AddTest,
+            ChangeReturnType,
+            DeleteSymbol,
+            ModifyDocstring,
+            MoveSymbol,
             RenameSymbol,
+            ReplaceBody,
             WrapInTry,
         )
 
         return isinstance(
             action,
-            (AddImport, AddField, AddParameter, AddTest, WrapInTry, RenameSymbol),
+            (
+                AddDecorator,
+                AddField,
+                AddFunction,
+                AddImport,
+                AddParameter,
+                AddStatement,
+                AddTest,
+                ChangeReturnType,
+                DeleteSymbol,
+                ModifyDocstring,
+                MoveSymbol,
+                RenameSymbol,
+                ReplaceBody,
+                WrapInTry,
+            ),
         )
 
     # ----- brain (Hebbian) decision-weighting -----
@@ -756,17 +800,6 @@ class AgentLoop:
                 kind="edit",
                 verify=outcome,
                 diff=joined_diff,
-            ),
-            False,
-            "",
-        )
-        return (
-            StepRecord(
-                step=step_idx,
-                action=action,
-                kind="error",
-                verify=outcome,
-                error="; ".join(f"{p}: {m}" for p, m in outcome.errors),
             ),
             False,
             "",

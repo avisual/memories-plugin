@@ -253,11 +253,20 @@ def _walk_string_fields(obj, path=()):
         yield path, obj
 
 
-def _set_at_path(obj, path, value) -> None:
+def _set_at_path(obj, path, value) -> bool:
+    """Set value at the given path in a nested obj. Returns True on
+    success, False if any intermediate key/index is missing (the
+    template was inferred from richer traces than what we have at
+    apply-time — degrade gracefully, leave the placeholder alone).
+    """
     cur = obj
-    for step in path[:-1]:
-        cur = cur[step]
-    cur[path[-1]] = value
+    try:
+        for step in path[:-1]:
+            cur = cur[step]
+        cur[path[-1]] = value
+        return True
+    except (KeyError, IndexError, TypeError):
+        return False
 
 
 def infer_template(traces: list[dict]) -> LearnedTemplate | None:
@@ -332,11 +341,21 @@ def infer_template(traces: list[dict]) -> LearnedTemplate | None:
         base_step = json.loads(json.dumps(action_lists[0][step_i]))
         for path, _value in list(_walk_string_fields(base_step)):
             values_at_path: list[str] = []
+            skip_path = False
             for tr_actions in action_lists:
                 cur = tr_actions[step_i]
-                for step in path:
-                    cur = cur[step]
+                try:
+                    for step in path:
+                        cur = cur[step]
+                except (KeyError, IndexError, TypeError):
+                    # Heterogeneous trace shape — one trace doesn't
+                    # have this path. Skip this path entirely; the
+                    # template just won't substitute at this slot.
+                    skip_path = True
+                    break
                 values_at_path.append(cur)
+            if skip_path:
+                continue
             if all(v == values_at_path[0] for v in values_at_path):
                 continue
             for cap_i in range(len(capture_positions)):
