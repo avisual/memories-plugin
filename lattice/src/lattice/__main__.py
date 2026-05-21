@@ -124,7 +124,9 @@ def _intent(args: argparse.Namespace) -> int:
                     sys.stderr.write(f"  verify failed {path}: {msg}\n")
         return 1
 
-    for diff in report.diffs:
+    # Consolidated diffs (one per touched file) are more readable than
+    # per-step diffs when actions chain. Both are available on the report.
+    for diff in report.consolidated_diffs:
         sys.stdout.write(diff)
         if not diff.endswith("\n"):
             sys.stdout.write("\n")

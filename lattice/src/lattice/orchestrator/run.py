@@ -1,8 +1,10 @@
-"""Plan execution — drives Actions through compile and verify.
+"""Plan execution — drives Actions through compile and verify, chaining state.
 
-ExecutionReport bundles every action's CompiledAction and verify
-SyntacticOutcome plus an overall success flag. No filesystem writes —
-the report is the deliverable; applying it to disk is downstream.
+Each action sees the cumulative output of prior successful actions via
+an OverlayWorkspace. The original workspace is never mutated — the
+overlay holds in-memory edits, and the ExecutionReport exposes both
+per-step diffs (each action's local change) and a `final_files` mapping
+of path → fully-edited content for downstream apply-to-disk.
 """
 
 from __future__ import annotations
@@ -13,9 +15,11 @@ from lattice.actions import Action
 from lattice.compiler import (
     CompileError,
     CompiledAction,
+    OverlayWorkspace,
     Workspace,
     compile_action,
 )
+from lattice.compiler.diff import unified_diff
 from lattice.verify import SyntacticOutcome, verify_syntactic
 
 
@@ -34,6 +38,8 @@ class StepResult(BaseModel):
 class ExecutionReport(BaseModel):
     model_config = ConfigDict(frozen=True)
     steps: tuple[StepResult, ...]
+    final_files: dict[str, str] = {}
+    consolidated_diffs: tuple[str, ...] = ()
 
     @property
     def ok(self) -> bool:
@@ -41,6 +47,7 @@ class ExecutionReport(BaseModel):
 
     @property
     def diffs(self) -> tuple[str, ...]:
+        """Per-step diffs — each action's local change."""
         out: list[str] = []
         for step in self.steps:
             if step.compiled is None:
@@ -52,20 +59,39 @@ class ExecutionReport(BaseModel):
 
 
 def execute_plan(actions: list[Action], workspace: Workspace) -> ExecutionReport:
-    """Compile + verify each action against the in-memory workspace.
+    """Compile + verify each action against a chained overlay of *workspace*.
 
-    Subsequent actions see the *original* workspace (no chained
-    application yet) — that's a deliberate v0 limitation. Once the
-    world model lands, chained simulation replaces this and the
-    workspace can be updated between steps in imagination.
+    A successful, non-noop action's after-content is staged into the
+    overlay so subsequent actions see it. Failed actions do not update
+    the overlay; later actions still see the last known good state.
     """
+    overlay = OverlayWorkspace(workspace)
     steps: list[StepResult] = []
     for action in actions:
         try:
-            compiled = compile_action(action, workspace)
+            compiled = compile_action(action, overlay)
         except CompileError as exc:
             steps.append(StepResult(action=action, error=f"{type(exc).__name__}: {exc}"))
             continue
         outcome = verify_syntactic(compiled)
+        if outcome.ok:
+            for change in compiled.file_changes:
+                if not change.is_noop:
+                    overlay.update(change.path, change.after)
         steps.append(StepResult(action=action, compiled=compiled, verify=outcome))
-    return ExecutionReport(steps=tuple(steps))
+
+    final_files: dict[str, str] = {}
+    consolidated: list[str] = []
+    for path in overlay.overlay_paths():
+        before = overlay.base_content(path)
+        after = overlay.read(path)
+        if before == after:
+            continue
+        final_files[path] = after
+        consolidated.append(unified_diff(path=path, before=before, after=after))
+
+    return ExecutionReport(
+        steps=tuple(steps),
+        final_files=final_files,
+        consolidated_diffs=tuple(consolidated),
+    )

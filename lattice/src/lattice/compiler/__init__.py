@@ -19,6 +19,7 @@ from lattice.compiler.errors import (
     UnsupportedAction,
     WorkspaceError,
 )
+from lattice.compiler.overlay import OverlayWorkspace
 from lattice.compiler.python import compile_action
 from lattice.compiler.types import CompiledAction, FileChange
 from lattice.compiler.workspace import DictWorkspace, FilesystemWorkspace, Workspace
@@ -30,6 +31,7 @@ __all__ = [
     "FileChange",
     "FilesystemWorkspace",
     "NonMutatingAction",
+    "OverlayWorkspace",
     "SymbolNotFound",
     "UnsupportedAction",
     "Workspace",
