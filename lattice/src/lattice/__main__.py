@@ -115,9 +115,13 @@ def _agent(args: argparse.Namespace) -> int:
     workspace = FilesystemWorkspace(args.workspace)
     atom_store = SQLiteAtomStore(args.atom_db) if args.atom_db else None
     try:
+        from lattice.distill import ApprenticeProposer
         from lattice.propose import CompositeProposer, PatternProposer
 
         rule_based: Proposer = PatternProposer()  # type: ignore[assignment]
+        apprentice: Proposer = ApprenticeProposer(  # type: ignore[assignment]
+            atom_store=atom_store
+        )
 
         if args.hosted:
             from lattice.propose.hosted import HostedLLMProposer
@@ -144,7 +148,10 @@ def _agent(args: argparse.Namespace) -> int:
                 else LocalLLMProposer()
             )
 
-        proposer = CompositeProposer([rule_based, llm_proposer])
+        # Chain order: hand-written patterns first (fast, deterministic),
+        # then apprentice (learned patterns from boosted traces), then
+        # the LLM (novel / open-ended interpretation).
+        proposer = CompositeProposer([rule_based, apprentice, llm_proposer])
 
         if args.subtasks:
             subtasks = [s.strip() for s in args.subtasks.split("|") if s.strip()]

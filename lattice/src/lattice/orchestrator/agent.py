@@ -412,6 +412,22 @@ class AgentLoop:
         symbols = self._gather_symbols()
         hints: list[str] = []
 
+        # STEER (Organ 4, lightweight v0): high-importance atoms — those
+        # EVOLVE has boosted because the system has lived through their
+        # pattern — go FIRST in the hint list so they sit in the LLM's
+        # most-attended prompt position. The heavyweight path
+        # (activation patching) is documented in steer/__init__.py.
+        if self.atom_store is not None:
+            try:
+                from lattice.steer import render_priming_block, top_priming_atoms
+
+                primed = top_priming_atoms(self.atom_store, task, k=2)
+                priming = render_priming_block(primed)
+                if priming:
+                    hints.append(priming)
+            except Exception:  # noqa: BLE001
+                pass
+
         # Pin the workspace file list explicitly so the model uses real
         # paths, not paths it might hallucinate from prompt examples.
         ws_files = self._files

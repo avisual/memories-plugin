@@ -46,6 +46,12 @@ def _make_two_stage_proposer():  # pragma: no cover (import deferred)
     return TwoStageProposer
 
 
+def _make_apprentice_proposer():  # pragma: no cover (import deferred)
+    from lattice.distill.apprentice import ApprenticeProposer
+
+    return ApprenticeProposer
+
+
 def _make_hosted_proposer_class():  # pragma: no cover (import deferred)
     from lattice.propose.hosted import HostedLLMProposer
 

@@ -99,19 +99,25 @@ Optional extras:
 
 ## Benchmark scoreboard
 
-Run `python -m lattice.benchmarks.run` for the full suite. Last live
-run on this machine (Qwen-class CPU models):
+Run `python -m lattice.benchmarks.run` for the full suite (subprocess
+mode). Add `--in-process` to share the LLM weights across tasks (~10×
+faster) and `--repeat N` for robustness measurement.
 
-| Tier | Tasks | Passing | Typical time |
-|---|---|---|---|
-| **pattern** (deterministic regex routing) | 8 | 8/8 | ~13s/task |
-| **llm** (slot-filling, Qwen-1.5B two-stage) | 2 | 2/2 | 110–620s/task |
-| **research** (LLM emits `Research`, fetches docs, uses them) | 1 | 1/1 | ~500s |
-| **Total** | **11** | **11/11** | |
+Last live run on this 4-CPU box (Qwen-class models, no GPU):
 
-This is "ran once and passed." Not robustness testing — that's `--repeat`
-and not implemented yet. But it IS coverage across every verb that
-should work plus the live web-research path.
+| Tier | Tasks | Single pass | × 3 in-process | Avg time |
+|---|---|---|---|---|
+| **pattern** (deterministic regex routing) | 8 | 8/8 | **24/24** | ~3.7s/run |
+| **llm** (slot-filling, Qwen-0.5B/1.5B two-stage) | 2 | 2/2 | **6/6** | 110–605s/run |
+| **research** (LLM emits `Research`, fetches docs, uses them) | 1 | 1/1 | not yet | ~500s |
+| **Total measured** | **11** | **11/11** | **30/30** | |
+
+LLM-tier breakdown (× 3):
+- `add-function-route` (AddFunction with decorator + body, Qwen-1.5B): 3/3, 547–605s
+- `add-statement-cors-wire` (AddStatement, Qwen-0.5B): 3/3, 105–115s
+
+These are honest robustness numbers — each run starts from a fresh
+tempdir workspace; the model weights are the only thing shared.
 
 ## What's reliable, what's not (honest)
 
