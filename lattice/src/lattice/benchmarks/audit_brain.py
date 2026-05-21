@@ -216,11 +216,32 @@ def _print_audit(rows: list[AuditRow]) -> None:
     print(f"total off-time: {off_time:.1f}s")
     print(f"time delta:     {on_time - off_time:+.1f}s")
 
+    # Pattern-only audits are STRUCTURALLY expected to show no
+    # outcome delta — the pattern proposer routes by deterministic
+    # regex and the brain cannot move what it cannot influence.
+    # An LLM-tier (or mixed) audit with no delta is the meaningful
+    # signal that the brain wiring isn't paying for itself.
+    tiers_present = {r.tier for r in rows}
+    pattern_only = tiers_present == {"pattern"}
+
     if total_on == total_off:
-        print(
-            "\nVerdict: brain is currently DECORATION on this task set. "
-            "No outcome shift. Needs work before more verbs are added."
-        )
+        if pattern_only:
+            print(
+                "\nVerdict: brain DECORATION on pattern tier — EXPECTED. "
+                "Pattern proposer is deterministic; brain cannot move "
+                "outcomes here. Re-run with --tier llm for the meaningful "
+                "signal."
+            )
+        else:
+            print(
+                "\nVerdict: brain DECORATION on this task set. "
+                "Wiring runs but doesn't move outcomes. Either the "
+                "tasks are too easy for the LLM (brain irrelevant), "
+                "the persistent-brain isn't accumulating useful atoms, "
+                "or the decision-weighting isn't tipping the choices "
+                "enough to flip results. Inspect with "
+                "`lattice brain audit-state` on the brain-on.db."
+            )
     elif total_on > total_off:
         print(
             f"\nVerdict: brain HELPS — +{total_on - total_off} passes "
