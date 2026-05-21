@@ -2,13 +2,23 @@
 
 Usage:
 
-    python -m lattice.benchmarks.run            # all tasks, all tiers
-    python -m lattice.benchmarks.run pattern    # only pattern-tier tasks (fast)
+    python -m lattice.benchmarks.run            # all tasks, subprocess mode
+    python -m lattice.benchmarks.run pattern    # only pattern-tier (fast)
     python -m lattice.benchmarks.run llm        # only LLM-tier (slow)
     python -m lattice.benchmarks.run research   # only research-tier (slowest)
-    python -m lattice.benchmarks.run --json     # JSON-lines output for CI
+    python -m lattice.benchmarks.run --in-process  # share model + brain
+                                                    # across tasks; ~30x faster
+                                                    # on LLM/research tiers
+    python -m lattice.benchmarks.run --repeat 5    # run each task 5 times,
+                                                    # report pass-rate
+    python -m lattice.benchmarks.run --json        # JSON-lines for CI
 
-Each task runs in a fresh tempdir. Exit code = number of failed tasks.
+Each task runs in a fresh tempdir workspace. The atom store ships
+seeded but otherwise fresh per task. In --in-process mode, the LLM
+model is loaded ONCE and reused across all tasks (huge speedup);
+each task still gets an isolated workspace + brain.
+
+Exit code = number of failed task-runs (task * repeats).
 """
 
 from __future__ import annotations
@@ -22,6 +32,7 @@ import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 from lattice.benchmarks.tasks import TASKS, BenchTask
 
@@ -33,6 +44,7 @@ class TaskResult:
     elapsed_s: float
     detail: str = ""
     final_files: dict[str, str] = field(default_factory=dict)
+    run_idx: int = 0  # 0-indexed when --repeat > 1
 
 
 def _setup_workspace(task: BenchTask, root: Path) -> None:
@@ -73,7 +85,7 @@ def _check_expectations(task: BenchTask, root: Path) -> tuple[bool, str, dict[st
     return True, "", finals
 
 
-def _run_one(task: BenchTask) -> TaskResult:
+def _run_one_subprocess(task: BenchTask) -> TaskResult:
     root = Path(tempfile.mkdtemp(prefix="lattice-bench-"))
     try:
         _setup_workspace(task, root)
@@ -111,16 +123,164 @@ def _run_one(task: BenchTask) -> TaskResult:
         shutil.rmtree(root, ignore_errors=True)
 
 
-def _print_table(results: list[TaskResult]) -> None:
-    name_w = max(len(r.task.name) for r in results)
-    print(f"\n{'name':<{name_w}}  {'tier':<8}  {'pass':<5}  {'time':>7}  detail")
-    print("-" * (name_w + 32 + 30))
-    for r in results:
-        symbol = "PASS" if r.passed else "FAIL"
-        print(
-            f"{r.task.name:<{name_w}}  {r.task.tier:<8}  {symbol:<5}  "
-            f"{r.elapsed_s:>6.1f}s  {r.detail}"
+def _parse_task_flags(flags: tuple[str, ...]) -> dict[str, str | bool]:
+    """Translate the subprocess-style flag list into an in-process config dict."""
+    out: dict[str, str | bool] = {
+        "two_stage": False,
+        "decompose": False,
+        "hosted": False,
+        "model": "",
+        "executor_model": "",
+    }
+    it = iter(flags)
+    for tok in it:
+        if tok == "--two-stage":
+            out["two_stage"] = True
+        elif tok == "--decompose":
+            out["decompose"] = True
+        elif tok == "--hosted":
+            out["hosted"] = True
+        elif tok == "--model":
+            out["model"] = next(it)
+        elif tok == "--executor-model":
+            out["executor_model"] = next(it)
+    return out
+
+
+def _build_inproc_proposer(cfg: dict[str, str | bool], cache: dict) -> Any:
+    """Build a Composite proposer, caching the LLM stage across calls.
+
+    The Pattern proposer is cheap to recreate. The LocalLLM /
+    TwoStage proposer loads transformers + a model — expensive — so
+    we cache by (model, executor_model, two_stage) and reuse.
+    """
+    from lattice.propose import CompositeProposer, PatternProposer
+
+    key = (cfg.get("model", ""), cfg.get("executor_model", ""), bool(cfg.get("two_stage")))
+    if key not in cache:
+        if cfg["two_stage"]:
+            from lattice.propose.two_stage import TwoStageProposer
+
+            cache[key] = TwoStageProposer(
+                planner_model=cfg["model"] or None,
+                executor_model=cfg["executor_model"] or None,
+            )
+        else:
+            from lattice.propose.local import LocalLLMProposer
+
+            cache[key] = LocalLLMProposer(model_name=cfg["model"] or None)
+    return CompositeProposer([PatternProposer(), cache[key]])
+
+
+def _run_one_inprocess(task: BenchTask, llm_cache: dict) -> TaskResult:
+    """Run a single task in-process, reusing cached LLM weights across tasks."""
+    from lattice.apply import write_final
+    from lattice.atoms import SQLiteAtomStore, seed_store
+    from lattice.compiler import FilesystemWorkspace
+    from lattice.orchestrator import (
+        AgentLoop,
+        decompose,
+        run_subtasks,
+    )
+
+    root = Path(tempfile.mkdtemp(prefix="lattice-bench-"))
+    start = time.time()
+    try:
+        _setup_workspace(task, root)
+        brain_path = root / ".lattice" / "brain.db"
+        brain_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SQLiteAtomStore(brain_path)
+        try:
+            if store.count() == 0:
+                seed_store(store)
+            cfg = _parse_task_flags(task.flags)
+            proposer = _build_inproc_proposer(cfg, llm_cache)
+            workspace = FilesystemWorkspace(root)
+
+            if cfg["decompose"]:
+                subtasks = decompose(task.task)
+                report = run_subtasks(
+                    subtasks,
+                    proposer=proposer,
+                    workspace=workspace,
+                    atom_store=store,
+                    max_steps_per_subtask=4,
+                )
+                final_files = report.final_files
+            else:
+                loop = AgentLoop(
+                    proposer=proposer,
+                    workspace=workspace,
+                    atom_store=store,
+                    max_steps=4,
+                )
+                trace = loop.run(task.task)
+                final_files = trace.final_files
+
+            if final_files:
+                class _Report:
+                    pass
+
+                rep = _Report()
+                rep.final_files = final_files  # type: ignore[attr-defined]
+                write_final(rep, root=root)
+        finally:
+            store.close()
+
+        elapsed = time.time() - start
+        ok, detail, finals = _check_expectations(task, root)
+        return TaskResult(
+            task=task,
+            passed=ok,
+            elapsed_s=elapsed,
+            detail=detail,
+            final_files=finals,
         )
+    except Exception as exc:  # noqa: BLE001
+        elapsed = time.time() - start
+        return TaskResult(
+            task=task,
+            passed=False,
+            elapsed_s=elapsed,
+            detail=f"in-process exception: {type(exc).__name__}: {exc}",
+        )
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def _print_table(results: list[TaskResult], *, repeat: int) -> None:
+    name_w = max(len(r.task.name) for r in results)
+
+    # When repeating, summarise per task (pass-rate).
+    if repeat > 1:
+        by_task: dict[str, list[TaskResult]] = {}
+        for r in results:
+            by_task.setdefault(r.task.name, []).append(r)
+        print(
+            f"\n{'name':<{name_w}}  {'tier':<8}  {'rate':<6}  "
+            f"{'avg time':>9}  details"
+        )
+        print("-" * (name_w + 40 + 30))
+        for name, rs in by_task.items():
+            ok = sum(1 for r in rs if r.passed)
+            tot = len(rs)
+            avg = sum(r.elapsed_s for r in rs) / tot
+            tier = rs[0].task.tier
+            fail_msgs = [r.detail for r in rs if not r.passed]
+            details = (fail_msgs[0][:120] + " ...") if fail_msgs else ""
+            print(
+                f"{name:<{name_w}}  {tier:<8}  {ok}/{tot:<3}  "
+                f"{avg:>8.1f}s  {details}"
+            )
+    else:
+        print(f"\n{'name':<{name_w}}  {'tier':<8}  {'pass':<5}  {'time':>7}  detail")
+        print("-" * (name_w + 32 + 30))
+        for r in results:
+            symbol = "PASS" if r.passed else "FAIL"
+            print(
+                f"{r.task.name:<{name_w}}  {r.task.tier:<8}  {symbol:<5}  "
+                f"{r.elapsed_s:>6.1f}s  {r.detail}"
+            )
 
     passed = sum(1 for r in results if r.passed)
     total = len(results)
@@ -168,6 +328,21 @@ def main(argv: list[str] | None = None) -> int:
         default="",
         help="Run only the named task (substring match).",
     )
+    parser.add_argument(
+        "--repeat",
+        type=int,
+        default=1,
+        help="Run each task N times; report pass-rate.",
+    )
+    parser.add_argument(
+        "--in-process",
+        action="store_true",
+        help=(
+            "Run tasks in-process, sharing the LLM model across tasks. "
+            "30x+ faster on LLM/research tiers (one cold model load, "
+            "many warm inference runs)."
+        ),
+    )
     args = parser.parse_args(argv)
 
     selected = TASKS
@@ -180,21 +355,35 @@ def main(argv: list[str] | None = None) -> int:
         sys.stderr.write("(no tasks selected)\n")
         return 0
 
-    sys.stderr.write(f"running {len(selected)} task(s)...\n")
+    n_runs = len(selected) * max(1, args.repeat)
+    sys.stderr.write(
+        f"running {len(selected)} task(s) x {args.repeat} repeat(s) = "
+        f"{n_runs} run(s)"
+        + (" (in-process)\n" if args.in_process else "\n")
+    )
+
+    llm_cache: dict = {}
     results: list[TaskResult] = []
     for task in selected:
-        sys.stderr.write(f"  -> {task.name} [{task.tier}] ... ")
-        sys.stderr.flush()
-        r = _run_one(task)
-        results.append(r)
-        sys.stderr.write(
-            f"{'PASS' if r.passed else 'FAIL'} ({r.elapsed_s:.1f}s)\n"
-        )
+        for i in range(max(1, args.repeat)):
+            tag = f" run {i + 1}/{args.repeat}" if args.repeat > 1 else ""
+            sys.stderr.write(f"  -> {task.name} [{task.tier}]{tag} ... ")
+            sys.stderr.flush()
+            r = (
+                _run_one_inprocess(task, llm_cache)
+                if args.in_process
+                else _run_one_subprocess(task)
+            )
+            r.run_idx = i
+            results.append(r)
+            sys.stderr.write(
+                f"{'PASS' if r.passed else 'FAIL'} ({r.elapsed_s:.1f}s)\n"
+            )
 
     if args.json:
         _print_json(results)
     else:
-        _print_table(results)
+        _print_table(results, repeat=args.repeat)
 
     return sum(1 for r in results if not r.passed)
 
