@@ -45,6 +45,7 @@ from lattice.compiler import (
 )
 from lattice.compiler.diff import unified_diff
 from lattice.compiler.errors import NonMutatingAction
+from lattice.orchestrator.plan import Plan, PlanStep
 from lattice.propose import ObservationContext, Proposer
 from lattice.sense import Symbol, walk_workspace
 from lattice.sense.semble_search import SembleCodeSearch
@@ -109,6 +110,7 @@ class AgentLoop:
         workspace_root: str | None = None,
         code_search: SembleCodeSearch | None = None,
         use_brain: bool = True,
+        use_plan: bool = True,
     ) -> None:
         self.proposer = proposer
         self.workspace = workspace
@@ -127,10 +129,25 @@ class AgentLoop:
         self._workspace_root = workspace_root
         self._code_search = code_search
         self._use_brain = use_brain
+        self._use_plan = use_plan
+        # The plan is built at the start of each run() so a single
+        # AgentLoop instance can run many tasks back-to-back.
+        self._plan: Plan | None = None
 
     def run(self, task: str) -> AgentTrace:
         steps: list[StepRecord] = []
         terminated_by = "exhausted"
+
+        # PLAN-DAG (Organ 6 v0 / Phase 2): build the plan once per task.
+        # Even single-step tasks get a one-element plan so the rest of
+        # the loop can use a uniform interface. Multi-step tasks gain
+        # an explicit current-step pointer the proposer focuses on.
+        self._plan = Plan.build(task) if self._use_plan else None
+        if self._plan is not None and self._plan.is_multistep():
+            self._persist_plan_atom(self._plan)
+            cur = self._plan.current()
+            if cur is not None:
+                self._plan.begin(cur)
 
         for step_idx in range(1, self.max_steps + 1):
             obs = self._build_observation(task, steps)
@@ -153,6 +170,37 @@ class AgentLoop:
                 break
             record, should_stop, stop_reason = self._handle_action(action, step_idx)
             steps.append(record)
+            self._record_step_outcome(record, task=task)
+
+            # PLAN-DAG advance: when the just-recorded step is a clean
+            # mutating edit (no verify error), the CURRENT plan step is
+            # considered done and we move the pointer. MarkDone from the
+            # LLM is treated as "this step is done" on multi-step plans;
+            # only the FINAL step's MarkDone completes the whole plan.
+            if self._plan is not None and self._plan.is_multistep():
+                if record.kind == "edit" and not record.error:
+                    next_step = self._plan.advance()
+                    if next_step is None:
+                        terminated_by = "done"
+                        break
+                    self._plan.begin(next_step)
+                elif record.kind == "done":
+                    # LLM thinks we're done — if more plan steps remain,
+                    # advance instead of terminating; only the last
+                    # step's MarkDone breaks out.
+                    next_step = self._plan.advance()
+                    if next_step is None:
+                        terminated_by = "done"
+                        break
+                    self._plan.begin(next_step)
+                    # Don't fall through to should_stop for this kind.
+                    if self._is_stuck(steps):
+                        terminated_by = "stuck"
+                        break
+                    continue
+                elif record.kind == "blocked":
+                    self._plan.block(record.error or "blocked")
+
             if should_stop:
                 terminated_by = stop_reason
                 break
@@ -237,8 +285,19 @@ class AgentLoop:
                 if not c.is_noop
             )
             change_bonus = min(0.3, 0.02 * lines_changed)
-            score = conf + change_bonus + 1.0  # +1.0 ensures real edits beat no-ops
-            scored.append((score, action, f"score=conf{conf:.2f}+lines{lines_changed}"))
+            # HEBBIAN DECISION-WEIGHTING (Organ 4 / Phase 4).
+            # The brain doesn't just decorate the prompt — it shapes
+            # which candidate wins. Recall outcomes from prior steps
+            # that match this (verb, slots, task) signature; SKILL /
+            # EXPERIENCE atoms boost, ANTIPATTERN atoms penalize.
+            # Bounded so a single hot atom can't drown out confidence,
+            # but a clear repeat-failure pattern CAN flip the winner.
+            brain_delta = self._brain_score(action, obs.task)
+            score = conf + change_bonus + 1.0 + brain_delta
+            scored.append((
+                score, action,
+                f"score=conf{conf:.2f}+lines{lines_changed}+brain{brain_delta:+.2f}",
+            ))
 
         if os.environ.get("LATTICE_LLM_DEBUG"):
             for s, a, note in scored:
@@ -263,6 +322,149 @@ class AgentLoop:
             action,
             (AddImport, AddField, AddParameter, AddTest, WrapInTry, RenameSymbol),
         )
+
+    # ----- brain (Hebbian) decision-weighting -----
+
+    @staticmethod
+    def _action_signature(action: Action) -> str:
+        """Compact (verb, slots) signature.
+
+        Used both as the recall query when scoring a candidate AND as
+        the content body of outcome atoms — so an atom written by one
+        run embeds near the query a future scorer will issue. Both
+        share the same template, so cosine similarity actually does
+        what we want it to.
+        """
+        verb = getattr(action, "verb", "?")
+        try:
+            dump = action.model_dump(mode="json")
+        except Exception:  # noqa: BLE001
+            return f"verb={verb}"
+        parts = [f"verb={verb}"]
+        for k, v in dump.items():
+            if k in {"verb", "confidence"}:
+                continue
+            parts.append(f"{k}={_compact_value(v)}")
+        return " ".join(parts)
+
+    def _brain_score(self, action: Action, task: str) -> float:
+        """Brain influence on candidate selection.
+
+        Recalls atoms matching this candidate's signature. SKILL /
+        EXPERIENCE atoms (prior successes on similar attempts) boost;
+        ANTIPATTERN atoms (prior failures) penalize. Weighting:
+
+          + 0.25 * similarity  per matching success atom
+          - 0.40 * similarity  per matching failure atom
+          (failures are weighted harder — a repeat-mistake signal
+          should be louder than a stale success.)
+
+        Bounded to [-0.5, +0.5] so the brain can break ties and
+        overrule small confidence gaps but cannot ride roughshod
+        over a clear high-confidence candidate. Similarity threshold
+        0.35 filters out near-irrelevant hits.
+
+        Returns 0.0 when brain is disabled or the store is empty.
+        """
+        if not self._use_brain or self.atom_store is None:
+            return 0.0
+        from lattice.atoms import AtomType
+
+        query = f"{self._action_signature(action)} | task '{task[:120]}'"
+        try:
+            hits = self.atom_store.recall(query, k=4)
+        except Exception:  # noqa: BLE001
+            return 0.0
+        delta = 0.0
+        for hit in hits:
+            sim = float(hit.score)
+            if sim < 0.35:
+                continue
+            atype = hit.atom.type
+            if atype in (AtomType.SKILL, AtomType.EXPERIENCE):
+                delta += 0.25 * sim
+            elif atype == AtomType.ANTIPATTERN:
+                delta -= 0.40 * sim
+        return max(-0.5, min(0.5, delta))
+
+    def _persist_plan_atom(self, plan: Plan) -> None:
+        """Write a TASK atom that summarizes the plan shape.
+
+        Lets the brain co-activate "tasks that decompose this way"
+        with their step atoms, which is the substrate Organ 9 will
+        eventually mine for recipes (recurring plan shapes → recipe
+        promotion candidates).
+        """
+        if not self._use_brain or self.atom_store is None:
+            return
+        from lattice.atoms import AtomType
+
+        step_summary = " | ".join(s.description[:60] for s in plan.steps)
+        content = (
+            f"Plan for task '{plan.task[:120]}'. "
+            f"{len(plan.steps)} steps: {step_summary[:400]}"
+        )
+        try:
+            self.atom_store.add(
+                content,
+                type=AtomType.TASK,
+                region="plans",
+                tags=("plan-dag", f"steps={len(plan.steps)}"),
+                importance=0.55,
+            )
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _record_step_outcome(self, record: "StepRecord", *, task: str) -> None:
+        """Write a SKILL atom on success / ANTIPATTERN on failure.
+
+        Per-step granularity: the brain accumulates fine-grained
+        outcome data for THIS verb on THIS kind of slot value, not
+        just an aggregate end-of-task summary. The next call to
+        `_brain_score` for a similar candidate will surface this atom
+        and bias selection accordingly.
+
+        Skipped when brain is off, when there's no atom_store, or when
+        the action isn't a mutating one (non-mutating verbs don't
+        teach the brain anything that helps future selection).
+        """
+        if not self._use_brain or self.atom_store is None:
+            return
+        if record.action is None:
+            return
+        if not self._is_mutating(record.action):
+            return
+
+        from lattice.atoms import AtomType
+
+        sig = self._action_signature(record.action)
+        ok = record.kind == "edit" and not record.error
+        if ok:
+            content = (
+                f"Success: {sig} on task '{task[:140]}'. "
+                "The attempt passed verification."
+            )
+            atype = AtomType.SKILL
+            importance = 0.65
+            tags = ("agent-step", "success", record.action.verb)
+        else:
+            content = (
+                f"Failure: {sig} on task '{task[:140]}'. "
+                f"Failed because: {(record.error or 'unknown')[:240]}"
+            )
+            atype = AtomType.ANTIPATTERN
+            importance = 0.6
+            tags = ("agent-step", "failure", record.action.verb)
+        try:
+            self.atom_store.add(
+                content,
+                type=atype,
+                region="steps",
+                tags=tags,
+                importance=importance,
+            )
+        except Exception:  # noqa: BLE001
+            pass
 
     # ----- per-action dispatch -----
 
@@ -444,6 +646,18 @@ class AgentLoop:
         symbols = self._gather_symbols()
         hints: list[str] = []
 
+        # PLAN-DAG view (Phase 2): on multi-step tasks, the proposer
+        # receives the CURRENT step as the task (not the original
+        # blob) and sees the full plan as a hint. This forces the
+        # small model to focus on one thing at a time instead of
+        # trying to plan AND act in the same turn.
+        active_task = task
+        if self._plan is not None and self._plan.is_multistep():
+            plan_view = self._plan.render()
+            if plan_view:
+                hints.append(plan_view)
+            active_task = self._plan.render_task()
+
         # VERIFY-FAILURE FEEDBACK (Phase 3): when the last step was an
         # error from verify (parse / type / tests), surface it as the
         # FIRST hint — top of the prompt, hard to miss. The model
@@ -532,7 +746,18 @@ class AgentLoop:
             "Do not repeat an edit that has already been applied."
         )
 
-        return ObservationContext(task=task, symbols=tuple(symbols[:30]), hints=tuple(hints))
+        # CONTEXT BUDGET (Phase 3): hints accumulate per-cycle; on long
+        # multi-step runs with priming + recall + history + code search
+        # they can blow past the small model's context. Apply a final
+        # priority-aware budget so the most important hints survive and
+        # the rest get truncated or dropped. Rule of thumb: ~4 chars per
+        # token; budget ~8000 chars ≈ 2000 hint tokens, leaving room for
+        # the system prompt + symbols + few-shot.
+        hints = _apply_context_budget(hints, max_chars=8000)
+
+        return ObservationContext(
+            task=active_task, symbols=tuple(symbols[:30]), hints=tuple(hints)
+        )
 
     def _gather_symbols(self) -> list[Symbol]:
         files = self._files if self._files is not None else self.overlay.iter_files(suffix=".py")
@@ -663,6 +888,96 @@ def _count_diff_added_lines(diff: str) -> int:
         if line.startswith("+") and not line.startswith("+++"):
             n += 1
     return n
+
+
+def _hint_priority(hint: str) -> int:
+    """Lower number = higher priority. Used by _apply_context_budget.
+
+    Ordering rationale:
+      0  FIX REQUIRED — last cycle's verify failure; the LLM MUST
+         see this to self-correct.
+      1  PLAN: — current step is the proposer's task; the plan view
+         tells it 'where we are' for the rest of the run.
+      2  Priming block (steering) — sticky, high-importance atoms.
+      3  WORKSPACE FILES — pins paths so the LLM can't hallucinate.
+      4  Atom recall hits — fluid, task-specific knowledge.
+      5  CODE — code-search chunks; nice-to-have grounding.
+      6  step-history lines — useful but tail-droppable.
+      7  FILES ALREADY EDITED — bookkeeping.
+      8  Coda ('Look at the history…') — instructions, smallest.
+      9  Anything else.
+    """
+    head = hint[:50]
+    if head.startswith("FIX REQUIRED"):
+        return 0
+    if head.startswith("PLAN:"):
+        return 1
+    if "priming" in head.lower() or head.startswith("STEER"):
+        return 2
+    if head.startswith("WORKSPACE FILES"):
+        return 3
+    if " (score " in head and "): " in head:  # atom recall
+        return 4
+    if head.startswith("CODE "):
+        return 5
+    if head.startswith("step "):
+        return 6
+    if head.startswith("FILES ALREADY EDITED"):
+        return 7
+    if head.startswith("Look at the history"):
+        return 8
+    return 9
+
+
+def _apply_context_budget(hints: list[str], *, max_chars: int) -> list[str]:
+    """Prune hints down to a character budget, keeping the highest-priority.
+
+    Approach:
+      1) Sort by priority (stable so same-class hints stay in original
+         order — e.g. step history stays oldest-first).
+      2) Accumulate until budget consumed.
+      3) If a single high-priority hint would alone exceed the budget,
+         truncate it to fit rather than drop entirely (FIX REQUIRED
+         must always survive, even truncated).
+      4) Return hints in their original ORDER (so the prompt structure
+         stays predictable for the LLM) — priority is only used to
+         decide WHICH to keep, not what order to render.
+    """
+    if not hints:
+        return hints
+    total = sum(len(h) for h in hints)
+    if total <= max_chars:
+        return hints
+
+    indexed = list(enumerate(hints))
+    indexed.sort(key=lambda t: (_hint_priority(t[1]), t[0]))
+
+    kept_indices: set[int] = set()
+    remaining = max_chars
+    truncated: dict[int, str] = {}
+    for orig_idx, h in indexed:
+        if len(h) <= remaining:
+            kept_indices.add(orig_idx)
+            remaining -= len(h)
+            continue
+        if not kept_indices and remaining > 200:
+            # First (highest-priority) hint already too big — truncate.
+            truncated[orig_idx] = h[: remaining - 20] + "…[truncated]"
+            kept_indices.add(orig_idx)
+            remaining = 0
+            continue
+        if remaining > 300 and _hint_priority(h) <= 1:
+            # Always keep FIX REQUIRED / PLAN even if we have to truncate.
+            truncated[orig_idx] = h[: remaining - 20] + "…[truncated]"
+            kept_indices.add(orig_idx)
+            remaining = 0
+            continue
+        # Out of budget for this hint; drop.
+    return [
+        truncated.get(i, h)
+        for i, h in enumerate(hints)
+        if i in kept_indices
+    ]
 
 
 def _summarize_diff(diff: str) -> str:

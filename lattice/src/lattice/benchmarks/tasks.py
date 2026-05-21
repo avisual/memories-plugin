@@ -176,6 +176,53 @@ TASKS: tuple[BenchTask, ...] = (
         },
         flags=("--decompose",),
     ),
+    # Same shape as multi-step-pattern but WITHOUT --decompose:
+    # exercises the in-agent Plan-DAG path (the loop builds its own
+    # plan from the task text and advances after each verified edit).
+    BenchTask(
+        name="multistep-plan-dag",
+        tier="pattern",
+        task=(
+            "Add an import of json to src/api.py; add a keyword-only "
+            "parameter timeout of type float with default 5.0 to function "
+            "get of class Client in src/api.py"
+        ),
+        files={"src/api.py": _client_module()},
+        expects={
+            "src/api.py": (
+                "import json",
+                "*, timeout: float = 5.0",
+            ),
+        },
+        flags=(),
+    ),
+    # Real 3-step pattern refactor — adds import, decorator, and a
+    # docstring. None of these depend on each other but all three
+    # MUST be applied for the task to count as done. Single-cycle
+    # pattern proposer would emit ONE verb per call; Plan-DAG forces
+    # it to do all three sequentially.
+    BenchTask(
+        name="plan-three-steps-pattern",
+        tier="pattern",
+        task=(
+            "Add an import of functools to src/util.py; "
+            "Add @cached decorator to function compute in src/util.py; "
+            "Add a docstring to function compute in src/util.py saying "
+            "\"Run the computation.\""
+        ),
+        files={
+            "src/util.py": "def compute(n: int) -> int:\n    return n * n\n",
+        },
+        expects={
+            "src/util.py": (
+                "import functools",
+                "@cached",
+                '"""Run the computation."""',
+                "def compute",
+            ),
+        },
+        flags=(),
+    ),
     BenchTask(
         name="wrap-in-try",
         tier="pattern",
