@@ -174,6 +174,40 @@ def _pytest_env(sandbox: Path) -> dict[str, str]:
     return env
 
 
+def _imported_module_names(source: str) -> set[str]:
+    """Parse `source` and return the set of module BASENAMES it imports.
+
+    Handles `import foo`, `import foo.bar`, `from foo import x`,
+    `from .foo import x`, and aliases via `as`. For each import target,
+    we return the *final* dotted-name component because that's what
+    the lattice's `touched_modules` set contains (Path.stem of each
+    changed source file).
+
+    Returns an empty set on parse error — better to under-trigger
+    than to error the test-discovery pass.
+    """
+    import ast
+
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return set()
+    out: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                # 'import foo.bar.baz' contributes 'foo', 'bar', 'baz'
+                # — touched_modules contains basenames, so any final
+                # component matching is a hit.
+                out.update(alias.name.split("."))
+        elif isinstance(node, ast.ImportFrom):
+            if node.module:
+                out.update(node.module.split("."))
+            for alias in node.names:
+                out.add(alias.name)
+    return out
+
+
 def _discover_affected_tests(
     changed: list, sandbox: Path
 ) -> list[str]:
@@ -207,8 +241,13 @@ def _discover_affected_tests(
                 out.append(cand)
                 seen.add(cand)
 
-    # Reference search: walk every test_*.py and check for module
-    # name mentions among the touched basenames.
+    # Reference search: walk every test_*.py and look for an actual
+    # IMPORT of a touched module. Previously this was a substring
+    # match on the basename — that produced both false positives
+    # (the basename appears in a comment or docstring) and false
+    # negatives (an alias import like 'from . import atom as atm'
+    # buries the basename). AST parsing the test file and matching
+    # on canonical import targets fixes both directions.
     touched_modules = {Path(c.path).stem for c in changed}
     if touched_modules:
         for test_file in sandbox.rglob("test_*.py"):
@@ -218,7 +257,8 @@ def _discover_affected_tests(
                 content = test_file.read_text(encoding="utf-8", errors="replace")
             except OSError:
                 continue
-            if any(m in content for m in touched_modules):
+            imported = _imported_module_names(content)
+            if imported & touched_modules:
                 out.append(test_file)
                 seen.add(test_file)
 

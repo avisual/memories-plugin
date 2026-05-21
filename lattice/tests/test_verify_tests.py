@@ -155,3 +155,34 @@ def test_pytest_not_importable_is_skipped(monkeypatch, tmp_path: Path):
 def test_outcome_is_truthy_only_when_ok(tmp_path: Path):
     assert bool(TestVerifyOutcome(ok=True))
     assert not bool(TestVerifyOutcome(ok=False, errors=(("t", "m"),)))
+
+
+def test_imported_module_names_ast_handles_common_shapes():
+    """The AST importer replaces the prior substring-match: rejects
+    false positives (module name in a comment / docstring) and catches
+    aliased imports the substring search missed.
+    """
+    from lattice.verify.tests import _imported_module_names
+
+    # `import foo`, `import foo.bar`, dotted imports.
+    src1 = "import foo\nimport foo.bar.baz\n"
+    assert _imported_module_names(src1) == {"foo", "bar", "baz"}
+
+    # `from foo import x` — both module and attribute names land in the set.
+    src2 = "from foo.bar import Quux\n"
+    out = _imported_module_names(src2)
+    assert "foo" in out and "bar" in out and "Quux" in out
+
+    # `from . import atom as atm` — the local alias doesn't bury the module.
+    src3 = "from . import atom as atm\n"
+    assert "atom" in _imported_module_names(src3)
+
+    # Substring in a comment / string is NOT counted.
+    src4 = '"""docstring mentioning foo and bar"""\nimport unrelated\n'
+    out = _imported_module_names(src4)
+    assert "foo" not in out and "bar" not in out
+    assert "unrelated" in out
+
+    # SyntaxError → empty set, doesn't raise.
+    src5 = "def broken(\n"
+    assert _imported_module_names(src5) == set()
