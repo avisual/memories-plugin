@@ -118,12 +118,18 @@ integration, interface surfaces beyond the CLI.
 
 ## Try it
 
-Install:
-
 ```bash
 cd lattice
-uv pip install -e ".[dev]"
+uv pip install -e ".[llm]"        # ~1GB: torch + transformers + MiniLM
+lattice init /path/to/your/project  # seeds .lattice/brain.db with 30 atoms
+lattice agent /path/to/your/project \
+  --atom-db /path/to/your/project/.lattice/brain.db \
+  --task "Add an import of json to src/foo.py" \
+  --write
 ```
+
+That's the minimum: a brain, a task, a written file. Everything below
+is detail on each piece.
 
 ### Single action
 

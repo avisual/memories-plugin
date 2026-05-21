@@ -24,6 +24,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from pathlib import Path
 from typing import IO
 
 from pydantic import TypeAdapter, ValidationError
@@ -237,6 +238,54 @@ def _atom_add(args: argparse.Namespace) -> int:
     finally:
         store.close()
     sys.stdout.write(f"added atom id={atom.id} type={atom.type.value}\n")
+    return 0
+
+
+def _init(args: argparse.Namespace) -> int:
+    from lattice.atoms import SQLiteAtomStore, seed_store
+
+    root = Path(args.workspace).resolve()
+    if not root.exists():
+        sys.stderr.write(f"workspace does not exist: {root}\n")
+        return 2
+    if not root.is_dir():
+        sys.stderr.write(f"workspace is not a directory: {root}\n")
+        return 2
+
+    brain_path = (root / args.brain).resolve()
+    try:
+        brain_path.relative_to(root)
+    except ValueError:
+        sys.stderr.write(f"brain path must be inside the workspace: {brain_path}\n")
+        return 2
+    brain_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if brain_path.exists():
+        sys.stderr.write(f"brain already exists: {brain_path}\n")
+    else:
+        sys.stderr.write(f"creating brain at {brain_path}\n")
+
+    store = SQLiteAtomStore(brain_path)
+    try:
+        seeded = 0
+        if not args.no_seed and store.count() == 0:
+            sys.stderr.write("loading seed atom pack ...\n")
+            seeded = seed_store(store)
+        total = store.count()
+    finally:
+        store.close()
+
+    sys.stdout.write(
+        f"lattice initialised\n"
+        f"  workspace: {root}\n"
+        f"  brain:     {brain_path}\n"
+        f"  atoms:     {total} (seeded {seeded} this run)\n"
+        f"\n"
+        f"Try:\n"
+        f"  lattice agent {root} --atom-db {brain_path} --task '<your task>'\n"
+        f"  lattice brain inspect --db {brain_path} --task '<a task>'\n"
+        f"  lattice brain dump    --db {brain_path}\n"
+    )
     return 0
 
 
@@ -534,6 +583,28 @@ def main(argv: list[str] | None = None) -> int:
         help="Actually write the compiled changes to disk after verify passes.",
     )
     propose_p.set_defaults(func=_propose)
+
+    init_p = sub.add_parser(
+        "init",
+        help="Initialize a lattice brain in a new project (seeded + ready to run).",
+    )
+    init_p.add_argument(
+        "workspace",
+        nargs="?",
+        default=".",
+        help="Project root; defaults to current directory.",
+    )
+    init_p.add_argument(
+        "--brain",
+        default=".lattice/brain.db",
+        help="Path (relative to workspace) for the brain SQLite file.",
+    )
+    init_p.add_argument(
+        "--no-seed",
+        action="store_true",
+        help="Skip loading the built-in seed atom pack.",
+    )
+    init_p.set_defaults(func=_init)
 
     agent_p = sub.add_parser(
         "agent",

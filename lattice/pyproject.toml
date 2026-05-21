@@ -43,6 +43,9 @@ llm = [
     "sentence-transformers>=3.2",
 ]
 
+[project.scripts]
+lattice = "lattice.__main__:main"
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
