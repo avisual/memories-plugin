@@ -16,6 +16,8 @@ ships its own atom store so no external service is required.
 
 ## What it actually does (live, today, on a 4-CPU box, no GPU)
 
+### Pattern-routed (deterministic, no LLM)
+
 ```bash
 $ lattice do "Add an import of request from flask to src/myapp/handlers.py"
 +from flask import request
@@ -29,14 +31,44 @@ $ lattice do "Rename charge to take_payment in src/billing.py"
 # every .py file in the project (3 files touched, 2 changed).
 ```
 
+### Multi-step composition (decompose into subtasks, shared overlay)
+
+```bash
+$ lattice do "Add an import of json to src/api.py; add a keyword-only \
+              parameter timeout of type float with default 5.0 to function \
+              get of class Client in src/api.py" --decompose
+
++import json
+-    def get(self, path: str) -> dict:
++    def get(self, path: str, *, timeout: float = 5.0) -> dict:
+```
+
+### LLM-driven with live web research (the headline)
+
+```bash
+$ lattice do "Add Flask-CORS support to src/app.py. If you don't know the \
+              setup pattern, first emit Research with \
+              url=https://flask-cors.readthedocs.io/en/latest/. After \
+              researching, emit AddImport for the flask_cors module." \
+  --model Qwen/Qwen2.5-1.5B-Instruct --two-stage
+
+# cycle 1: Planner→Research, Executor→Research(flask-cors-docs)
+#          → curl-cffi fetches docs, atom stored in brain
+# cycle 2: Planner→AddImport, Executor→AddImport(file, module, names=[CORS])
+#          → atom recall surfaces the just-fetched docs
+#          → model emits the right import using docs it didn't know before
++from flask_cors import CORS
+```
+
 Each command:
 1. Auto-initialises a brain (96 seed atoms) on first run.
 2. Tries pattern-matching first — these tasks need zero LLM calls.
-3. Falls back to a small local LLM (Qwen2.5-0.5B-Instruct, ~500MB)
-   for tasks the patterns don't cover.
-4. Compiles the action to a real file diff via libcst.
-5. Verifies the result parses (and optionally type-checks with mypy).
-6. Writes the file. Records what it did as an experience atom.
+3. Falls back to a local LLM (or `--two-stage` Planner+Executor split,
+   or `--hosted` Anthropic) for tasks the patterns don't cover.
+4. The LLM may emit `Research(url)` to learn from the live web mid-run.
+5. Compiles the action to a real file diff via libcst.
+6. Verifies the result parses (and optionally type-checks with mypy).
+7. Writes the file. Records what it did as an experience atom.
 
 ## Install + try it
 

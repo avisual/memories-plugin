@@ -293,8 +293,8 @@ def _do(args: argparse.Namespace) -> int:
         atom_db=str(brain_path),
         model=args.model,
         max_steps=args.max_steps,
-        subtasks="",
-        decompose=False,
+        subtasks=args.subtasks,
+        decompose=args.decompose,
         hosted=args.hosted,
         two_stage=args.two_stage,
         executor_model=args.executor_model,
@@ -663,6 +663,16 @@ def main(argv: list[str] | None = None) -> int:
                       help="Planner+Executor split (recommended for sub-1.5B models).")
     do_p.add_argument("--executor-model", default=None)
     do_p.add_argument("--types", action="store_true")
+    do_p.add_argument(
+        "--decompose",
+        action="store_true",
+        help="Deterministically split the task on conjunctions; run one agent loop per subtask.",
+    )
+    do_p.add_argument(
+        "--subtasks",
+        default="",
+        help="Pipe-separated subtasks; overrides --decompose.",
+    )
     do_p.add_argument("--write", action="store_true", help="Default for `do`: ON. Use --no-write to dry-run.")
     do_p.add_argument("--no-write", action="store_true")
     do_p.set_defaults(func=_do)
