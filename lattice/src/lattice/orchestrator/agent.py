@@ -358,6 +358,36 @@ class AgentLoop:
             for s, a, note, _ids in scored:
                 sys.stderr.write(f"  candidate {a.verb} score={s:.2f} ({note})\n")
 
+        # BRAIN_DEBUG: emit the brain's per-cycle behavior so users
+        # (and audits) can see whether decision-weighting is actually
+        # firing — what brain_delta did each candidate get, which
+        # atoms contributed, did the winner change vs the baseline
+        # score. Cheap to compute (we already have all the numbers);
+        # easy to grep ('BRAIN' prefix); off by default.
+        if os.environ.get("LATTICE_BRAIN_DEBUG"):
+            for s, a, note, ids in scored:
+                if "brain" in note:
+                    sys.stderr.write(
+                        f"BRAIN candidate={a.verb} {note} "
+                        f"contributors={ids[:4] or '-'}\n"
+                    )
+            if scored:
+                top = scored[0]
+                # Find the runner-up's baseline (without brain) to see if
+                # brain CHANGED the choice.
+                baseline_sorted = sorted(
+                    scored,
+                    key=lambda t: -(
+                        float(t[2].split("conf")[1].split("+")[0])
+                        if "conf" in t[2] else 0.0
+                    ),
+                )
+                if baseline_sorted and baseline_sorted[0][1] is not top[1]:
+                    sys.stderr.write(
+                        f"BRAIN FLIPPED: brain chose {top[1].verb} over "
+                        f"{baseline_sorted[0][1].verb} (baseline winner)\n"
+                    )
+
         # Highest score wins; stable order on ties.
         scored.sort(key=lambda t: -t[0])
         if not scored:
