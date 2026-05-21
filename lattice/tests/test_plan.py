@@ -162,6 +162,25 @@ def test_agent_loop_single_step_plan_still_works():
     assert "import json" in final
 
 
+def test_plan_fork_produces_independent_copy():
+    """Plan.fork() returns a new Plan whose PlanStep mutations don't
+    leak back to the original. Required for beam-search where each
+    branch advances its own plan independently.
+    """
+    original = Plan.build("step A; step B; step C")
+    forked = original.fork()
+
+    # Mutate the fork.
+    forked.advance()
+    assert forked.steps[0].status == "done"
+    # Original unchanged.
+    assert original.steps[0].status == "pending"
+
+    # Identity check — different list, different step objects.
+    assert original.steps is not forked.steps
+    assert original.steps[0] is not forked.steps[0]
+
+
 def test_agent_loop_use_plan_false_keeps_legacy_behavior():
     """When use_plan=False the loop never builds a plan; obs.task is raw."""
     ws = _two_file_workspace()

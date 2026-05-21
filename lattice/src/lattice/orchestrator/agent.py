@@ -150,6 +150,13 @@ class AgentLoop:
         # _build_observation; used by _record_step_outcome and
         # _brain_score so the SAME query embeds against the SAME atoms.
         self._active_task: str = ""
+        # Atom IDs of atoms newly added by non-mutating steps (Research,
+        # potentially RecallMore in future). They're added in cycle N
+        # (before any outcome is observed). The NEXT cycle's
+        # reinforcement pool picks them up so research that helped the
+        # next edit succeed gets a +0.05 nudge — closing the loop on
+        # 'did the LLM's mid-task data-fetch actually pay off?'
+        self._pending_added_atom_ids: list[int] = []
 
     def run(self, task: str) -> AgentTrace:
         steps: list[StepRecord] = []
@@ -837,7 +844,13 @@ class AgentLoop:
         # Reset the participating-IDs list each cycle; reinforce() at
         # end of step uses what's collected here as 'the atoms that
         # showed up for THIS decision'.
-        self._cycle_recalled_ids = []
+        # Seed with any atoms newly added by the PREVIOUS cycle
+        # (Research / RecallMore). They participated in this decision
+        # because they're fresh and the proposer just saw them — and
+        # they should receive outcome feedback so research-that-helps
+        # gets reinforced and research-that-misleads gets decayed.
+        self._cycle_recalled_ids = list(self._pending_added_atom_ids)
+        self._pending_added_atom_ids = []
         if self._use_brain and self.atom_store is not None:
             try:
                 hits = self.atom_store.recall(task, k=4)
@@ -958,13 +971,22 @@ class AgentLoop:
             try:
                 from lattice.atoms import AtomType
 
-                self.atom_store.add(
+                research_atom = self.atom_store.add(
                     content,
                     type=AtomType.FACT,
                     region="research",
                     tags=("web", url),
                     importance=0.75,
                 )
+                # Stash the new atom's ID so the NEXT step's
+                # reinforcement loop credits it for the outcome —
+                # research that helped the next edit succeed gets
+                # +0.05; research that misled it gets -0.03.
+                # Without this, research atoms never get later-step
+                # outcome feedback and their importance stays static.
+                atom_id = getattr(research_atom, "id", None)
+                if atom_id is not None:
+                    self._pending_added_atom_ids.append(int(atom_id))
             except Exception:  # noqa: BLE001
                 pass
 

@@ -603,6 +603,58 @@ def test_outcome_atom_embeds_near_brain_score_query(tmp_path):
     store.close()
 
 
+def test_pending_added_atom_ids_seeded_into_next_cycle_recall(tmp_path):
+    """Atoms added by a non-mutating step (Research) get seeded into
+    the NEXT cycle's _cycle_recalled_ids so the post-step reinforcement
+    credits them for the outcome of the next edit.
+
+    Without this wiring, research atoms wrote but never received any
+    outcome feedback — their importance stayed static even when the
+    research clearly enabled the next step's success.
+    """
+    from lattice.actions import AddImport
+
+    store = _store(tmp_path)
+    loop = AgentLoop(
+        proposer=MockProposer.empty(),
+        workspace=_ws(),
+        atom_store=store,
+        use_brain=True,
+    )
+    # Stash a 'pending' ID as if the prior cycle was a Research call.
+    research_atom = store.add(
+        "Fetched docs about adding imports",
+        type=AtomType.FACT,
+        region="research",
+        importance=0.6,
+    )
+    loop._pending_added_atom_ids = [research_atom.id]
+
+    # Build observation; should consume the pending ID into _cycle_recalled_ids.
+    loop._build_observation("add an import", [])
+    assert research_atom.id in loop._cycle_recalled_ids
+    # And the pending list got reset so the same atom doesn't double-credit.
+    assert loop._pending_added_atom_ids == []
+
+    # Simulate a successful step — _reinforce_recalled should bump the
+    # research atom's importance even though it wasn't matched by recall
+    # directly this cycle.
+    good_record = StepRecord(
+        step=1,
+        action=AddImport(
+            file=FileRef(path="src/main.py"), module="json", confidence=0.9
+        ),
+        kind="edit",
+        diff="+ import json\n",
+    )
+    loop._reinforce_recalled(good_record)
+    hits = store.recall("Fetched docs", k=3)
+    same = next((h for h in hits if h.atom.id == research_atom.id), None)
+    assert same is not None
+    assert same.atom.importance >= 0.6 + 0.04
+    store.close()
+
+
 def test_winning_brain_ids_cleared_at_cycle_start(tmp_path):
     """_winning_brain_ids must be cleared at the start of EVERY cycle.
 

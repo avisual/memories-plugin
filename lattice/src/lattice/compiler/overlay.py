@@ -52,3 +52,28 @@ class OverlayWorkspace:
             return self._base.read(path)
         except WorkspaceError:
             return ""
+
+    def fork(self) -> "OverlayWorkspace":
+        """Return an independent copy of this overlay for branching.
+
+        Needed for beam-search (Organ 6 v1): each alive branch must
+        be able to commit different edits without affecting siblings.
+        The fork shares the base Workspace (read-only by contract)
+        and shallow-copies the overlay dict (str values are immutable
+        in Python, so dict.copy() is safe).
+
+        Cost is O(paths edited), not O(workspace size) — the base
+        isn't copied. For K-way beam with K≤4 and overlay typically
+        under ~10 entries this is microseconds.
+        """
+        forked = OverlayWorkspace(self._base)
+        forked._overlay = dict(self._overlay)
+        return forked
+
+    def snapshot(self) -> dict[str, str]:
+        """Capture the current overlay state. Pair with restore()."""
+        return dict(self._overlay)
+
+    def restore(self, snap: dict[str, str]) -> None:
+        """Roll the overlay back to a previous snapshot()."""
+        self._overlay = dict(snap)

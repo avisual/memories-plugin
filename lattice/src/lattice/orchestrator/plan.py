@@ -122,6 +122,24 @@ class Plan(BaseModel):
     def is_multistep(self) -> bool:
         return len(self.steps) > 1
 
+    def fork(self) -> "Plan":
+        """Return an independent copy of this plan.
+
+        Needed for beam-search (Organ 6 v1): each alive branch holds
+        its own PlanStep status (one branch may advance to step 2
+        while a sibling is still on step 1). PlanStep is mutable so
+        the steps MUST be deep-copied — a shallow copy of the steps
+        list would share PlanStep instances across branches.
+
+        Pydantic's model_copy() handles this cleanly. Both Plan and
+        PlanStep are BaseModels, so .model_copy() per step gives us
+        the independent state we need.
+        """
+        return Plan(
+            task=self.task,
+            steps=[s.model_copy() for s in self.steps],
+        )
+
     def render(self) -> str:
         """ASCII view for an observation hint.
 
