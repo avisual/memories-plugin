@@ -62,7 +62,15 @@ Plus a minimal lattice-native atom store (Organ 1, v0):
   (~90MB, CPU). Same conceptual taxonomy as memories-plugin
   (fact/experience/skill/antipattern/...). Wired into `propose`'s
   Observation so recalls become typed hints to the LLM.
-- CLI: `lattice atom add` / `lattice atom recall`.
+- **Seed pack** (30 curated atoms): Python conventions, antipatterns
+  (bare except, mutable defaults, eval, raw SQL building, etc.),
+  library defaults (Stripe for payments, httpx/requests for HTTP,
+  SQLAlchemy for SQL, pathlib over os.path, etc.). Loaded with
+  `lattice atom seed --db DB`. The brain ships knowing things.
+- **Hebbian feedback**: after a successful agent run, the harness
+  writes an `experience` atom summarizing what was done so the
+  brain accumulates lived knowledge across runs.
+- CLI: `lattice atom add` / `lattice atom recall` / `lattice atom seed`.
 
 Plus a multi-step **agent loop** (Organ 6 stub, linear v0):
 - Drives a Proposer one action per turn; history + atom recall become

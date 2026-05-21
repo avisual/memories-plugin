@@ -103,7 +103,11 @@ _intent_adapter: TypeAdapter[Intent] = TypeAdapter(Intent)
 
 
 def _agent(args: argparse.Namespace) -> int:
-    from lattice.atoms import SQLiteAtomStore
+    from lattice.atoms import (
+        SQLiteAtomStore,
+        record_experience,
+        summarize_trace_for_experience,
+    )
     from lattice.orchestrator import AgentLoop, decompose, run_subtasks
     from lattice.propose.local import LocalLLMProposer
 
@@ -151,6 +155,17 @@ def _agent(args: argparse.Namespace) -> int:
 
                 written = write_final(report, root=args.workspace)
                 sys.stderr.write(f"wrote {len(written)} file(s)\n")
+
+            if atom_store is not None and report.final_files:
+                actions, files = summarize_trace_for_experience(report)
+                if actions:
+                    record_experience(
+                        store=atom_store,
+                        task=args.task or "; ".join(report.subtasks),
+                        actions_summary=actions,
+                        files_touched=files,
+                    )
+                    sys.stderr.write("recorded experience atom\n")
             return 0 if report.ok else 1
 
         loop = AgentLoop(
@@ -160,31 +175,42 @@ def _agent(args: argparse.Namespace) -> int:
             max_steps=args.max_steps,
         )
         trace = loop.run(args.task)
+
+        sys.stderr.write(f"\nterminated_by={trace.terminated_by}\n")
+        for step in trace.steps:
+            sys.stderr.write(
+                f"  step {step.step} [{step.kind}] {step.verb}"
+                + (f" :: {step.error[:120]}" if step.error else "")
+                + (f" :: {step.payload[:120]}" if step.payload else "")
+                + "\n"
+            )
+
+        for diff in trace.consolidated_diffs:
+            sys.stdout.write(diff)
+            if not diff.endswith("\n"):
+                sys.stdout.write("\n")
+
+        if args.write and trace.final_files:
+            from lattice.apply import write_final
+
+            written = write_final(trace, root=args.workspace)
+            sys.stderr.write(f"wrote {len(written)} file(s)\n")
+
+        if atom_store is not None and trace.final_files:
+            actions, files = summarize_trace_for_experience(trace)
+            if actions:
+                record_experience(
+                    store=atom_store,
+                    task=args.task,
+                    actions_summary=actions,
+                    files_touched=files,
+                )
+                sys.stderr.write("recorded experience atom\n")
+
+        return 0 if trace.ok else 1
     finally:
         if atom_store is not None:
             atom_store.close()
-
-    sys.stderr.write(f"\nterminated_by={trace.terminated_by}\n")
-    for step in trace.steps:
-        sys.stderr.write(
-            f"  step {step.step} [{step.kind}] {step.verb}"
-            + (f" :: {step.error[:120]}" if step.error else "")
-            + (f" :: {step.payload[:120]}" if step.payload else "")
-            + "\n"
-        )
-
-    for diff in trace.consolidated_diffs:
-        sys.stdout.write(diff)
-        if not diff.endswith("\n"):
-            sys.stdout.write("\n")
-
-    if args.write and trace.final_files:
-        from lattice.apply import write_final
-
-        written = write_final(trace, root=args.workspace)
-        sys.stderr.write(f"wrote {len(written)} file(s)\n")
-
-    return 0 if trace.ok else 1
 
 
 def _atom_add(args: argparse.Namespace) -> int:
@@ -211,6 +237,18 @@ def _atom_add(args: argparse.Namespace) -> int:
     finally:
         store.close()
     sys.stdout.write(f"added atom id={atom.id} type={atom.type.value}\n")
+    return 0
+
+
+def _atom_seed(args: argparse.Namespace) -> int:
+    from lattice.atoms import SQLiteAtomStore, seed_store
+
+    store = SQLiteAtomStore(args.db)
+    try:
+        added = seed_store(store)
+    finally:
+        store.close()
+    sys.stdout.write(f"seeded {added} atom(s) into {args.db}\n")
     return 0
 
 
@@ -490,6 +528,13 @@ def main(argv: list[str] | None = None) -> int:
     recall_p.add_argument("--query", required=True)
     recall_p.add_argument("--k", type=int, default=5)
     recall_p.set_defaults(func=_atom_recall)
+
+    seed_p = atom_sub.add_parser(
+        "seed",
+        help="Load the built-in seed atoms (python conventions/antipatterns/skills) into a store.",
+    )
+    seed_p.add_argument("--db", required=True, help="Atom-store DB path.")
+    seed_p.set_defaults(func=_atom_seed)
 
     args = parser.parse_args(argv)
     return args.func(args)

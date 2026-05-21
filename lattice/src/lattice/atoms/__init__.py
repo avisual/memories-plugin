@@ -13,6 +13,12 @@ the same Protocol; nothing in the orchestrator changes.
 
 from lattice.atoms.atom import Atom, AtomType
 from lattice.atoms.embedder import Embedder, MiniLMEmbedder
+from lattice.atoms.feedback import (
+    record_antipattern,
+    record_experience,
+    summarize_trace_for_experience,
+)
+from lattice.atoms.seed import SEED_ATOMS, SeedAtom, seed_store
 from lattice.atoms.store import AtomStore, RecallResult, SQLiteAtomStore
 
 __all__ = [
@@ -22,5 +28,11 @@ __all__ = [
     "Embedder",
     "MiniLMEmbedder",
     "RecallResult",
+    "SEED_ATOMS",
     "SQLiteAtomStore",
+    "SeedAtom",
+    "record_antipattern",
+    "record_experience",
+    "seed_store",
+    "summarize_trace_for_experience",
 ]
