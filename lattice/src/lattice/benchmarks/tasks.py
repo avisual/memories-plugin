@@ -285,6 +285,48 @@ TASKS: tuple[BenchTask, ...] = (
         expects={"src/api.py": ("class API:", "def current")},
         not_expects={"src/api.py": ("def legacy",)},
     ),
+    BenchTask(
+        name="change-return-type",
+        tier="pattern",
+        task="Change the return type of function get of class Client in src/api.py to dict",
+        files={
+            "src/api.py": (
+                "class Client:\n"
+                "    def get(self, path: str) -> str:\n"
+                "        return \"\"\n"
+            ),
+        },
+        expects={"src/api.py": ("def get(self, path: str) -> dict:",)},
+    ),
+    BenchTask(
+        name="add-function-docstring",
+        tier="pattern",
+        task='Add a docstring to function compute in src/util.py saying "Run the computation."',
+        files={
+            "src/util.py": "def compute(n: int) -> int:\n    return n * n\n",
+        },
+        expects={"src/util.py": ('"""Run the computation."""', "def compute")},
+    ),
+    BenchTask(
+        name="set-module-docstring",
+        tier="pattern",
+        task='Set the docstring of module src/util.py to "Utility helpers."',
+        files={"src/util.py": "def compute(n: int) -> int:\n    return n * n\n"},
+        expects={"src/util.py": ('"""Utility helpers."""',)},
+    ),
+    BenchTask(
+        name="move-function",
+        tier="pattern",
+        task="Move function helper from src/old.py to src/new.py",
+        files={
+            "src/old.py": "def keep(): pass\n\n\ndef helper():\n    return 42\n",
+            "src/new.py": '"""New home."""\n',
+        },
+        expects={
+            "src/new.py": ("def helper", "return 42"),
+        },
+        not_expects={"src/old.py": ("def helper",)},
+    ),
 
     # ---- Research tier: hardest; LLM must fetch web docs and apply them ----
     BenchTask(

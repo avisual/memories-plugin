@@ -21,9 +21,12 @@ from lattice.actions import (
     AddStatement,
     AddTest,
     Branch,
+    ChangeReturnType,
     DeleteSymbol,
     MarkBlocked,
     MarkDone,
+    ModifyDocstring,
+    MoveSymbol,
     RecallMore,
     RenameSymbol,
     Research,
@@ -68,6 +71,12 @@ def compile_action(action: Action, workspace: Workspace) -> CompiledAction:
                 return _compile_add_decorator(action, workspace)
             case DeleteSymbol():
                 return _compile_delete_symbol(action, workspace)
+            case ChangeReturnType():
+                return _compile_change_return_type(action, workspace)
+            case ModifyDocstring():
+                return _compile_modify_docstring(action, workspace)
+            case MoveSymbol():
+                return _compile_move_symbol(action, workspace)
             case RenameSymbol():
                 return _compile_rename_symbol(action, workspace)
             case RecallMore() | RevealBody() | MarkBlocked() | MarkDone() | Branch() | Research():
@@ -841,6 +850,263 @@ def _statement_insertion_index(module: cst.Module, position: str) -> int:
             continue
         break
     return index
+
+
+# ---------------------------------------------------------------------------
+# ChangeReturnType
+# ---------------------------------------------------------------------------
+
+
+def _compile_change_return_type(
+    action: ChangeReturnType, workspace: Workspace
+) -> CompiledAction:
+    """Replace a function's return annotation."""
+    path = action.symbol.file
+    before = workspace.read(path)
+    module = cst.parse_module(before)
+    fn = _find_function(module, action.symbol.name)
+
+    try:
+        new_annotation_expr = cst.parse_expression(action.return_type.expr)
+    except cst.ParserSyntaxError as exc:
+        raise CompileError(
+            f"ChangeReturnType.return_type is not a valid expression: {exc}"
+        ) from exc
+
+    # Idempotency: compare the rendered source of the existing return
+    # annotation (if any) to the requested one.
+    requested_src = cst.Module(body=[]).code_for_node(new_annotation_expr).strip()
+    if fn.returns is not None:
+        current_src = cst.Module(body=[]).code_for_node(fn.returns.annotation).strip()
+        if current_src == requested_src:
+            return CompiledAction(
+                verb=action.verb,
+                file_changes=(FileChange(path=path, before=before, after=before, diff=""),),
+            )
+
+    new_fn = fn.with_changes(returns=cst.Annotation(annotation=new_annotation_expr))
+    new_module = module.deep_replace(fn, new_fn)
+    after = new_module.code
+
+    return CompiledAction(
+        verb=action.verb,
+        file_changes=(
+            FileChange(
+                path=path,
+                before=before,
+                after=after,
+                diff=unified_diff(path=path, before=before, after=after),
+            ),
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
+# ModifyDocstring
+# ---------------------------------------------------------------------------
+
+
+def _compile_modify_docstring(
+    action: ModifyDocstring, workspace: Workspace
+) -> CompiledAction:
+    """Set the docstring on a function, class, or module.
+
+    For functions/classes (action.symbol set), inserts the docstring as
+    the first statement of the body (or replaces an existing first
+    docstring). For modules (symbol=None), inserts at module top (or
+    replaces an existing module docstring).
+    """
+    path = action.file.path
+    before = workspace.read(path)
+    module = cst.parse_module(before)
+
+    new_docstring_literal = cst.SimpleString(_quote_docstring(action.docstring))
+    new_doc_stmt = cst.SimpleStatementLine(body=[cst.Expr(value=new_docstring_literal)])
+
+    if action.symbol is None:
+        # Module docstring.
+        body = list(module.body)
+        if body and _is_docstring(body[0]):
+            existing = body[0]
+            if isinstance(existing, cst.SimpleStatementLine) and isinstance(
+                existing.body[0], cst.Expr
+            ):
+                existing_value = existing.body[0].value
+                if (
+                    isinstance(existing_value, cst.SimpleString)
+                    and existing_value.value == new_docstring_literal.value
+                ):
+                    return CompiledAction(
+                        verb=action.verb,
+                        file_changes=(
+                            FileChange(path=path, before=before, after=before, diff=""),
+                        ),
+                    )
+            body[0] = new_doc_stmt
+        else:
+            body.insert(0, new_doc_stmt)
+        new_module = module.with_changes(body=tuple(body))
+    else:
+        target = _find_symbol(module, action.symbol.name)
+        if target is None or not isinstance(target, (cst.FunctionDef, cst.ClassDef)):
+            raise SymbolNotFound(
+                f"ModifyDocstring target must be function or class; got "
+                f"{type(target).__name__ if target else 'nothing'}"
+            )
+        body = target.body
+        if not isinstance(body, cst.IndentedBlock):
+            raise CompileError(f"{action.symbol.name!r} has no IndentedBlock body")
+        body_stmts = list(body.body)
+        if body_stmts and _is_docstring(body_stmts[0]):
+            existing = body_stmts[0]
+            if isinstance(existing, cst.SimpleStatementLine) and isinstance(
+                existing.body[0], cst.Expr
+            ):
+                existing_value = existing.body[0].value
+                if (
+                    isinstance(existing_value, cst.SimpleString)
+                    and existing_value.value == new_docstring_literal.value
+                ):
+                    return CompiledAction(
+                        verb=action.verb,
+                        file_changes=(
+                            FileChange(path=path, before=before, after=before, diff=""),
+                        ),
+                    )
+            body_stmts[0] = new_doc_stmt
+        else:
+            body_stmts.insert(0, new_doc_stmt)
+        new_body = body.with_changes(body=tuple(body_stmts))
+        new_target = target.with_changes(body=new_body)
+        new_module = module.deep_replace(target, new_target)
+
+    after = new_module.code
+    return CompiledAction(
+        verb=action.verb,
+        file_changes=(
+            FileChange(
+                path=path,
+                before=before,
+                after=after,
+                diff=unified_diff(path=path, before=before, after=after),
+            ),
+        ),
+    )
+
+
+def _quote_docstring(text: str) -> str:
+    """Wrap *text* in triple-double-quotes, escaping inner triple-quotes."""
+    safe = text.replace('"""', '\\"\\"\\"')
+    return f'"""{safe}"""'
+
+
+# ---------------------------------------------------------------------------
+# MoveSymbol
+# ---------------------------------------------------------------------------
+
+
+def _compile_move_symbol(action: MoveSymbol, workspace: Workspace) -> CompiledAction:
+    """Move a top-level function or class from source to target file.
+
+    v0 scope: top-level def/class only. Methods (dotted names) are not
+    yet supported. Imports referencing the symbol are NOT updated (a
+    follow-up RenameSymbol can redirect them).
+    """
+    if "." in action.symbol.name:
+        raise UnsupportedAction(
+            "MoveSymbol v0 supports top-level def/class only; "
+            "method moves are a follow-up."
+        )
+
+    source_path = action.symbol.file
+    target_path = action.target_file.path
+
+    if source_path == target_path:
+        raise CompileError(
+            "MoveSymbol: source and target files must differ"
+        )
+
+    source_before = workspace.read(source_path)
+    source_module = cst.parse_module(source_before)
+
+    # Find the target node in the source module.
+    target_node = None
+    for stmt in source_module.body:
+        if isinstance(stmt, (cst.FunctionDef, cst.ClassDef)) and stmt.name.value == action.symbol.name:
+            target_node = stmt
+            break
+    if target_node is None:
+        raise SymbolNotFound(
+            f"MoveSymbol: could not find top-level {action.symbol.name!r} "
+            f"in {source_path}"
+        )
+
+    # Remove from source.
+    new_source_body = tuple(
+        s for s in source_module.body
+        if not (isinstance(s, (cst.FunctionDef, cst.ClassDef)) and s.name.value == action.symbol.name)
+    )
+    new_source_module = source_module.with_changes(body=new_source_body)
+    source_after = new_source_module.code
+
+    # Add to target.
+    if workspace.exists(target_path):
+        target_before = workspace.read(target_path)
+    else:
+        target_before = ""
+    target_module = cst.parse_module(target_before)
+
+    if _function_exists_in_module(target_module, action.symbol.name) or _class_exists_in_module(
+        target_module, action.symbol.name
+    ):
+        # Already there. If we also removed it from source, that's the
+        # whole move — still a real diff. Otherwise no-op.
+        if source_before == source_after:
+            return CompiledAction(
+                verb=action.verb,
+                file_changes=(
+                    FileChange(path=source_path, before=source_before, after=source_before, diff=""),
+                    FileChange(path=target_path, before=target_before, after=target_before, diff=""),
+                ),
+            )
+        new_target_module = target_module
+    else:
+        insertion_index = _statement_insertion_index(target_module, action.position)
+        leading_lines = (cst.EmptyLine(), cst.EmptyLine()) if insertion_index > 0 else ()
+        moved_node = target_node.with_changes(leading_lines=leading_lines)
+        new_target_body = (
+            *target_module.body[:insertion_index],
+            moved_node,
+            *target_module.body[insertion_index:],
+        )
+        new_target_module = target_module.with_changes(body=new_target_body)
+
+    target_after = new_target_module.code
+
+    return CompiledAction(
+        verb=action.verb,
+        file_changes=(
+            FileChange(
+                path=source_path,
+                before=source_before,
+                after=source_after,
+                diff=unified_diff(path=source_path, before=source_before, after=source_after),
+            ),
+            FileChange(
+                path=target_path,
+                before=target_before,
+                after=target_after,
+                diff=unified_diff(path=target_path, before=target_before, after=target_after),
+            ),
+        ),
+    )
+
+
+def _class_exists_in_module(module: cst.Module, name: str) -> bool:
+    return any(
+        isinstance(stmt, cst.ClassDef) and stmt.name.value == name
+        for stmt in module.body
+    )
 
 
 # ---------------------------------------------------------------------------

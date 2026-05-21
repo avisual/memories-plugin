@@ -35,8 +35,11 @@ from lattice.actions import (
     AddParameter,
     AddStatement,
     AddTest,
+    ChangeReturnType,
     Expr,
     FileRef,
+    ModifyDocstring,
+    MoveSymbol,
     RenameSymbol,
     SpanRef,
     SymbolRef,
@@ -166,6 +169,67 @@ _PATTERNS: list[tuple[re.Pattern[str], str]] = [
             re.IGNORECASE | re.VERBOSE,
         ),
         "delete_symbol",
+    ),
+    # 'change|set|update the return type of function FOO [of class C] in FILE to TYPE'
+    (
+        re.compile(
+            r"""
+            (?:change|set|update)\s+(?:the\s+)?return\s+type\s+
+            of\s+(?:function|method)\s+
+            ['"`]?(?P<func>[A-Za-z_][\w.]*)['"`]?
+            (?:\s+(?:of\s+class\s+|in\s+class\s+)
+                ['"`]?(?P<cls>[A-Za-z_]\w*)['"`]?
+            )?
+            \s+(?:in|inside)\s+
+            (?P<file>['"`]?[\w/][\w/.-]+\.py['"`]?)
+            \s+to\s+
+            (?P<typ>['"`].+?['"`]|`.+?`|\S+(?:\s*\|\s*\S+)*)
+            \s*$
+            """,
+            re.IGNORECASE | re.VERBOSE,
+        ),
+        "change_return_type",
+    ),
+    # 'set the docstring of function|class|module X in FILE to "TEXT"'
+    # 'add a docstring to function X in FILE saying "TEXT"'
+    (
+        re.compile(
+            r"""
+            (?:set|add)\s+(?:an?\s+|the\s+)?docstring\s+
+            (?:of|to|for)\s+
+            (?:(?:function|method|class)\s+
+                ['"`]?(?P<symbol>[A-Za-z_][\w.]*)['"`]?
+                (?:\s+(?:of\s+class\s+|in\s+class\s+)
+                    ['"`]?(?P<cls>[A-Za-z_]\w*)['"`]?
+                )?
+                \s+(?:in|inside)\s+
+                (?P<file_sym>['"`]?[\w/][\w/.-]+\.py['"`]?)
+                |
+                module\s+(?P<file_mod>['"`]?[\w/][\w/.-]+\.py['"`]?)
+            )
+            \s+(?:to|saying|with|as)\s+
+            (?P<doc>['"`].+?['"`]|`.+?`)
+            \s*$
+            """,
+            re.IGNORECASE | re.VERBOSE,
+        ),
+        "modify_docstring",
+    ),
+    # 'move function|class X from FILE_A to FILE_B'
+    (
+        re.compile(
+            r"""
+            move\s+(?:the\s+)?(?:function|class)\s+
+            ['"`]?(?P<name>[A-Za-z_]\w*)['"`]?
+            \s+from\s+
+            (?P<src>['"`]?[\w/][\w/.-]+\.py['"`]?)
+            \s+to\s+
+            (?P<dst>['"`]?[\w/][\w/.-]+\.py['"`]?)
+            \s*$
+            """,
+            re.IGNORECASE | re.VERBOSE,
+        ),
+        "move_symbol",
     ),
     # 'add a @decorator to function FUNC [of class C] in FILE'
     # 'apply @decorator to function FUNC in FILE'
@@ -313,6 +377,50 @@ def task_to_action(task: str) -> Action | None:
             name = f"{groups['cls']}.{name}"
         return DeleteSymbol(
             symbol=SymbolRef(file=file_path, name=name),
+            confidence=0.9,
+        )
+    if kind == "change_return_type":
+        file_clean = (groups.get("file") or "").strip("'\"`")
+        func = groups["func"]
+        if groups.get("cls"):
+            func = f"{groups['cls']}.{func}"
+        typ = groups["typ"].strip()
+        # Strip optional surrounding quotes from a 'to "int | None"' phrasing.
+        if typ and typ[0] in ('"', "'", "`"):
+            typ = typ[1:-1]
+        return ChangeReturnType(
+            symbol=SymbolRef(file=file_clean, name=func),
+            return_type=TypeExpr(expr=typ),
+            confidence=0.9,
+        )
+    if kind == "modify_docstring":
+        doc_raw = groups["doc"].strip()
+        if doc_raw and doc_raw[0] in ('"', "'", "`"):
+            doc_raw = doc_raw[1:-1]
+        if groups.get("file_mod"):
+            file_clean = groups["file_mod"].strip("'\"`")
+            return ModifyDocstring(
+                file=FileRef(path=file_clean),
+                docstring=doc_raw,
+                confidence=0.9,
+            )
+        else:
+            file_clean = (groups.get("file_sym") or "").strip("'\"`")
+            name = groups["symbol"]
+            if groups.get("cls"):
+                name = f"{groups['cls']}.{name}"
+            return ModifyDocstring(
+                file=FileRef(path=file_clean),
+                symbol=SymbolRef(file=file_clean, name=name),
+                docstring=doc_raw,
+                confidence=0.9,
+            )
+    if kind == "move_symbol":
+        src_file = groups["src"].strip("'\"`")
+        dst_file = groups["dst"].strip("'\"`")
+        return MoveSymbol(
+            symbol=SymbolRef(file=src_file, name=groups["name"]),
+            target_file=FileRef(path=dst_file),
             confidence=0.9,
         )
     if kind == "add_parameter":

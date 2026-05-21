@@ -263,6 +263,59 @@ class AddStatement(_Verb):
             )
 
 
+class ChangeReturnType(_Verb):
+    """Change a function or method's return type annotation.
+
+    Idempotent: a no-op if the function's return annotation already
+    matches the requested type. Raises SymbolNotFound if the target
+    isn't a FunctionDef.
+
+    Use this for `-> str` → `-> str | None` migrations, narrowing
+    return types after analysis, or adding missing annotations.
+    """
+
+    verb: Literal["ChangeReturnType"] = "ChangeReturnType"
+    symbol: SymbolRef
+    return_type: TypeExpr
+
+
+class ModifyDocstring(_Verb):
+    """Add or replace a docstring on a function, class, or module.
+
+    If `symbol` is set, the docstring is attached to that function or
+    class. If `symbol` is None, the module-level docstring of
+    `file` is set instead.
+
+    Idempotent: a no-op when the existing docstring matches verbatim.
+    Replaces an existing docstring otherwise. Adds one when absent.
+    """
+
+    verb: Literal["ModifyDocstring"] = "ModifyDocstring"
+    file: FileRef
+    docstring: str = Field(min_length=1, max_length=4000)
+    symbol: SymbolRef | None = None
+
+
+class MoveSymbol(_Verb):
+    """Move a top-level function or class from one file to another.
+
+    v0 scope:
+      - Source must be a top-level def/class (not a nested method).
+      - Target file is created if missing.
+      - The symbol's source code (decorators + body) is preserved.
+      - Imports referencing the symbol are NOT rewritten yet (a
+        future iteration will walk the workspace; for now, use
+        a follow-up RenameSymbol if you need to redirect imports).
+      - Idempotent: no-op when the symbol already exists at target
+        AND is absent from source.
+    """
+
+    verb: Literal["MoveSymbol"] = "MoveSymbol"
+    symbol: SymbolRef
+    target_file: FileRef
+    position: Literal["end", "top_after_imports"] = "end"
+
+
 class DeleteSymbol(_Verb):
     """Delete a function, class, or method by dotted name.
 
