@@ -29,6 +29,7 @@ from lattice.actions import (
     MoveSymbol,
     RecallMore,
     RenameSymbol,
+    ReplaceBody,
     Research,
     RevealBody,
     WrapInTry,
@@ -77,6 +78,8 @@ def compile_action(action: Action, workspace: Workspace) -> CompiledAction:
                 return _compile_modify_docstring(action, workspace)
             case MoveSymbol():
                 return _compile_move_symbol(action, workspace)
+            case ReplaceBody():
+                return _compile_replace_body(action, workspace)
             case RenameSymbol():
                 return _compile_rename_symbol(action, workspace)
             case RecallMore() | RevealBody() | MarkBlocked() | MarkDone() | Branch() | Research():
@@ -850,6 +853,62 @@ def _statement_insertion_index(module: cst.Module, position: str) -> int:
             continue
         break
     return index
+
+
+# ---------------------------------------------------------------------------
+# ReplaceBody
+# ---------------------------------------------------------------------------
+
+
+def _compile_replace_body(
+    action: ReplaceBody, workspace: Workspace
+) -> CompiledAction:
+    """Swap a function's body for new code; signature + decorators kept."""
+    path = action.symbol.file
+    before = workspace.read(path)
+    module = cst.parse_module(before)
+    fn = _find_function(module, action.symbol.name)
+
+    # Parse the new body as a module, then re-wrap as the function's
+    # IndentedBlock. Reject malformed input here.
+    try:
+        new_module_body = cst.parse_module(action.body)
+    except cst.ParserSyntaxError as exc:
+        raise CompileError(
+            f"ReplaceBody.body is not valid Python: {exc}"
+        ) from exc
+    if not new_module_body.body:
+        raise CompileError("ReplaceBody.body parsed to zero statements")
+
+    new_indented = cst.IndentedBlock(body=tuple(new_module_body.body))
+
+    # Idempotency: compare rendered body source.
+    if isinstance(fn.body, cst.IndentedBlock):
+        old_src = cst.Module(body=fn.body.body).code.strip()
+        new_src = cst.Module(body=new_module_body.body).code.strip()
+        if old_src == new_src:
+            return CompiledAction(
+                verb=action.verb,
+                file_changes=(
+                    FileChange(path=path, before=before, after=before, diff=""),
+                ),
+            )
+
+    new_fn = fn.with_changes(body=new_indented)
+    new_module = module.deep_replace(fn, new_fn)
+    after = new_module.code
+
+    return CompiledAction(
+        verb=action.verb,
+        file_changes=(
+            FileChange(
+                path=path,
+                before=before,
+                after=after,
+                diff=unified_diff(path=path, before=before, after=after),
+            ),
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------

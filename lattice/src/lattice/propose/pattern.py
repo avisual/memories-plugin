@@ -231,6 +231,27 @@ _PATTERNS: list[tuple[re.Pattern[str], str]] = [
         ),
         "move_symbol",
     ),
+    # 'replace the body of function FUNC [of class C] in FILE with `code`'
+    # 'rewrite function FUNC in FILE to `code`'
+    (
+        re.compile(
+            r"""
+            (?:replace\s+(?:the\s+)?body\s+of|rewrite)\s+
+            (?:function|method)\s+
+            ['"`]?(?P<func>[A-Za-z_][\w.]*)['"`]?
+            (?:\s+(?:of\s+class\s+|in\s+class\s+)
+                ['"`]?(?P<cls>[A-Za-z_]\w*)['"`]?
+            )?
+            \s+(?:in|inside)\s+
+            (?P<file>['"`]?[\w/][\w/.-]+\.py['"`]?)
+            \s+(?:with|to)\s+
+            (?P<body>`(?:.|\n)+?`)
+            \s*$
+            """,
+            re.IGNORECASE | re.VERBOSE | re.DOTALL,
+        ),
+        "replace_body",
+    ),
     # 'add a @decorator to function FUNC [of class C] in FILE'
     # 'apply @decorator to function FUNC in FILE'
     # 'decorate function FUNC in FILE with @decorator'
@@ -421,6 +442,24 @@ def task_to_action(task: str) -> Action | None:
         return MoveSymbol(
             symbol=SymbolRef(file=src_file, name=groups["name"]),
             target_file=FileRef(path=dst_file),
+            confidence=0.9,
+        )
+    if kind == "replace_body":
+        from lattice.actions import ReplaceBody
+
+        file_clean = (groups.get("file") or "").strip("'\"`")
+        func = groups["func"]
+        if groups.get("cls"):
+            func = f"{groups['cls']}.{func}"
+        body_raw = groups["body"].strip()
+        # Strip the outer backticks.
+        if body_raw.startswith("`") and body_raw.endswith("`"):
+            body_raw = body_raw[1:-1].strip("\n")
+        if not body_raw:
+            return None
+        return ReplaceBody(
+            symbol=SymbolRef(file=file_clean, name=func),
+            body=body_raw,
             confidence=0.9,
         )
     if kind == "add_parameter":

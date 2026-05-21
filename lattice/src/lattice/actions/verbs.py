@@ -263,6 +263,32 @@ class AddStatement(_Verb):
             )
 
 
+class ReplaceBody(_Verb):
+    """Replace a function or method's body with new code.
+
+    Preserves the signature (name, parameters, return type) and any
+    decorators. The body source is parsed with libcst.parse_module
+    before substitution, so invalid Python is rejected at compile
+    time.
+
+    This is the free-form-refactor escape hatch. Anything that
+    doesn't fit the typed Add/Change/Delete verbs — algorithmic
+    rewrites, control-flow restructuring, body-level bug fixes —
+    expresses cleanly here without losing the parseable-output
+    guarantee.
+
+    Example body input:
+        amount = max(0, amount)
+        return self._gateway.charge(amount)
+
+    Idempotent: a no-op when the rendered body matches verbatim.
+    """
+
+    verb: Literal["ReplaceBody"] = "ReplaceBody"
+    symbol: SymbolRef
+    body: str = Field(min_length=1, max_length=8000)
+
+
 class ChangeReturnType(_Verb):
     """Change a function or method's return type annotation.
 
