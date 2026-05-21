@@ -150,6 +150,23 @@ _PATTERNS: list[tuple[re.Pattern[str], str]] = [
         ),
         "rename",
     ),
+    # 'delete function|method|class X [of class C] [from|in] FILE'
+    # 'remove function X in FILE'
+    (
+        re.compile(
+            r"""
+            (?:delete|remove|drop)\s+(?:the\s+)?
+            (?:function|method|class)\s+
+            ['"`]?(?P<name>[A-Za-z_]\w*)['"`]?
+            (?:\s+(?:of\s+class\s+|in\s+class\s+|from\s+class\s+)
+                ['"`]?(?P<cls>[A-Za-z_]\w*)['"`]?
+            )?
+            \s+(?:in|inside|from)\s+
+            """ + _PATH,
+            re.IGNORECASE | re.VERBOSE,
+        ),
+        "delete_symbol",
+    ),
     # 'add a @decorator to function FUNC [of class C] in FILE'
     # 'apply @decorator to function FUNC in FILE'
     # 'decorate function FUNC in FILE with @decorator'
@@ -286,6 +303,16 @@ def task_to_action(task: str) -> Action | None:
         return RenameSymbol(
             symbol=SymbolRef(file=file_path, name=groups["old"]),
             new_name=groups["new"],
+            confidence=0.9,
+        )
+    if kind == "delete_symbol":
+        from lattice.actions import DeleteSymbol
+
+        name = groups["name"]
+        if groups.get("cls"):
+            name = f"{groups['cls']}.{name}"
+        return DeleteSymbol(
+            symbol=SymbolRef(file=file_path, name=name),
             confidence=0.9,
         )
     if kind == "add_parameter":

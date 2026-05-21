@@ -263,6 +263,31 @@ class AddStatement(_Verb):
             )
 
 
+class DeleteSymbol(_Verb):
+    """Delete a function, class, or method by dotted name.
+
+    For top-level symbols, removes the whole def/class. For methods
+    (dotted name 'Class.method'), removes just the method from its
+    class body — the class itself remains.
+
+    v0 scope: only deletes the definition. Does NOT walk the workspace
+    for references (that's a follow-up — RenameSymbol already has the
+    pattern, this would need a 'remove this reference too' policy).
+
+    Idempotent: returns a no-op if the symbol is already absent.
+    """
+
+    verb: Literal["DeleteSymbol"] = "DeleteSymbol"
+    symbol: SymbolRef
+    require_present: bool = Field(
+        default=True,
+        description=(
+            "If True (default), absent symbols raise SymbolNotFound. "
+            "Set False to make DeleteSymbol a soft 'ensure not present' op."
+        ),
+    )
+
+
 class AddDecorator(_Verb):
     """Apply a decorator to an existing function or class.
 

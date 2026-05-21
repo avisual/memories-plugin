@@ -107,10 +107,16 @@ Last live run on this 4-CPU box (Qwen-class models, no GPU):
 
 | Tier | Tasks | Single pass | × 3 in-process | Avg time |
 |---|---|---|---|---|
-| **pattern** (deterministic regex routing) | 8 | 8/8 | **24/24** | ~3.7s/run |
+| **pattern** (deterministic regex routing) | 15 | **15/15** | (re-run pending) | ~4s/run |
 | **llm** (slot-filling, Qwen-0.5B/1.5B two-stage) | 2 | 2/2 | **6/6** | 110–605s/run |
 | **research** (LLM emits `Research`, fetches docs, uses them) | 1 | 1/1 | not yet | ~500s |
-| **Total measured** | **11** | **11/11** | **30/30** | |
+| **Total measured** | **18** | **18/18** | **— pattern × 3 was 24/24 at 8 tasks** | |
+
+Pattern-tier task coverage: imports (plain/from/alias), rename
+cross-file, add-parameter (positional + keyword-only), add-field,
+add-decorator (function + class + method, parenthesized
+decorators), multi-step decompose, wrap-in-try, insert-at-start /
+end-of-function, delete function / method-of-class.
 
 LLM-tier breakdown (× 3):
 - `add-function-route` (AddFunction with decorator + body, Qwen-1.5B): 3/3, 547–605s

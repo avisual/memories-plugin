@@ -21,6 +21,7 @@ from lattice.actions import (
     AddStatement,
     AddTest,
     Branch,
+    DeleteSymbol,
     MarkBlocked,
     MarkDone,
     RecallMore,
@@ -65,6 +66,8 @@ def compile_action(action: Action, workspace: Workspace) -> CompiledAction:
                 return _compile_add_function(action, workspace)
             case AddDecorator():
                 return _compile_add_decorator(action, workspace)
+            case DeleteSymbol():
+                return _compile_delete_symbol(action, workspace)
             case RenameSymbol():
                 return _compile_rename_symbol(action, workspace)
             case RecallMore() | RevealBody() | MarkBlocked() | MarkDone() | Branch() | Research():
@@ -838,6 +841,94 @@ def _statement_insertion_index(module: cst.Module, position: str) -> int:
             continue
         break
     return index
+
+
+# ---------------------------------------------------------------------------
+# DeleteSymbol
+# ---------------------------------------------------------------------------
+
+
+def _compile_delete_symbol(
+    action: DeleteSymbol, workspace: Workspace
+) -> CompiledAction:
+    """Remove a function/class/method definition by dotted name."""
+    path = action.symbol.file
+    before = workspace.read(path)
+    module = cst.parse_module(before)
+
+    dotted = action.symbol.name
+
+    if "." in dotted:
+        cls_name, _, leaf = dotted.rpartition(".")
+        try:
+            cls = _find_class(module, cls_name)
+        except SymbolNotFound:
+            if action.require_present:
+                raise
+            return CompiledAction(
+                verb=action.verb,
+                file_changes=(FileChange(path=path, before=before, after=before, diff=""),),
+            )
+        body = cls.body
+        if not isinstance(body, cst.IndentedBlock):
+            raise CompileError(f"{cls_name!r} body is not an IndentedBlock")
+        kept = []
+        removed = False
+        for stmt in body.body:
+            if isinstance(stmt, (cst.FunctionDef, cst.ClassDef)) and stmt.name.value == leaf:
+                removed = True
+                continue
+            kept.append(stmt)
+        if not removed:
+            if action.require_present:
+                raise SymbolNotFound(
+                    f"DeleteSymbol could not find {dotted!r} in {path}"
+                )
+            return CompiledAction(
+                verb=action.verb,
+                file_changes=(FileChange(path=path, before=before, after=before, diff=""),),
+            )
+        if not kept:
+            # Class would become empty — leave a `pass` placeholder so it parses.
+            kept = [cst.SimpleStatementLine(body=[cst.Pass()])]
+        new_cls = cls.with_changes(body=body.with_changes(body=tuple(kept)))
+        new_module = module.deep_replace(cls, new_cls)
+    else:
+        new_body = []
+        removed = False
+        for stmt in module.body:
+            if isinstance(stmt, (cst.FunctionDef, cst.ClassDef)) and stmt.name.value == dotted:
+                removed = True
+                continue
+            new_body.append(stmt)
+        if not removed:
+            if action.require_present:
+                raise SymbolNotFound(
+                    f"DeleteSymbol could not find {dotted!r} in {path}"
+                )
+            return CompiledAction(
+                verb=action.verb,
+                file_changes=(FileChange(path=path, before=before, after=before, diff=""),),
+            )
+        new_module = module.with_changes(body=tuple(new_body))
+
+    after = new_module.code
+    if after == before:
+        return CompiledAction(
+            verb=action.verb,
+            file_changes=(FileChange(path=path, before=before, after=before, diff=""),),
+        )
+    return CompiledAction(
+        verb=action.verb,
+        file_changes=(
+            FileChange(
+                path=path,
+                before=before,
+                after=after,
+                diff=unified_diff(path=path, before=before, after=after),
+            ),
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------

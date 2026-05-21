@@ -258,6 +258,33 @@ TASKS: tuple[BenchTask, ...] = (
         },
         expects={"src/db.py": ("self._cleanup()", "def close")},
     ),
+    BenchTask(
+        name="delete-dead-function",
+        tier="pattern",
+        task="Delete function unused_helper in src/util.py",
+        files={
+            "src/util.py": (
+                "def keep() -> None:\n    pass\n\n\n"
+                "def unused_helper() -> None:\n    pass\n"
+            ),
+        },
+        expects={"src/util.py": ("def keep",)},
+        not_expects={"src/util.py": ("def unused_helper",)},
+    ),
+    BenchTask(
+        name="delete-method-of-class",
+        tier="pattern",
+        task="Remove method legacy of class API from src/api.py",
+        files={
+            "src/api.py": (
+                "class API:\n"
+                "    def current(self) -> None:\n        pass\n\n"
+                "    def legacy(self) -> None:\n        pass\n"
+            ),
+        },
+        expects={"src/api.py": ("class API:", "def current")},
+        not_expects={"src/api.py": ("def legacy",)},
+    ),
 
     # ---- Research tier: hardest; LLM must fetch web docs and apply them ----
     BenchTask(
