@@ -90,6 +90,12 @@ def _apply(args: argparse.Namespace) -> int:
             sys.stdout.write(change.diff)
             if not change.diff.endswith("\n"):
                 sys.stdout.write("\n")
+
+    if args.write:
+        from lattice.apply import write_compiled
+
+        written = write_compiled(compiled, root=args.workspace)
+        sys.stderr.write(f"wrote {len(written)} file(s)\n")
     return 0
 
 
@@ -217,6 +223,12 @@ def _propose(args: argparse.Namespace) -> int:
             sys.stdout.write("\n")
     if not report.consolidated_diffs:
         sys.stderr.write("(action was a no-op against the current workspace)\n")
+
+    if args.write and report.consolidated_diffs:
+        from lattice.apply import write_final
+
+        written = write_final(report, root=args.workspace)
+        sys.stderr.write(f"wrote {len(written)} file(s)\n")
     return 0
 
 
@@ -273,6 +285,11 @@ def main(argv: list[str] | None = None) -> int:
         default="-",
         help="Action JSON: literal string, '-' for stdin, or '@FILE' to read from a file.",
     )
+    apply_p.add_argument(
+        "--write",
+        action="store_true",
+        help="Actually write the compiled changes to disk after verify passes.",
+    )
     apply_p.set_defaults(func=_apply)
 
     intent_p = sub.add_parser(
@@ -289,6 +306,11 @@ def main(argv: list[str] | None = None) -> int:
         "--files",
         default="",
         help="Comma-separated repository-relative .py paths. Default: walk workspace.",
+    )
+    intent_p.add_argument(
+        "--write",
+        action="store_true",
+        help="Actually write the compiled changes to disk after verify passes.",
     )
     intent_p.set_defaults(func=_intent)
 
@@ -318,6 +340,11 @@ def main(argv: list[str] | None = None) -> int:
         type=int,
         default=4,
         help="Max hints to surface from the atom store (default 4).",
+    )
+    propose_p.add_argument(
+        "--write",
+        action="store_true",
+        help="Actually write the compiled changes to disk after verify passes.",
     )
     propose_p.set_defaults(func=_propose)
 
