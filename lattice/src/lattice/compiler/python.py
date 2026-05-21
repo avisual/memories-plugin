@@ -13,6 +13,7 @@ import libcst as cst
 
 from lattice.actions import (
     Action,
+    AddDecorator,
     AddField,
     AddFunction,
     AddImport,
@@ -62,6 +63,8 @@ def compile_action(action: Action, workspace: Workspace) -> CompiledAction:
                 return _compile_add_statement(action, workspace)
             case AddFunction():
                 return _compile_add_function(action, workspace)
+            case AddDecorator():
+                return _compile_add_decorator(action, workspace)
             case RenameSymbol():
                 return _compile_rename_symbol(action, workspace)
             case RecallMore() | RevealBody() | MarkBlocked() | MarkDone() | Branch() | Research():
@@ -797,6 +800,93 @@ def _statement_insertion_index(module: cst.Module, position: str) -> int:
             continue
         break
     return index
+
+
+# ---------------------------------------------------------------------------
+# AddDecorator
+# ---------------------------------------------------------------------------
+
+
+def _compile_add_decorator(
+    action: AddDecorator, workspace: Workspace
+) -> CompiledAction:
+    """Apply a decorator to an existing function or class.
+
+    `decorator` is parsed with libcst.parse_expression — anything that
+    isn't a valid Python expression is rejected at compile time.
+    Idempotent: returns a no-op when an exactly-equal decorator is
+    already present on the target.
+
+    position='outermost' (default) places the new decorator ABOVE any
+    existing ones (the typical Pythonic shape). 'innermost' places it
+    directly above the def/class.
+    """
+    path = action.symbol.file
+    before = workspace.read(path)
+    module = cst.parse_module(before)
+
+    target = _find_symbol(module, action.symbol.name)
+    if target is None or not isinstance(target, (cst.FunctionDef, cst.ClassDef)):
+        raise SymbolNotFound(
+            f"AddDecorator target must be a function or class; "
+            f"got {type(target).__name__ if target else 'nothing'} for {action.symbol.name!r}"
+        )
+
+    try:
+        decorator_expr = cst.parse_expression(action.decorator)
+    except cst.ParserSyntaxError as exc:
+        raise CompileError(
+            f"AddDecorator.decorator is not a valid expression: {exc}"
+        ) from exc
+
+    new_decorator = cst.Decorator(decorator=decorator_expr)
+    new_decorator_src = _decorator_source(new_decorator)
+
+    existing = list(target.decorators)
+    for d in existing:
+        if _decorator_source(d) == new_decorator_src:
+            return CompiledAction(
+                verb=action.verb,
+                file_changes=(FileChange(path=path, before=before, after=before, diff=""),),
+            )
+
+    if action.position == "innermost":
+        new_decorators = (*existing, new_decorator)
+    else:
+        new_decorators = (new_decorator, *existing)
+
+    new_target = target.with_changes(decorators=new_decorators)
+    new_module = module.deep_replace(target, new_target)
+    after = new_module.code
+
+    return CompiledAction(
+        verb=action.verb,
+        file_changes=(
+            FileChange(
+                path=path,
+                before=before,
+                after=after,
+                diff=unified_diff(path=path, before=before, after=after),
+            ),
+        ),
+    )
+
+
+def _decorator_source(d: cst.Decorator) -> str:
+    """Canonical-source string for a decorator (for idempotency check)."""
+    # Wrap in a dummy class body so libcst will render the decorator
+    # in context; strip the wrapper from the resulting text.
+    rendered = cst.Module(
+        body=[
+            cst.ClassDef(
+                name=cst.Name("_X"),
+                body=cst.IndentedBlock(body=[cst.SimpleStatementLine(body=[cst.Pass()])]),
+                decorators=[d],
+            )
+        ]
+    ).code
+    line = rendered.splitlines()[0].strip()
+    return line
 
 
 # ---------------------------------------------------------------------------

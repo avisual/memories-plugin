@@ -189,6 +189,42 @@ TASKS: tuple[BenchTask, ...] = (
         },
         expects={"src/io.py": ("try:", "except IOError:")},
     ),
+    BenchTask(
+        name="add-decorator-route",
+        tier="pattern",
+        task='Add @app.route("/health") decorator to function health in src/app.py',
+        files={
+            "src/app.py": (
+                "from flask import Flask\n\n\n"
+                "app = Flask(__name__)\n\n\n"
+                "def health() -> dict:\n"
+                "    return {\"ok\": True}\n"
+            ),
+        },
+        expects={"src/app.py": ('@app.route("/health")', "def health()")},
+    ),
+    BenchTask(
+        name="add-decorator-cached",
+        tier="pattern",
+        task="Add @cached decorator to function compute in src/util.py",
+        files={
+            "src/util.py": "def compute(n: int) -> int:\n    return n * n\n",
+        },
+        expects={"src/util.py": ("@cached", "def compute")},
+    ),
+    BenchTask(
+        name="decorate-with-staticmethod",
+        tier="pattern",
+        task="Decorate function from_dict of class Config in src/cfg.py with @classmethod",
+        files={
+            "src/cfg.py": (
+                "class Config:\n"
+                "    def from_dict(self, d: dict) -> 'Config':\n"
+                "        return self\n"
+            ),
+        },
+        expects={"src/cfg.py": ("@classmethod", "def from_dict")},
+    ),
 
     # ---- Research tier: hardest; LLM must fetch web docs and apply them ----
     BenchTask(

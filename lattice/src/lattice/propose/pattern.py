@@ -29,6 +29,7 @@ import re
 
 from lattice.actions import (
     Action,
+    AddDecorator,
     AddField,
     AddImport,
     AddParameter,
@@ -148,6 +149,41 @@ _PATTERNS: list[tuple[re.Pattern[str], str]] = [
         ),
         "rename",
     ),
+    # 'add a @decorator to function FUNC [of class C] in FILE'
+    # 'apply @decorator to function FUNC in FILE'
+    # 'decorate function FUNC in FILE with @decorator'
+    (
+        re.compile(
+            r"""
+            (?:
+                (?:add|apply)\s+(?:an?\s+|the\s+)?(?:@\s*)?
+                ['"`]?(?P<decorator_a>[A-Za-z_][\w.()\[\]'"=,\s/_-]*?)['"`]?
+                \s+(?:decorator\s+)?to\s+(?:function|method|class)\s+
+                ['"`]?(?P<func_a>[A-Za-z_][\w.]*)['"`]?
+                (?:\s+(?:of\s+class\s+|in\s+class\s+)
+                    ['"`]?(?P<cls_a>[A-Za-z_]\w*)['"`]?
+                )?
+                \s+(?:in|inside)\s+
+                (?P<file_a>['"`]?[\w/][\w/.-]+\.py['"`]?)
+            )
+            |
+            (?:
+                decorate\s+(?:function|method|class)\s+
+                ['"`]?(?P<func_b>[A-Za-z_][\w.]*)['"`]?
+                (?:\s+(?:of\s+class\s+|in\s+class\s+)
+                    ['"`]?(?P<cls_b>[A-Za-z_]\w*)['"`]?
+                )?
+                \s+(?:in|inside)\s+
+                (?P<file_b>['"`]?[\w/][\w/.-]+\.py['"`]?)
+                \s+with\s+(?:an?\s+|the\s+)?(?:@\s*)?
+                ['"`]?(?P<decorator_b>[A-Za-z_][\w.()\[\]'"=,\s/_-]*?)['"`]?
+            )
+            $
+            """,
+            re.IGNORECASE | re.VERBOSE,
+        ),
+        "add_decorator",
+    ),
     # 'wrap lines N-M of FILE in try/except for EXC' / 'wrap lines N to M in FILE with a try/except for EXC'
     (
         re.compile(
@@ -201,8 +237,14 @@ def task_to_action(task: str) -> Action | None:
     if matched is None:
         return None
     kind, groups = matched
-    file_path = groups["file"]
-    file_ref = FileRef(path=file_path)
+    # The decorator patterns use file_a/file_b instead of file (two
+    # alternation branches in one regex). For every other kind, 'file'
+    # is the standard group name.
+    file_path = groups.get("file") or ""
+    if file_path:
+        file_ref = FileRef(path=file_path)
+    else:
+        file_ref = None  # type: ignore[assignment]
 
     if kind == "plain_import":
         return AddImport(file=file_ref, module=groups["module"], confidence=0.95)
@@ -276,6 +318,25 @@ def task_to_action(task: str) -> Action | None:
             when=Expr(code=f"result = {leaf}()"),
             then=Expr(code="assert result is not None"),
             confidence=0.7,
+        )
+    if kind == "add_decorator":
+        # Two branches collapsed; pull whichever group fired.
+        func = groups.get("func_a") or groups.get("func_b")
+        cls = groups.get("cls_a") or groups.get("cls_b")
+        decorator = (groups.get("decorator_a") or groups.get("decorator_b") or "").strip()
+        file_match = groups.get("file_a") or groups.get("file_b") or ""
+        # Strip optional surrounding quotes the regex tolerated.
+        file_clean = file_match.strip("'\"`")
+        if not (func and decorator and file_clean):
+            return None
+        if cls:
+            func = f"{cls}.{func}"
+        # Strip a stray leading '@' if the user wrote "add @cached to ..."
+        decorator = decorator.lstrip("@").strip()
+        return AddDecorator(
+            symbol=SymbolRef(file=file_clean, name=func),
+            decorator=decorator,
+            confidence=0.9,
         )
     return None
 

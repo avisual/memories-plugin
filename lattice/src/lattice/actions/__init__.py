@@ -9,6 +9,7 @@ come from later organs (store, world_model, compiler).
 from lattice.actions.action import Action, parse_action
 from lattice.actions.refs import Expr, FileRef, IntentTag, SpanRef, SymbolRef, TypeExpr
 from lattice.actions.verbs import (
+    AddDecorator,
     AddField,
     AddFunction,
     AddImport,
@@ -27,6 +28,7 @@ from lattice.actions.verbs import (
 
 __all__ = [
     "Action",
+    "AddDecorator",
     "AddField",
     "AddFunction",
     "AddImport",

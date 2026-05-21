@@ -230,6 +230,29 @@ class AddStatement(_Verb):
     position: _INSERT_POSITION = "end"
 
 
+class AddDecorator(_Verb):
+    """Apply a decorator to an existing function or class.
+
+    Common real-world uses:
+      @app.route("/health") on a handler.
+      @cached(maxsize=100) on a pure function.
+      @classmethod / @staticmethod / @property on a method.
+      @dataclass on a class.
+
+    `decorator` is the source after the leading '@' (e.g. 'cached',
+    'app.route("/health")', 'dataclass(frozen=True)'). The leading
+    '@' is added at compile time. Parsed via libcst.parse_expression
+    before insertion so invalid syntax is rejected at compile time.
+    Idempotent: if a decorator with the exact same rendered source
+    is already on the symbol, returns a no-op.
+    """
+
+    verb: Literal["AddDecorator"] = "AddDecorator"
+    symbol: SymbolRef
+    decorator: str = Field(min_length=1, max_length=400)
+    position: Literal["outermost", "innermost"] = "outermost"
+
+
 class AddFunction(_Verb):
     """Insert a complete function definition at module level.
 

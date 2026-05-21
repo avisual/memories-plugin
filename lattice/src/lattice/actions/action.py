@@ -7,6 +7,7 @@ from typing import Annotated, Any, Union
 from pydantic import Field, TypeAdapter, ValidationError
 
 from lattice.actions.verbs import (
+    AddDecorator,
     AddField,
     AddFunction,
     AddImport,
@@ -33,6 +34,7 @@ Action = Annotated[
         AddTest,
         AddStatement,
         AddFunction,
+        AddDecorator,
         RecallMore,
         RevealBody,
         MarkBlocked,
