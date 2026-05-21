@@ -108,10 +108,15 @@ class AgentLoop:
         run_tests: bool = False,
         workspace_root: str | None = None,
         code_search: SembleCodeSearch | None = None,
+        use_brain: bool = True,
     ) -> None:
         self.proposer = proposer
         self.workspace = workspace
         self.overlay = OverlayWorkspace(workspace)
+        # When use_brain is False, the loop pretends there is no atom
+        # store from the OBSERVATION side: no priming, no recall hints,
+        # no apprentice influence. Used by the brain-effect audit to
+        # measure 'does the substrate actually pay for itself'.
         self.atom_store = atom_store
         self.max_steps = max_steps
         self._files = files
@@ -121,6 +126,7 @@ class AgentLoop:
         self._run_tests = run_tests
         self._workspace_root = workspace_root
         self._code_search = code_search
+        self._use_brain = use_brain
 
     def run(self, task: str) -> AgentTrace:
         steps: list[StepRecord] = []
@@ -454,7 +460,7 @@ class AgentLoop:
         # pattern — go FIRST in the hint list so they sit in the LLM's
         # most-attended prompt position. The heavyweight path
         # (activation patching) is documented in steer/__init__.py.
-        if self.atom_store is not None:
+        if self._use_brain and self.atom_store is not None:
             try:
                 from lattice.steer import render_priming_block, top_priming_atoms
 
@@ -479,7 +485,7 @@ class AgentLoop:
         # Recall atoms EVERY cycle, not just the first. New atoms
         # written by mid-loop Research are exactly the ones that need
         # to surface on the very next turn.
-        if self.atom_store is not None:
+        if self._use_brain and self.atom_store is not None:
             try:
                 hits = self.atom_store.recall(task, k=4)
             except Exception:

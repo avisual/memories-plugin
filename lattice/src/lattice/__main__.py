@@ -119,8 +119,11 @@ def _agent(args: argparse.Namespace) -> int:
         from lattice.propose import CompositeProposer, PatternProposer
 
         rule_based: Proposer = PatternProposer()  # type: ignore[assignment]
+        # When --no-brain is set, the apprentice never sees the store
+        # — every learned-template / boosted-trace shortcut is off.
+        apprentice_store = None if getattr(args, "no_brain", False) else atom_store
         apprentice: Proposer = ApprenticeProposer(  # type: ignore[assignment]
-            atom_store=atom_store
+            atom_store=apprentice_store
         )
 
         if args.hosted:
@@ -219,6 +222,7 @@ def _agent(args: argparse.Namespace) -> int:
             run_tests=getattr(args, "tests", False),
             workspace_root=args.workspace,
             code_search=code_search,
+            use_brain=not getattr(args, "no_brain", False),
         )
         trace = loop.run(args.task)
 
@@ -321,6 +325,7 @@ def _do(args: argparse.Namespace) -> int:
         types=args.types,
         tests=args.tests,
         semble=args.semble,
+        no_brain=args.no_brain,
         write=not args.no_write,
     )
     return _agent(agent_ns)
@@ -726,6 +731,8 @@ def main(argv: list[str] | None = None) -> int:
     do_p.add_argument("--types", action="store_true")
     do_p.add_argument("--tests", action="store_true",
                       help="Run pytest on the affected tests after each edit.")
+    do_p.add_argument("--no-brain", action="store_true",
+                      help="Disable brain influence (audit mode).")
     do_p.add_argument(
         "--decompose",
         action="store_true",
@@ -830,6 +837,15 @@ def main(argv: list[str] | None = None) -> int:
             "Run pytest on the affected tests in a sandbox after each "
             "candidate edit. Reject edits that break tests. Requires "
             "pytest to be installed (already a [dev] dep)."
+        ),
+    )
+    agent_p.add_argument(
+        "--no-brain",
+        action="store_true",
+        help=(
+            "Disable brain influence on the loop (no priming block, no "
+            "recall hints in the observation, no apprentice candidates). "
+            "Used by the audit to measure 'does the substrate pay for itself'."
         ),
     )
     agent_p.add_argument(
