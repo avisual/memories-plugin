@@ -27,6 +27,7 @@ classifiers = [
 dependencies = [
     "pydantic>=2.9",
     "libcst>=1.5",
+    "numpy>=2.0",
 ]
 
 [project.optional-dependencies]
@@ -39,6 +40,7 @@ llm = [
     "torch>=2.5",
     "transformers>=4.46",
     "accelerate>=1.0",
+    "sentence-transformers>=3.2",
 ]
 
 [build-system]

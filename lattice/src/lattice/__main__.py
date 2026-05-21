@@ -96,6 +96,51 @@ def _apply(args: argparse.Namespace) -> int:
 _intent_adapter: TypeAdapter[Intent] = TypeAdapter(Intent)
 
 
+def _atom_add(args: argparse.Namespace) -> int:
+    from lattice.atoms import AtomType, SQLiteAtomStore
+
+    try:
+        atom_type = AtomType(args.type)
+    except ValueError:
+        sys.stderr.write(
+            f"unknown atom type {args.type!r}; valid: {', '.join(t.value for t in AtomType)}\n"
+        )
+        return 2
+
+    tags = tuple(t.strip() for t in args.tags.split(",") if t.strip())
+    store = SQLiteAtomStore(args.db)
+    try:
+        atom = store.add(
+            args.content,
+            type=atom_type,
+            region=args.region,
+            tags=tags,
+            importance=args.importance,
+        )
+    finally:
+        store.close()
+    sys.stdout.write(f"added atom id={atom.id} type={atom.type.value}\n")
+    return 0
+
+
+def _atom_recall(args: argparse.Namespace) -> int:
+    from lattice.atoms import SQLiteAtomStore
+
+    store = SQLiteAtomStore(args.db)
+    try:
+        results = store.recall(args.query, k=args.k)
+    finally:
+        store.close()
+    if not results:
+        sys.stderr.write("(no atoms recalled)\n")
+        return 0
+    for r in results:
+        sys.stdout.write(
+            f"[{r.score:.3f}] {r.atom.type.value:<12} {r.atom.content}\n"
+        )
+    return 0
+
+
 def _propose(args: argparse.Namespace) -> int:
     from lattice.orchestrator import execute_plan
     from lattice.propose import ObservationContext
@@ -110,7 +155,36 @@ def _propose(args: argparse.Namespace) -> int:
     )
     symbols = walk_workspace(workspace, files)
 
-    obs = ObservationContext(task=args.task, symbols=tuple(symbols[:30]))
+    hints: tuple[str, ...] = ()
+    if args.atom_db:
+        from lattice.atoms import AtomType, SQLiteAtomStore
+
+        store = SQLiteAtomStore(args.atom_db)
+        try:
+            results = store.recall(args.task, k=args.hint_count)
+            antipattern_results = store.recall(
+                args.task, k=2, types=(AtomType.ANTIPATTERN,)
+            )
+        finally:
+            store.close()
+
+        hint_list: list[str] = []
+        for res in antipattern_results:
+            hint_list.append(f"antipattern (score {res.score:.2f}): {res.atom.content}")
+        seen = {r.atom.id for r in antipattern_results}
+        for res in results:
+            if res.atom.id in seen:
+                continue
+            hint_list.append(
+                f"{res.atom.type.value} (score {res.score:.2f}): {res.atom.content}"
+            )
+        hints = tuple(hint_list[: args.hint_count])
+        if hints:
+            sys.stderr.write(f"recalled {len(hints)} hint(s) from atom store\n")
+
+    obs = ObservationContext(
+        task=args.task, symbols=tuple(symbols[:30]), hints=hints
+    )
     sys.stderr.write(f"loading model{(' ' + args.model) if args.model else ''}...\n")
     proposer = LocalLLMProposer(model_name=args.model) if args.model else LocalLLMProposer()
 
@@ -234,7 +308,38 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="HuggingFace model name. Default: Qwen/Qwen2.5-0.5B-Instruct (~500MB, CPU).",
     )
+    propose_p.add_argument(
+        "--atom-db",
+        default=None,
+        help="Path to a lattice atom store; relevant atoms become hints to the LLM.",
+    )
+    propose_p.add_argument(
+        "--hint-count",
+        type=int,
+        default=4,
+        help="Max hints to surface from the atom store (default 4).",
+    )
     propose_p.set_defaults(func=_propose)
+
+    atom_p = sub.add_parser("atom", help="Manage the lattice atom store.")
+    atom_sub = atom_p.add_subparsers(dest="atom_cmd", required=True)
+
+    add_p = atom_sub.add_parser("add", help="Add an atom to the store.")
+    add_p.add_argument("--db", required=True, help="Atom-store DB path.")
+    add_p.add_argument("--content", required=True)
+    add_p.add_argument(
+        "--type", default="fact", help="Atom type (fact|experience|skill|antipattern|...)"
+    )
+    add_p.add_argument("--region", default="")
+    add_p.add_argument("--tags", default="", help="Comma-separated tags.")
+    add_p.add_argument("--importance", type=float, default=0.5)
+    add_p.set_defaults(func=_atom_add)
+
+    recall_p = atom_sub.add_parser("recall", help="Recall atoms matching a query.")
+    recall_p.add_argument("--db", required=True, help="Atom-store DB path.")
+    recall_p.add_argument("--query", required=True)
+    recall_p.add_argument("--k", type=int, default=5)
+    recall_p.set_defaults(func=_atom_recall)
 
     args = parser.parse_args(argv)
     return args.func(args)

@@ -57,8 +57,15 @@ What runs today:
 - **CLI**: `apply` (single action), `intent` (multi-action
   expansion), `propose` (local-LLM-driven).
 
-Not yet: world model, steering, lattice store integration,
-apprentice, evolution, interface surfaces beyond the CLI.
+Plus a minimal lattice-native atom store (Organ 1, v0):
+- SQLite-backed; embeddings via `sentence-transformers/all-MiniLM-L6-v2`
+  (~90MB, CPU). Same conceptual taxonomy as memories-plugin
+  (fact/experience/skill/antipattern/...). Wired into `propose`'s
+  Observation so recalls become typed hints to the LLM.
+- CLI: `lattice atom add` / `lattice atom recall`.
+
+Not yet: world model, activation steering, full memories-plugin
+integration, apprentice, evolution, interface surfaces beyond the CLI.
 
 ## Try it
 
@@ -143,6 +150,45 @@ load to verified diff. The LLM never sees source code as text; it
 sees a typed Observation (task + Symbol list) and emits one typed
 Action; the harness handles compile + verify. Override the model
 with `--model HuggingFace/name` or `LATTICE_LLM_MODEL`.
+
+### With recall (hints from the atom store)
+
+A local SQLite-backed atom store (MiniLM embeddings, ~90MB, CPU)
+provides relevant past experience and antipatterns as hints in the
+Observation. Same loop, smarter decisions.
+
+```bash
+# Seed the store with project context.
+uv run python -m lattice atom add --db /tmp/demo/atoms.db \
+  --type experience \
+  --content "Use 'stripe' for charges; the project standardizes on Stripe."
+
+uv run python -m lattice atom add --db /tmp/demo/atoms.db \
+  --type antipattern \
+  --content "Don't import network libraries at module top level in payment files."
+
+# Now ask vaguely — the recall surfaces 'stripe' as the standard.
+uv run python -m lattice propose /tmp/demo \
+  --task "Add the payment library dependency to src/payments/charge.py." \
+  --atom-db /tmp/demo/atoms.db
+```
+
+```
+recalled 3 hint(s) from atom store
+loading model...
+proposed action:
+  {"verb":"AddImport","file":{"path":"src/payments/charge.py"},
+   "module":"stripe", ...}
+--- a/src/payments/charge.py
++++ b/src/payments/charge.py
+@@ -1,4 +1,5 @@
+ """Charge processing."""
++import stripe
+```
+
+The small model picked `stripe` because the hint surfaced the project
+convention. This is what makes LATTICE *LATTICE* — the substrate
+informs every decision, no retraining required.
 
 ## Layout
 
