@@ -778,6 +778,104 @@ def test_multi_step_plan_accumulates_brain_atoms_across_cycles(tmp_path):
     store.close()
 
 
+def test_brain_accumulates_then_boosts_repeat_run(tmp_path):
+    """End-to-end Hebbian learning loop: same task run twice on the
+    SAME brain DB. Run 1 writes a SKILL atom. Run 2 finds it via
+    brain_score with a positive delta — the brain has actually
+    learned from the first run and pays for itself on the second.
+
+    This is the architectural claim the user kept pressing on. Each
+    of the earlier tests covered ONE wire of the loop in isolation;
+    this one drives the full circle:
+      1. cycle picks candidate
+      2. _record_step_outcome writes SKILL with verb tag
+      3. SAME task run again
+      4. brain_score recalls the SKILL, returns +delta + contributor
+      5. winner's brain_ids stash the SKILL for reinforcement
+      6. reinforcement bumps its importance
+    """
+    from lattice.compiler import DictWorkspace
+
+    base_files = {"src/main.py": "def main() -> None:\n    pass\n"}
+    store = _store(tmp_path)
+
+    # ---- Run 1: brain has no data, candidate wins on confidence alone.
+    proposer1 = MockProposer(
+        batches=[
+            [AddImport(file=FileRef(path="src/main.py"), module="json", confidence=0.9)],
+            [MarkDone(summary="done", confidence=0.9)],
+        ]
+    )
+    loop1 = AgentLoop(
+        proposer=proposer1,
+        workspace=DictWorkspace(dict(base_files)),
+        atom_store=store,
+        use_brain=True,
+    )
+    trace1 = loop1.run("add an import of json to src/main.py")
+    assert trace1.ok
+
+    # Confirm exactly one SKILL atom was written in region='steps'
+    # tagged with the AddImport verb (the wiring contract).
+    hits_after_run1 = store.recall("verb=AddImport", k=10, region="steps")
+    skills_v1 = [
+        h for h in hits_after_run1
+        if h.atom.type == AtomType.SKILL and "AddImport" in (h.atom.tags or ())
+    ]
+    assert len(skills_v1) >= 1, "run 1 should have written a SKILL atom"
+    initial_importance = skills_v1[0].atom.importance
+
+    # ---- Run 2: SAME brain DB, SAME task. brain_score should fire.
+    action = AddImport(file=FileRef(path="src/main.py"), module="json", confidence=0.9)
+    loop2 = AgentLoop(
+        proposer=MockProposer.empty(),
+        workspace=DictWorkspace(dict(base_files)),
+        atom_store=store,
+        use_brain=True,
+    )
+    # Direct call — we want to inspect the brain_score output, not the
+    # whole loop's outcome.
+    loop2._active_task = "add an import of json to src/main.py"
+    delta, contributors = loop2._brain_score(
+        action, "add an import of json to src/main.py"
+    )
+    assert delta > 0.0, (
+        f"expected positive delta from run-1's SKILL atom; got {delta}"
+    )
+    assert contributors, "expected SKILL atom IDs returned for reinforcement"
+
+    # ---- Run 2 full execution: the boost should reinforce the SKILL.
+    proposer2 = MockProposer(
+        batches=[
+            [AddImport(file=FileRef(path="src/main.py"), module="json", confidence=0.9)],
+            [MarkDone(summary="done", confidence=0.9)],
+        ]
+    )
+    loop_run2 = AgentLoop(
+        proposer=proposer2,
+        workspace=DictWorkspace(dict(base_files)),
+        atom_store=store,
+        use_brain=True,
+    )
+    loop_run2.run("add an import of json to src/main.py")
+
+    # The run-1 atom's importance should have been bumped by the +0.05
+    # success reinforcement in run 2. Also a new SKILL was written for
+    # run 2 (idempotent — same content, different created_at). The
+    # ORIGINAL atom's importance now > initial.
+    hits_after_run2 = store.recall("verb=AddImport", k=10, region="steps")
+    same_atom_after = next(
+        (h for h in hits_after_run2 if h.atom.id == skills_v1[0].atom.id),
+        None,
+    )
+    assert same_atom_after is not None
+    assert same_atom_after.atom.importance > initial_importance, (
+        f"expected importance bump from {initial_importance} after run 2; "
+        f"got {same_atom_after.atom.importance}"
+    )
+    store.close()
+
+
 def test_brain_score_filters_by_verb_tag(tmp_path):
     """An atom written for verb X does NOT score a candidate of verb Y.
 
