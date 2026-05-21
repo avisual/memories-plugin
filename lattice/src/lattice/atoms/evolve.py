@@ -211,24 +211,29 @@ def discover(
 class LearnedTemplate:
     """A regex-shaped pattern inferred from N successful traces.
 
-    The pattern's capture groups map to JSON-paths in the recorded
-    action, so applying the template to a new matching task substitutes
-    the new task's captures into the right slots.
+    The regex's capture groups map to JSON-paths in the recorded
+    action chain, so applying the template to a new matching task
+    substitutes the new task's captures into every step.
 
     Fields:
     - task_regex: compiled regex matching the task-text shape; named
       groups 'c0', 'c1', ... carry the variable parts.
-    - action_template: the recorded action dict with placeholder
-      strings `__LATTICE_CAPTURE_N__` substituted into the fields
-      that varied across samples.
-    - signature: the verb sequence (today single-verb only).
-    - sample_count: how many traces contributed.
+    - action_template: the FIRST step of the chain (legacy single-
+      action view). For single-action templates, this is the whole
+      learned action.
+    - action_template_chain: the full ordered chain of action
+      templates (1+). Multi-action templates store all steps here so
+      ApprenticeProposer can emit each step as a separate candidate.
+    - signature: the verb sequence (e.g. ('AddImport',) or
+      ('Research', 'AddImport', 'AddStatement')).
+    - sample_count: how many traces contributed to the inference.
     """
 
     task_regex: "re.Pattern[str]"  # forward-ref-free at runtime
     action_template: dict
     signature: tuple[str, ...]
     sample_count: int
+    action_template_chain: tuple[dict, ...] = ()
 
 
 def _tokenize(task: str) -> list[str]:
@@ -261,14 +266,17 @@ def infer_template(traces: list[dict]) -> LearnedTemplate | None:
     Returns None when traces don't agree well enough to template:
     - Fewer than 2 samples.
     - Task token-counts differ across samples.
-    - More than one action recorded per trace (v0 is single-action).
-    - No string field in the action dict tracks any task capture.
+    - Action sequences differ in length / verb order across samples.
+    - No string field in any action dict tracks any task capture.
 
-    The honest scope: this v0 handles single-action sequences where
-    task words map directly to action string fields (the AddImport /
-    AddParameter / AddField families). It does NOT yet handle multi-
-    action sequences or non-string slots (ints, booleans, nested
-    typed exprs); those land in a follow-up.
+    Handles single-action AND multi-action sequences:
+    - Single-action: action_template is the substituted action dict;
+      action_template_chain is just [action_template].
+    - Multi-action (e.g. AddImport → AddStatement): every step is
+      substituted; action_template_chain holds the whole sequence in
+      order. ApprenticeProposer emits each step as a separate
+      candidate and the agent loop's pre-flight picks whichever isn't
+      yet a no-op against the overlay.
     """
     if len(traces) < 2:
         return None
@@ -278,7 +286,7 @@ def infer_template(traces: list[dict]) -> LearnedTemplate | None:
         return None
     token_count = len(tokens_per_sample[0])
     if any(len(toks) != token_count for toks in tokens_per_sample):
-        return None  # variable-length tasks — v0 punts
+        return None
 
     # Identify capture positions (tokens that vary across samples).
     capture_positions: list[int] = []
@@ -292,76 +300,98 @@ def infer_template(traces: list[dict]) -> LearnedTemplate | None:
             capture_positions.append(i)
             pattern_parts.append(f"(?P<c{cap_idx}>\\S+)")
     if not capture_positions:
-        return None  # all-constant tasks aren't worth templating
+        return None
     task_regex = re.compile(r"^" + r"\s+".join(pattern_parts) + r"$")
 
-    # Recover capture values per sample, then align to action string slots.
     captures_per_sample: list[list[str]] = [
         [toks[pos] for pos in capture_positions]
         for toks in tokens_per_sample
     ]
 
-    # Use the FIRST trace's action as the template skeleton; require all
-    # traces to have exactly one action AND the same verb.
-    actions_first = traces[0].get("actions") or []
-    if len(actions_first) != 1 or not isinstance(actions_first[0], dict):
+    # Require all traces to have the same action-sequence shape.
+    action_lists = [tr.get("actions") or [] for tr in traces]
+    seq_len = len(action_lists[0])
+    if seq_len < 1:
         return None
-    base_action = json.loads(json.dumps(actions_first[0]))  # deep copy
-    base_verb = base_action.get("verb")
-    for tr in traces[1:]:
-        acts = tr.get("actions") or []
-        if len(acts) != 1 or not isinstance(acts[0], dict):
-            return None
-        if acts[0].get("verb") != base_verb:
-            return None
+    if any(len(al) != seq_len for al in action_lists):
+        return None
+    if any(not all(isinstance(a, dict) for a in al) for al in action_lists):
+        return None
+    verbs_per_step = [
+        [al[i].get("verb") for al in action_lists] for i in range(seq_len)
+    ]
+    if any(any(v != vs[0] for v in vs) for vs in verbs_per_step):
+        return None
+    signature = tuple(vs[0] or "?" for vs in verbs_per_step)
 
-    # For each string field in the base action, check whether its value
-    # changes across samples; if so, find which capture index has the
-    # same value at that sample index and substitute a placeholder.
-    string_field_paths = list(_walk_string_fields(base_action))
-    substitution_made = False
-    for path, _value in string_field_paths:
-        values_at_path: list[str] = []
-        for tr in traces:
-            cur = tr["actions"][0]
-            for step in path:
-                cur = cur[step]
-            values_at_path.append(cur)
-        if all(v == values_at_path[0] for v in values_at_path):
-            continue
-        # Find which capture column matches these values across samples.
-        for cap_i in range(len(capture_positions)):
-            if [c[cap_i] for c in captures_per_sample] == values_at_path:
-                _set_at_path(base_action, path, f"__LATTICE_CAPTURE_{cap_i}__")
-                substitution_made = True
-                break
+    # Per-step substitution: walk every step's string fields, find the
+    # capture column whose values match across samples.
+    chain: list[dict] = []
+    any_substitution = False
+    for step_i in range(seq_len):
+        base_step = json.loads(json.dumps(action_lists[0][step_i]))
+        for path, _value in list(_walk_string_fields(base_step)):
+            values_at_path: list[str] = []
+            for tr_actions in action_lists:
+                cur = tr_actions[step_i]
+                for step in path:
+                    cur = cur[step]
+                values_at_path.append(cur)
+            if all(v == values_at_path[0] for v in values_at_path):
+                continue
+            for cap_i in range(len(capture_positions)):
+                if [c[cap_i] for c in captures_per_sample] == values_at_path:
+                    _set_at_path(base_step, path, f"__LATTICE_CAPTURE_{cap_i}__")
+                    any_substitution = True
+                    break
+        chain.append(base_step)
 
-    if not substitution_made:
-        return None  # no learnable mapping
+    if not any_substitution:
+        return None
 
     return LearnedTemplate(
         task_regex=task_regex,
-        action_template=base_action,
-        signature=(base_verb or "?",),
+        action_template=chain[0],  # legacy single-action view
+        action_template_chain=tuple(chain),
+        signature=signature,
         sample_count=len(traces),
     )
 
 
 def apply_template(template: LearnedTemplate, task: str) -> dict | None:
-    """If *task* matches the template, return the substituted action dict."""
+    """If *task* matches the template, return the substituted FIRST action.
+
+    For multi-action templates, this returns step 0 only — convenience
+    for single-action callers. Use apply_template_chain to get the
+    whole chain.
+    """
+    chain = apply_template_chain(template, task)
+    return chain[0] if chain else None
+
+
+def apply_template_chain(template: LearnedTemplate, task: str) -> list[dict]:
+    """If *task* matches the template, return every step's substituted action.
+
+    Returns [] on no match. For single-action templates, returns a
+    one-element list; for multi-action, the full chain in order.
+    """
     match = template.task_regex.match(task)
     if not match:
-        return None
-    out = json.loads(json.dumps(template.action_template))  # deep copy
-    for cap_i in range(len(match.groupdict())):
-        key = f"c{cap_i}"
-        if key not in match.groupdict():
-            continue
-        cap_value = match.group(key)
-        for path, value in list(_walk_string_fields(out)):
-            if value == f"__LATTICE_CAPTURE_{cap_i}__":
-                _set_at_path(out, path, cap_value)
-    return out
+        return []
+    chain_in = template.action_template_chain or (template.action_template,)
+    out_chain: list[dict] = []
+    captures = match.groupdict()
+    for step_template in chain_in:
+        out = json.loads(json.dumps(step_template))
+        for cap_key, cap_value in captures.items():
+            if cap_value is None:
+                continue
+            for path, value in list(_walk_string_fields(out)):
+                # placeholder format: __LATTICE_CAPTURE_<n>__
+                if value == f"__LATTICE_CAPTURE_{cap_key[1:]}__":
+                    _set_at_path(out, path, cap_value)
+        out_chain.append(out)
+    return out_chain
 
 
 def learned_templates(store: AtomStore, *, min_recurrence: int = 3) -> list[LearnedTemplate]:

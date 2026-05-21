@@ -82,33 +82,35 @@ class ApprenticeProposer:
             pass
         try:
             from lattice.actions import parse_action
-            from lattice.atoms.evolve import apply_template, learned_templates
+            from lattice.atoms.evolve import apply_template_chain, learned_templates
 
             for tmpl in learned_templates(
                 self.atom_store, min_recurrence=2
             ):
-                # Skip templates that come from un-boosted traces. A
-                # template MUST also be importance-boosted to fire — the
-                # gate is 'lattice has lived through this pattern enough
-                # to commit to it'.
                 if tmpl.sample_count < 2:
                     continue
-                substituted = apply_template(tmpl, obs.task)
-                if substituted is None:
+                substituted_chain = apply_template_chain(tmpl, obs.task)
+                if not substituted_chain:
                     continue
-                try:
-                    action = parse_action(substituted)
-                except Exception:  # noqa: BLE001
-                    continue
-                dump = action.model_dump_json()
-                if dump in seen_dumps:
-                    continue
-                seen_dumps.add(dump)
-                actions.append(action)
-                if len(actions) >= n:
-                    return actions
+                # Emit EVERY step in the chain as a candidate. The
+                # orchestrator's pre-flight scorer picks whichever step
+                # isn't yet a no-op against the overlay — that's how
+                # multi-action templates drive across multiple cycles:
+                # cycle 1 picks step 0 (only one that isn't no-op);
+                # cycle 2 picks step 1 (step 0 is now no-op); etc.
+                for substituted in substituted_chain:
+                    try:
+                        action = parse_action(substituted)
+                    except Exception:  # noqa: BLE001
+                        continue
+                    dump = action.model_dump_json()
+                    if dump in seen_dumps:
+                        continue
+                    seen_dumps.add(dump)
+                    actions.append(action)
+                    if len(actions) >= n:
+                        return actions
         except Exception:  # noqa: BLE001
-            # Template path is best-effort; fall through to recall.
             pass
 
         # RECALL PATH (legacy): nearest-neighbour trace replay. Useful

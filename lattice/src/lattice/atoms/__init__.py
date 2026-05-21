@@ -18,6 +18,7 @@ from lattice.atoms.evolve import (
     LearnedTemplate,
     MacroCandidate,
     apply_template,
+    apply_template_chain,
     boost_recurrent_traces,
     discover,
     infer_template,

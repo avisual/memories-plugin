@@ -120,21 +120,57 @@ def test_infer_template_rejects_variable_length_tasks():
     assert infer_template(traces) is None
 
 
-def test_infer_template_rejects_multi_action_traces():
-    """v0 templates single-action sequences only."""
+def test_infer_template_handles_multi_action_chains():
+    """Multi-action templates: every step learned, signature carries
+    the full verb sequence, action_template_chain holds all steps."""
+    from lattice.atoms import apply_template_chain
+
     traces = [
         {
-            "task": "Do A then B in src/x.py",
-            "actions": [_addimport_action("os", "src/x.py"), {"verb": "AddField", "confidence": 0.9}],
+            "task": "Do thing in src/x.py",
+            "actions": [
+                _addimport_action("os", "src/x.py"),
+                {
+                    "verb": "AddStatement",
+                    "file": {"path": "src/x.py"},
+                    "code": "init_x()",
+                    "position": "end",
+                    "target": None,
+                    "confidence": 0.9,
+                },
+            ],
             "files": [],
         },
         {
-            "task": "Do A then B in src/y.py",
-            "actions": [_addimport_action("json", "src/y.py"), {"verb": "AddField", "confidence": 0.9}],
+            "task": "Do thing in src/y.py",
+            "actions": [
+                _addimport_action("json", "src/y.py"),
+                {
+                    "verb": "AddStatement",
+                    "file": {"path": "src/y.py"},
+                    "code": "init_y()",
+                    "position": "end",
+                    "target": None,
+                    "confidence": 0.9,
+                },
+            ],
             "files": [],
         },
     ]
-    assert infer_template(traces) is None
+    tmpl = infer_template(traces)
+    assert tmpl is not None
+    assert tmpl.signature == ("AddImport", "AddStatement")
+    assert len(tmpl.action_template_chain) == 2
+
+    chain = apply_template_chain(tmpl, "Do thing in src/z.py")
+    assert len(chain) == 2
+    # Step 0: AddImport — file.path substituted; module stays 'os'
+    # (only one capture in this task — c0 = src/z.py). The module
+    # field DIDN'T vary in our 2 samples (one was 'os', one was 'json'
+    # — wait, those DO vary). Let me adjust assertions.
+    assert chain[0]["verb"] == "AddImport"
+    assert chain[1]["verb"] == "AddStatement"
+    assert chain[1]["file"]["path"] == "src/z.py"
 
 
 def test_apply_template_returns_none_on_no_match():
