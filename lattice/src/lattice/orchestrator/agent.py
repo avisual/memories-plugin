@@ -48,7 +48,12 @@ from lattice.compiler.errors import NonMutatingAction
 from lattice.propose import ObservationContext, Proposer
 from lattice.sense import Symbol, walk_workspace
 from lattice.sense.semble_search import SembleCodeSearch
-from lattice.verify import SyntacticOutcome, verify_syntactic, verify_types
+from lattice.verify import (
+    SyntacticOutcome,
+    verify_syntactic,
+    verify_tests,
+    verify_types,
+)
 
 
 class StepRecord(BaseModel):
@@ -100,6 +105,8 @@ class AgentLoop:
         noop_streak_limit: int = 2,
         preflight_candidates: int = 3,
         type_check: bool = False,
+        run_tests: bool = False,
+        workspace_root: str | None = None,
         code_search: SembleCodeSearch | None = None,
     ) -> None:
         self.proposer = proposer
@@ -111,6 +118,8 @@ class AgentLoop:
         self._noop_streak_limit = noop_streak_limit
         self._preflight_candidates = preflight_candidates
         self._type_check = type_check
+        self._run_tests = run_tests
+        self._workspace_root = workspace_root
         self._code_search = code_search
 
     def run(self, task: str) -> AgentTrace:
@@ -339,6 +348,23 @@ class AgentLoop:
                         verify=outcome,
                         error="type-check failed: "
                         + "; ".join(f"{p}: {m}" for p, m in type_outcome.errors[:3]),
+                    ),
+                    False,
+                    "",
+                )
+        if self._run_tests and self._workspace_root is not None:
+            test_outcome = verify_tests(
+                compiled, workspace_root=self._workspace_root
+            )
+            if not test_outcome.ok and not test_outcome.skipped:
+                return (
+                    StepRecord(
+                        step=step_idx,
+                        action=action,
+                        kind="error",
+                        verify=outcome,
+                        error="tests failed: "
+                        + "; ".join(f"{t}: {m}" for t, m in test_outcome.errors[:3]),
                     ),
                     False,
                     "",

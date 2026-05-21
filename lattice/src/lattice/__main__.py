@@ -216,6 +216,8 @@ def _agent(args: argparse.Namespace) -> int:
             atom_store=atom_store,
             max_steps=args.max_steps,
             type_check=args.types,
+            run_tests=getattr(args, "tests", False),
+            workspace_root=args.workspace,
             code_search=code_search,
         )
         trace = loop.run(args.task)
@@ -317,6 +319,7 @@ def _do(args: argparse.Namespace) -> int:
         two_stage=args.two_stage,
         executor_model=args.executor_model,
         types=args.types,
+        tests=args.tests,
         semble=args.semble,
         write=not args.no_write,
     )
@@ -721,6 +724,8 @@ def main(argv: list[str] | None = None) -> int:
                       help="Planner+Executor split (recommended for sub-1.5B models).")
     do_p.add_argument("--executor-model", default=None)
     do_p.add_argument("--types", action="store_true")
+    do_p.add_argument("--tests", action="store_true",
+                      help="Run pytest on the affected tests after each edit.")
     do_p.add_argument(
         "--decompose",
         action="store_true",
@@ -816,6 +821,15 @@ def main(argv: list[str] | None = None) -> int:
             "Run mypy against each candidate edit's after-content; reject "
             "edits that introduce type errors. Requires the [typecheck] "
             "extras."
+        ),
+    )
+    agent_p.add_argument(
+        "--tests",
+        action="store_true",
+        help=(
+            "Run pytest on the affected tests in a sandbox after each "
+            "candidate edit. Reject edits that break tests. Requires "
+            "pytest to be installed (already a [dev] dep)."
         ),
     )
     agent_p.add_argument(
