@@ -18,6 +18,7 @@ from lattice.actions.verbs import (
     MarkDone,
     RecallMore,
     RenameSymbol,
+    Research,
     RevealBody,
     WrapInTry,
 )
@@ -36,6 +37,7 @@ __all__ = [
     "MarkDone",
     "RecallMore",
     "RenameSymbol",
+    "Research",
     "RevealBody",
     "SpanRef",
     "SymbolRef",

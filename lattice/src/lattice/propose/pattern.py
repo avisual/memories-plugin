@@ -297,13 +297,35 @@ class CompositeProposer:
 
     Used by the agent CLI to try fast deterministic rules first, then
     fall through to the LLM for anything the rules don't cover.
+
+    When the task is complex enough that the LLM should drive
+    (e.g. mentions external libraries, multi-step language,
+    'using X'), the composite SKIPS the pattern proposer so the LLM
+    isn't deprived of a chance to research or compose.
     """
+
+    _LLM_FIRST_HINTS = (
+        " using ", " via ", " with ",  # 'add CORS using flask-cors'
+        " how ", "?",                   # 'how do I ...'
+        " refactor", " optimize", " implement",
+        "research", "look up", "fetch",
+    )
 
     def __init__(self, proposers: list[Proposer]) -> None:
         self._proposers = proposers
 
     def propose(self, obs: ObservationContext, n: int = 1) -> list[Action]:
-        for p in self._proposers:
+        ordered = self._proposers
+        task_lower = obs.task.lower()
+        if any(h in task_lower for h in self._LLM_FIRST_HINTS):
+            # Put non-pattern proposers first when the task screams 'reasoning'.
+            from lattice.propose.pattern import PatternProposer
+
+            llm_first = [p for p in ordered if not isinstance(p, PatternProposer)]
+            patterns = [p for p in ordered if isinstance(p, PatternProposer)]
+            ordered = llm_first + patterns
+
+        for p in ordered:
             out = p.propose(obs, n=n)
             if out:
                 return out

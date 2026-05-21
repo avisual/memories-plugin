@@ -17,6 +17,7 @@ never touched.
 from __future__ import annotations
 
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -69,7 +70,7 @@ def verify_types(
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(change.after, encoding="utf-8")
 
-        cmd = ["python", "-m", "mypy", "--no-incremental", "--no-error-summary"]
+        cmd = [sys.executable, "-m", "mypy", "--no-incremental", "--no-error-summary"]
         if strict:
             cmd.append("--strict")
         else:

@@ -66,6 +66,10 @@ RevealBody — {"verb":"RevealBody","symbol":{"file":"src/x.py","name":"func"},"
 MarkBlocked — {"verb":"MarkBlocked","reason_code":"missing_context","detail":"need to see User model","confidence":0.6}
 MarkDone — {"verb":"MarkDone","summary":"added stripe import","confidence":0.9}
 Branch — {"verb":"Branch","rationale":"try alternative approach","confidence":0.5}
+Research — fetch a documentation URL into the brain at runtime.
+  {"verb":"Research","url":"https://flask-cors.readthedocs.io/en/latest/","reason":"need exact Flask-CORS init pattern","confidence":0.7}
+  Use when the task mentions a library/API the brain doesn't already know.
+  Next cycle's HINTS will include the fetched content.
 
 Rules:
 - Emit ONE JSON object on a single line.

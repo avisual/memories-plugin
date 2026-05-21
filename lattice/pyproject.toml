@@ -29,6 +29,7 @@ dependencies = [
     "pydantic>=2.9",
     "libcst>=1.5",
     "numpy>=2.0",
+    "curl-cffi>=0.7",
 ]
 
 [project.optional-dependencies]

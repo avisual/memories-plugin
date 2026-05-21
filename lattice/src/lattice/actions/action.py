@@ -16,6 +16,7 @@ from lattice.actions.verbs import (
     MarkDone,
     RecallMore,
     RenameSymbol,
+    Research,
     RevealBody,
     WrapInTry,
 )
@@ -33,6 +34,7 @@ Action = Annotated[
         MarkBlocked,
         MarkDone,
         Branch,
+        Research,
     ],
     Field(discriminator="verb"),
 ]

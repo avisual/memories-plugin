@@ -34,6 +34,7 @@ from lattice.actions import (
     MarkBlocked,
     MarkDone,
     RecallMore,
+    Research,
     RevealBody,
 )
 from lattice.compiler import (
@@ -258,6 +259,13 @@ class AgentLoop:
                 False,
                 "",
             )
+        if isinstance(action, Research):
+            payload = self._research(action.url, action.reason)
+            return (
+                StepRecord(step=step_idx, action=action, kind="research", payload=payload),
+                False,
+                "",
+            )
 
         # Mutating path.
         try:
@@ -432,6 +440,47 @@ class AgentLoop:
                 snippet = "\n".join(lines[i : i + 12])
                 return f"{file}:{i + 1}\n{snippet}"
         return f"(symbol {dotted_name!r} not found in {file})"
+
+    def _research(self, url: str, reason: str) -> str:
+        """Fetch *url* via curl-cffi, store the cleaned text as a fact atom,
+        and return a short payload string that next-turn hint rendering
+        will surface to the LLM. The atom carries the URL as a tag so
+        the brain can re-fetch / dedup on subsequent runs.
+        """
+        try:
+            from lattice.atoms.web import WebFetchError, fetch_url
+        except ImportError as exc:
+            return f"(web fetch unavailable: {exc})"
+        try:
+            page = fetch_url(url)
+        except WebFetchError as exc:
+            return f"(fetch failed: {exc})"
+
+        snippet = page.text[:2000]
+        content = (
+            f"Fetched from {page.final_url} (status {page.status})"
+            + (f" — title: {page.title}" if page.title else "")
+            + f"\n\n{snippet}"
+        )
+
+        if self.atom_store is not None:
+            try:
+                from lattice.atoms import AtomType
+
+                self.atom_store.add(
+                    content,
+                    type=AtomType.FACT,
+                    region="research",
+                    tags=("web", url),
+                    importance=0.75,
+                )
+            except Exception:  # noqa: BLE001
+                pass
+
+        return (
+            f"researched {page.final_url} ({reason}); "
+            f"top excerpt: {snippet[:240].replace(chr(10), ' ')}"
+        )
 
 
 def _summarize_diff(diff: str) -> str:

@@ -200,3 +200,35 @@ class MarkDone(_Verb):
 
     verb: Literal["MarkDone"] = "MarkDone"
     summary: str = Field(min_length=1, max_length=280)
+
+
+_HTTP_URL_RE = re.compile(r"^https?://[^\s<>\"']+$", re.IGNORECASE)
+
+
+class Research(_Verb):
+    """Fetch a URL into the brain as an atom — the LLM learns at runtime.
+
+    The harness fetches the URL with browser-impersonating HTTP, strips
+    HTML to a readable extract, and stores it as a fact atom tagged
+    with the URL so future recall surfaces it. The next cycle sees the
+    fetched knowledge in the observation context.
+
+    Use this when the task references a library/API/pattern the brain
+    doesn't already know about. SSRF-guarded: localhost / private
+    networks are rejected at fetch time.
+    """
+
+    verb: Literal["Research"] = "Research"
+    url: str = Field(min_length=8, max_length=2048)
+    reason: str = Field(
+        min_length=1,
+        max_length=200,
+        description="One short sentence: why does the agent need this URL?",
+    )
+
+    @field_validator("url")
+    @classmethod
+    def _http_url(cls, v: str) -> str:
+        if not _HTTP_URL_RE.match(v):
+            raise ValueError("url must start with http:// or https://")
+        return v

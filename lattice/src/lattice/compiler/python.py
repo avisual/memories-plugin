@@ -22,6 +22,7 @@ from lattice.actions import (
     MarkDone,
     RecallMore,
     RenameSymbol,
+    Research,
     RevealBody,
     WrapInTry,
 )
@@ -57,7 +58,7 @@ def compile_action(action: Action, workspace: Workspace) -> CompiledAction:
                 return _compile_add_test(action, workspace)
             case RenameSymbol():
                 return _compile_rename_symbol(action, workspace)
-            case RecallMore() | RevealBody() | MarkBlocked() | MarkDone() | Branch():
+            case RecallMore() | RevealBody() | MarkBlocked() | MarkDone() | Branch() | Research():
                 raise NonMutatingAction(
                     f"{action.verb!r} does not produce file changes; "
                     "the orchestrator handles it directly"
