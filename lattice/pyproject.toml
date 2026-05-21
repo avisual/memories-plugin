@@ -50,6 +50,9 @@ hosted = [
 typecheck = [
     "mypy>=1.13",
 ]
+search = [
+    "semble>=0.2",
+]
 
 [project.scripts]
 lattice = "lattice.__main__:main"

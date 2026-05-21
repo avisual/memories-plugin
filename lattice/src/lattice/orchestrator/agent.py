@@ -47,6 +47,7 @@ from lattice.compiler.diff import unified_diff
 from lattice.compiler.errors import NonMutatingAction
 from lattice.propose import ObservationContext, Proposer
 from lattice.sense import Symbol, walk_workspace
+from lattice.sense.semble_search import SembleCodeSearch
 from lattice.verify import SyntacticOutcome, verify_syntactic, verify_types
 
 
@@ -99,6 +100,7 @@ class AgentLoop:
         noop_streak_limit: int = 2,
         preflight_candidates: int = 3,
         type_check: bool = False,
+        code_search: SembleCodeSearch | None = None,
     ) -> None:
         self.proposer = proposer
         self.workspace = workspace
@@ -109,6 +111,7 @@ class AgentLoop:
         self._noop_streak_limit = noop_streak_limit
         self._preflight_candidates = preflight_candidates
         self._type_check = type_check
+        self._code_search = code_search
 
     def run(self, task: str) -> AgentTrace:
         steps: list[StepRecord] = []
@@ -400,6 +403,18 @@ class AgentLoop:
             for r in hits:
                 hints.append(
                     f"{r.atom.type.value} (score {r.score:.2f}): {r.atom.content[:600]}"
+                )
+
+        # Semble code-search: per-task, focused chunks rather than the
+        # whole symbol list. Same per-cycle cadence as atom recall.
+        if self._code_search is not None:
+            try:
+                chunks = self._code_search.search(task, top_k=3)
+            except Exception:
+                chunks = []
+            for c in chunks:
+                hints.append(
+                    f"CODE {c.file}:{c.start_line}-{c.end_line}\n{c.content[:300]}"
                 )
 
         for step in steps[-6:]:

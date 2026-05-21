@@ -193,12 +193,23 @@ def _agent(args: argparse.Namespace) -> int:
                     sys.stderr.write("recorded experience atom\n")
             return 0 if report.ok else 1
 
+        code_search = None
+        if getattr(args, "semble", False):
+            from lattice.sense.semble_search import maybe_code_search
+
+            code_search = maybe_code_search(args.workspace)
+            if code_search is None:
+                sys.stderr.write(
+                    "warning: --semble requested but semble not importable; continuing without it\n"
+                )
+
         loop = AgentLoop(
             proposer=proposer,
             workspace=workspace,
             atom_store=atom_store,
             max_steps=args.max_steps,
             type_check=args.types,
+            code_search=code_search,
         )
         trace = loop.run(args.task)
 
@@ -299,6 +310,7 @@ def _do(args: argparse.Namespace) -> int:
         two_stage=args.two_stage,
         executor_model=args.executor_model,
         types=args.types,
+        semble=args.semble,
         write=not args.no_write,
     )
     return _agent(agent_ns)
@@ -673,6 +685,11 @@ def main(argv: list[str] | None = None) -> int:
         default="",
         help="Pipe-separated subtasks; overrides --decompose.",
     )
+    do_p.add_argument(
+        "--semble",
+        action="store_true",
+        help="Use Semble for task-relevant code search.",
+    )
     do_p.add_argument("--write", action="store_true", help="Default for `do`: ON. Use --no-write to dry-run.")
     do_p.add_argument("--no-write", action="store_true")
     do_p.set_defaults(func=_do)
@@ -736,6 +753,15 @@ def main(argv: list[str] | None = None) -> int:
         "--executor-model",
         default=None,
         help="Optional second model name for the Executor stage (otherwise the same as --model).",
+    )
+    agent_p.add_argument(
+        "--semble",
+        action="store_true",
+        help=(
+            "Use Semble (fast Model2Vec+BM25 code search) to surface "
+            "task-relevant code chunks in the observation. Requires "
+            "the [search] extras."
+        ),
     )
     agent_p.add_argument(
         "--types",
