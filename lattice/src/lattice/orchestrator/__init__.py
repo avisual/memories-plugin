@@ -17,6 +17,8 @@ from lattice.orchestrator.intent import (
     Intent,
     expand_intent,
 )
+from lattice.orchestrator.multi import MultiSubtaskReport, run_subtasks
+from lattice.orchestrator.planner import decompose
 from lattice.orchestrator.run import ExecutionReport, execute_plan
 
 __all__ = [
@@ -25,7 +27,10 @@ __all__ = [
     "AgentTrace",
     "ExecutionReport",
     "Intent",
+    "MultiSubtaskReport",
     "StepRecord",
+    "decompose",
     "execute_plan",
     "expand_intent",
+    "run_subtasks",
 ]

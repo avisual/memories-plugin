@@ -74,19 +74,35 @@ Plus a multi-step **agent loop** (Organ 6 stub, linear v0):
 - CLI: `lattice agent <workspace> --task "..." [--atom-db DB]
   [--max-steps N] [--model NAME] [--write]`.
 
+### The stack-machine model
+
+The LLM never plans. The harness is the fetch-decode-execute cycle;
+the LLM is the instruction emitter. Each turn:
+
+1. Observe (typed: code subgraph + atom hints + recent history).
+2. LLM emits **one** typed Action.
+3. Pre-flight simulates against the overlay.
+4. Compiler produces the diff; verify parses it.
+5. If the next instruction would be a no-op, the goal of the current
+   subtask is observably met → harness advances the program counter.
+
+This means a small (0.5B) model can complete real multi-step tasks
+because it doesn't have to remember what's already done — it just
+answers "what's the next single instruction?" each cycle. The
+observable state advances the loop.
+
 ### What's been observed live on this CPU
 
-- **Single-step propose+compile+verify+diff:** Qwen2.5-0.5B-Instruct
-  produces a valid action from a structured Observation in ~7 seconds.
-  With recall hints, picks project-specific values (e.g. `stripe`
-  when the project standardizes on it). Solid.
-- **Multi-step planning:** at this scale (0.5B and 1.5B Qwen), the
-  model gets the first step right but tends to repeat itself rather
-  than tracking what's already done. The harness detects this and
-  terminates with `stuck`, so the first real edit ships and the loop
-  doesn't spin. Multi-step quality unlocks with either a bigger model
-  or the unbuilt LATTICE organs (population search and an apprentice
-  trained on successful traces — both in DESIGN.md).
+- **Single-step:** Qwen2.5-0.5B-Instruct produces a valid action from
+  a structured Observation in ~7 seconds. With recall hints, picks
+  project-specific values (e.g. `stripe` when the project
+  standardizes on it).
+- **Multi-step via planner-executor split:** caller supplies subtasks
+  (or `--decompose` deterministically splits on conjunctions), the
+  harness runs one agent loop per subtask with a shared overlay.
+  Two-edit task ("add stripe import; add dry_run keyword-only
+  parameter") completed end-to-end by Qwen2.5-0.5B on CPU. Final
+  diff applied both edits in one consolidated unified diff.
 
 Not yet: world model, activation steering, population search,
 apprentice (Organ 8), evolution (Organ 9), full memories-plugin

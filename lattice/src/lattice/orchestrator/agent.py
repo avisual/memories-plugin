@@ -52,12 +52,17 @@ from lattice.verify import SyntacticOutcome, verify_syntactic
 class StepRecord(BaseModel):
     model_config = ConfigDict(frozen=True, arbitrary_types_allowed=True)
     step: int
-    action: Action
+    action: Action | None = None  # None when the proposer itself raised before emitting
     kind: str  # "edit" | "blocked" | "done" | "recall" | "reveal" | "branch" | "error"
+    verb: str = ""
     verify: SyntacticOutcome | None = None
     diff: str = ""
     error: str = ""
-    payload: str = ""  # recall results / revealed source / branch rationale
+    payload: str = ""
+
+    def model_post_init(self, __context) -> None:  # type: ignore[override]
+        if not self.verb and self.action is not None:
+            object.__setattr__(self, "verb", self.action.verb)
 
 
 class AgentTrace(BaseModel):
@@ -114,8 +119,9 @@ class AgentLoop:
                 steps.append(
                     StepRecord(
                         step=step_idx,
-                        action=_NullAction(),  # type: ignore[arg-type]
+                        action=None,
                         kind="error",
+                        verb="proposer",
                         error=f"proposer raised: {exc}",
                     )
                 )
@@ -309,8 +315,8 @@ class AgentLoop:
         if len(recent) < limit:
             return False
         tail = recent[-limit:]
-        verb = tail[0].action.verb
-        if not all(s.action.verb == verb for s in tail):
+        verb = tail[0].verb
+        if not all(s.verb == verb for s in tail):
             return False
         return all(
             s.kind == "error"
@@ -333,7 +339,7 @@ class AgentLoop:
                 hints.append(f"{r.atom.type.value} (score {r.score:.2f}): {r.atom.content}")
 
         for step in steps[-6:]:
-            line = f"step {step.step} [{step.kind}] {step.action.verb}"
+            line = f"step {step.step} [{step.kind}] {step.verb}"
             if step.kind == "edit":
                 summary = _summarize_diff(step.diff)
                 line += f" -> {summary}"
@@ -387,13 +393,6 @@ class AgentLoop:
                 snippet = "\n".join(lines[i : i + 12])
                 return f"{file}:{i + 1}\n{snippet}"
         return f"(symbol {dotted_name!r} not found in {file})"
-
-
-class _NullAction:
-    """Placeholder used when proposer itself raised — never compiled."""
-
-    verb = "_NULL_"
-    confidence = 0.0
 
 
 def _summarize_diff(diff: str) -> str:

@@ -104,7 +104,7 @@ _intent_adapter: TypeAdapter[Intent] = TypeAdapter(Intent)
 
 def _agent(args: argparse.Namespace) -> int:
     from lattice.atoms import SQLiteAtomStore
-    from lattice.orchestrator import AgentLoop
+    from lattice.orchestrator import AgentLoop, decompose, run_subtasks
     from lattice.propose.local import LocalLLMProposer
 
     workspace = FilesystemWorkspace(args.workspace)
@@ -116,6 +116,43 @@ def _agent(args: argparse.Namespace) -> int:
             if args.model
             else LocalLLMProposer()
         )
+
+        if args.subtasks:
+            subtasks = [s.strip() for s in args.subtasks.split("|") if s.strip()]
+        elif args.decompose:
+            subtasks = decompose(args.task)
+        else:
+            subtasks = []
+
+        if subtasks:
+            sys.stderr.write(f"running {len(subtasks)} subtask(s):\n")
+            for i, st in enumerate(subtasks, 1):
+                sys.stderr.write(f"  [{i}] {st}\n")
+            report = run_subtasks(
+                subtasks,
+                proposer=proposer,
+                workspace=workspace,
+                atom_store=atom_store,
+                max_steps_per_subtask=args.max_steps,
+            )
+            sys.stderr.write(f"\nterminated_by={report.terminated_by}\n")
+            for i, trace in enumerate(report.traces, 1):
+                sys.stderr.write(f"  subtask {i}: {trace.terminated_by}\n")
+                for step in trace.steps:
+                    sys.stderr.write(
+                        f"    step {step.step} [{step.kind}] {step.verb}\n"
+                    )
+            for diff in report.consolidated_diffs:
+                sys.stdout.write(diff)
+                if not diff.endswith("\n"):
+                    sys.stdout.write("\n")
+            if args.write and report.final_files:
+                from lattice.apply import write_final
+
+                written = write_final(report, root=args.workspace)
+                sys.stderr.write(f"wrote {len(written)} file(s)\n")
+            return 0 if report.ok else 1
+
         loop = AgentLoop(
             proposer=proposer,
             workspace=workspace,
@@ -130,7 +167,7 @@ def _agent(args: argparse.Namespace) -> int:
     sys.stderr.write(f"\nterminated_by={trace.terminated_by}\n")
     for step in trace.steps:
         sys.stderr.write(
-            f"  step {step.step} [{step.kind}] {step.action.verb}"
+            f"  step {step.step} [{step.kind}] {step.verb}"
             + (f" :: {step.error[:120]}" if step.error else "")
             + (f" :: {step.payload[:120]}" if step.payload else "")
             + "\n"
@@ -411,6 +448,22 @@ def main(argv: list[str] | None = None) -> int:
         help="HuggingFace model name. Default: Qwen/Qwen2.5-0.5B-Instruct.",
     )
     agent_p.add_argument("--max-steps", type=int, default=6)
+    agent_p.add_argument(
+        "--subtasks",
+        default="",
+        help=(
+            "Pipe-separated list of subtasks. When set, the agent runs once "
+            "per subtask with shared state. Overrides --decompose."
+        ),
+    )
+    agent_p.add_argument(
+        "--decompose",
+        action="store_true",
+        help=(
+            "Deterministically split --task on conjunctions (then / ; / "
+            "numbered lists) and run one agent loop per subtask."
+        ),
+    )
     agent_p.add_argument(
         "--write",
         action="store_true",
