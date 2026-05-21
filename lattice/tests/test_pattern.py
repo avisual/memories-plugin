@@ -74,6 +74,61 @@ class TestRename:
         assert a.symbol.file == "src/billing.py"
 
 
+class TestAddParameter:
+    def test_function_with_class(self):
+        from lattice.actions import AddParameter
+
+        a = task_to_action(
+            "Add a keyword-only parameter named timeout of type float to function get of class Client in src/api.py"
+        )
+        assert isinstance(a, AddParameter)
+        assert a.function.name == "Client.get"
+        assert a.name == "timeout"
+        assert a.type.expr == "float"
+        assert a.keyword_only is True
+
+    def test_function_module_level(self):
+        from lattice.actions import AddParameter
+
+        a = task_to_action("Add a parameter user_id of type str to function login in src/auth.py")
+        assert isinstance(a, AddParameter)
+        assert a.function.name == "login"
+        assert a.name == "user_id"
+        assert a.keyword_only is False
+
+    def test_with_default(self):
+        from lattice.actions import AddParameter
+
+        a = task_to_action(
+            "Add a parameter retries of type int with default 3 to function call_api in src/x.py"
+        )
+        assert isinstance(a, AddParameter)
+        assert a.default.code == "3"
+        assert a.type.expr == "int"
+
+
+class TestAddField:
+    def test_basic(self):
+        from lattice.actions import AddField
+
+        a = task_to_action(
+            "Add a field version of type str with default 1.0 to class Config in src/config.py"
+        )
+        assert isinstance(a, AddField)
+        assert a.cls.name == "Config"
+        assert a.name == "version"
+        assert a.type.expr == "str"
+
+    def test_attribute_synonym(self):
+        from lattice.actions import AddField
+
+        a = task_to_action(
+            "Add an attribute api_key of type str to class Client in src/api.py"
+        )
+        assert isinstance(a, AddField)
+        assert a.name == "api_key"
+
+
 class TestNonMatches:
     def test_unrelated_task(self):
         assert task_to_action("Refactor the whole codebase") is None

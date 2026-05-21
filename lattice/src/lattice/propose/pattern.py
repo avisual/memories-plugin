@@ -47,6 +47,49 @@ _LEAF = r"['\"`]?[A-Za-z_]\w*['\"`]?"
 
 
 _PATTERNS: list[tuple[re.Pattern[str], str]] = [
+    # 'add a keyword-only parameter <NAME> of type <T> [with default <D>] to function <DOTTED> in <FILE>'
+    (
+        re.compile(
+            r"""
+            add\s+(?:an?\s+)?(?P<kw>keyword[\s-]only\s+)?
+            parameter\s+(?:named\s+|called\s+)?
+            ['"`]?(?P<name>[A-Za-z_]\w*)['"`]?
+            \s+of\s+type\s+
+            ['"`]?(?P<typ>[A-Za-z_][\w\[\].,\s|]*?)['"`]?
+            (?:\s+(?:with\s+)?defaul[tT]\s+
+                ['"`]?(?P<default>[^'"`\s,;]+)['"`]?
+            )?
+            \s+to\s+(?:function|method)\s+
+            ['"`]?(?P<func>[A-Za-z_][\w.]*)['"`]?
+            (?:\s+(?:of\s+class\s+|in\s+class\s+)
+                ['"`]?(?P<cls>[A-Za-z_]\w*)['"`]?
+            )?
+            \s+(?:in|inside)\s+
+            """ + _PATH,
+            re.IGNORECASE | re.VERBOSE,
+        ),
+        "add_parameter",
+    ),
+    # 'add a field <NAME> of type <T> [with default <D>] to class <X> in <FILE>'
+    (
+        re.compile(
+            r"""
+            add\s+(?:an?\s+)?
+            (?:(?P<typ_pre>[A-Za-z_][\w\[\].,\s|]*?)\s+)?
+            (?:field|attribute)\s+(?:named\s+|called\s+)?
+            ['"`]?(?P<name>[A-Za-z_]\w*)['"`]?
+            (?:\s+of\s+type\s+['"`]?(?P<typ>[A-Za-z_][\w\[\].,\s|]*?)['"`]?)?
+            (?:\s+(?:with\s+)?defaul[tT]\s+
+                ['"`]?(?P<default>[^'"`\s,;]+)['"`]?
+            )?
+            \s+to\s+(?:class\s+)?
+            ['"`]?(?P<cls>[A-Za-z_]\w*)['"`]?
+            \s+(?:in|inside)\s+
+            """ + _PATH,
+            re.IGNORECASE | re.VERBOSE,
+        ),
+        "add_field",
+    ),
     # 'add an import of <X> from <Y> to <FILE>' / 'import X from Y in FILE'
     (
         re.compile(
@@ -142,6 +185,31 @@ def task_to_action(task: str) -> Action | None:
         return RenameSymbol(
             symbol=SymbolRef(file=file_path, name=groups["old"]),
             new_name=groups["new"],
+            confidence=0.9,
+        )
+    if kind == "add_parameter":
+        func = groups["func"]
+        if groups.get("cls"):
+            func = f"{groups['cls']}.{func}"
+        default = groups.get("default")
+        return AddParameter(
+            function=SymbolRef(file=file_path, name=func),
+            name=groups["name"],
+            type=TypeExpr(expr=groups["typ"].strip()),
+            default=Expr(code=default) if default else None,
+            keyword_only=bool(groups.get("kw")),
+            confidence=0.9,
+        )
+    if kind == "add_field":
+        typ_str = (groups.get("typ") or groups.get("typ_pre") or "").strip()
+        if not typ_str:
+            return None
+        default = groups.get("default")
+        return AddField(
+            cls=SymbolRef(file=file_path, name=groups["cls"]),
+            name=groups["name"],
+            type=TypeExpr(expr=typ_str),
+            default=Expr(code=default) if default else None,
             confidence=0.9,
         )
     return None
