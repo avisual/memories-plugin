@@ -271,6 +271,99 @@ def test_preflight_picks_non_noop_from_candidate_batch():
     assert "*, dry_run: bool" in final
 
 
+def test_verify_failure_surfaces_as_fix_required_hint():
+    """When a candidate fails verify, the next observation MUST carry
+    a FIX REQUIRED block describing what broke. This is the self-
+    correction promise of Phase 3."""
+    from lattice.actions import AddParameter, MarkDone, SymbolRef, TypeExpr
+    from lattice.orchestrator.agent import _format_failure_hint
+    from lattice.propose.base import ObservationContext
+
+    # Hand-craft a step that looks like a verify failure to test the
+    # rendering directly. (Full end-to-end via a real verify_tests
+    # invocation is tested in test_verify_tests.py.)
+    from lattice.orchestrator.agent import StepRecord
+
+    failed = StepRecord(
+        step=1,
+        action=AddParameter(
+            function=SymbolRef(file="src/foo.py", name="charge"),
+            name="amount",
+            type=TypeExpr(expr="int"),
+            confidence=0.9,
+        ),
+        kind="error",
+        verb="AddParameter",
+        error="tests failed: tests/test_foo.py::test_charge: AssertionError: expected 100 got 0",
+    )
+    block = _format_failure_hint(failed)
+
+    assert "FIX REQUIRED" in block
+    assert "AddParameter" in block
+    assert "tests failed" in block
+    assert "AssertionError" in block
+    assert "MarkBlocked" in block  # explicit escape hatch mentioned
+
+
+def test_failure_hint_skipped_when_no_error():
+    """No error -> no FIX REQUIRED block; the hint list stays clean."""
+    from lattice.orchestrator.agent import StepRecord, _format_failure_hint
+
+    success = StepRecord(
+        step=1,
+        action=None,
+        verb="MarkDone",
+        kind="done",
+        payload="task complete",
+    )
+    assert _format_failure_hint(success) == ""
+
+
+def test_failure_hint_is_lifted_to_first_hint_position():
+    """The agent's observation builder MUST put FIX REQUIRED at the
+    top of the hint list so the LLM lands on it first.
+    """
+    from lattice.actions import AddImport, FileRef
+    from lattice.compiler.workspace import DictWorkspace
+    from lattice.orchestrator import AgentLoop
+    from lattice.propose.base import ObservationContext
+    from lattice.propose.mock import MockProposer
+
+    # Simulate a loop that ran one failing step. We can't easily
+    # construct that via MockProposer's deterministic path because the
+    # apprentice path requires the failure to actually arise from
+    # verify; instead, build the loop, manually inject a fake error
+    # step, then call the observation builder.
+    ws = DictWorkspace({"src/a.py": "def f(): pass\n"})
+    loop = AgentLoop(proposer=MockProposer.empty(), workspace=ws)
+
+    from lattice.orchestrator.agent import StepRecord
+
+    fake_failure = StepRecord(
+        step=1,
+        action=AddImport(
+            file=FileRef(path="src/a.py"), module="bogus", confidence=0.9
+        ),
+        kind="error",
+        verb="AddImport",
+        error="parse failed in src/a.py: invalid syntax at line 3",
+    )
+    obs = loop._build_observation("any task", [fake_failure])
+
+    # The FIX REQUIRED block must be present AND must come before any
+    # 'recall' / 'CODE' / history hints.
+    fix_idx = next(
+        (i for i, h in enumerate(obs.hints) if h.startswith("FIX REQUIRED")),
+        None,
+    )
+    assert fix_idx is not None, f"FIX REQUIRED not found in {obs.hints!r}"
+
+    # Other hints (history step lines) come AFTER.
+    for i, h in enumerate(obs.hints):
+        if h.startswith("step ") and "[error]" in h:
+            assert fix_idx < i, "FIX REQUIRED should precede the history line"
+
+
 def test_branch_is_noop_in_linear_loop():
     proposer = MockProposer(
         batches=[

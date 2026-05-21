@@ -438,6 +438,17 @@ class AgentLoop:
         symbols = self._gather_symbols()
         hints: list[str] = []
 
+        # VERIFY-FAILURE FEEDBACK (Phase 3): when the last step was an
+        # error from verify (parse / type / tests), surface it as the
+        # FIRST hint — top of the prompt, hard to miss. The model
+        # sees what broke and the exact action that caused it, so the
+        # next propose call is a real self-correction attempt rather
+        # than a blind retry.
+        if steps and steps[-1].kind == "error" and steps[-1].error:
+            failure_block = _format_failure_hint(steps[-1])
+            if failure_block:
+                hints.append(failure_block)
+
         # STEER (Organ 4, lightweight v0): high-importance atoms — those
         # EVOLVE has boosted because the system has lived through their
         # pattern — go FIRST in the hint list so they sit in the LLM's
@@ -588,6 +599,53 @@ class AgentLoop:
             f"researched {page.final_url} ({reason}); "
             f"top excerpt: {snippet[:240].replace(chr(10), ' ')}"
         )
+
+
+def _format_failure_hint(step: "StepRecord") -> str:
+    """Render the previous step's failure as a 'FIX REQUIRED' block.
+
+    The block sits at the head of the hints list so it lands in the
+    LLM's most-attended position. Includes:
+      - what was attempted (verb + key slot values from the action)
+      - the actual error message (parse / type / test failure)
+      - an explicit directive that the next action must AVOID this
+        failure mode.
+
+    Empty when the step has no error string.
+    """
+    if not step.error:
+        return ""
+    verb = step.verb or "?"
+    action_summary = ""
+    if step.action is not None:
+        try:
+            dump = step.action.model_dump(mode="json")
+            slots = {k: v for k, v in dump.items() if k not in {"verb", "confidence"}}
+            action_summary = "; ".join(
+                f"{k}={_compact_value(v)}" for k, v in slots.items()
+            )
+        except Exception:  # noqa: BLE001
+            action_summary = ""
+
+    lines = [
+        "FIX REQUIRED — your previous attempt failed verification.",
+        f"  attempted: {verb}" + (f" ({action_summary})" if action_summary else ""),
+        f"  failed because: {step.error[:600]}",
+        "Your next action MUST address this failure — pick a different "
+        "approach, fix the broken slot value, or emit MarkBlocked if you "
+        "cannot proceed.",
+    ]
+    return "\n".join(lines)
+
+
+def _compact_value(v) -> str:
+    """One-line repr of a slot value for the failure hint."""
+    if isinstance(v, dict):
+        return "{" + ",".join(f"{k}:{_compact_value(val)}" for k, val in v.items()) + "}"
+    if isinstance(v, list):
+        return "[" + ",".join(_compact_value(x) for x in v) + "]"
+    s = str(v)
+    return s if len(s) <= 60 else s[:57] + "..."
 
 
 def _count_diff_added_lines(diff: str) -> int:
