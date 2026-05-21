@@ -166,16 +166,22 @@ class AgentLoop:
     # ----- pre-flight: simulate before commit -----
 
     def _propose_with_preflight(self, obs: ObservationContext) -> Action | None:
-        """Ask the proposer for N candidates; pick the first non-no-op edit.
+        """POPULATION (Organ 6, v0): score all N candidates, pick the best.
 
-        Pre-flight uses the real compiler against the current overlay so
-        the predicted outcome matches what would actually happen. This
-        is the v0 'world model': for mutating verbs, simulate cheaply
-        before commit. Non-mutating verbs (MarkDone/MarkBlocked/recall)
-        pass through unchanged — there's nothing to simulate.
+        Asks the proposer for N candidates, simulates each via the real
+        compiler against the current overlay (the v0 'world model'),
+        scores them by a composite (non-no-op + lines-changed + confidence),
+        returns the highest-scoring action.
 
-        Falls back to the first proposed action if every candidate is a
-        no-op (so the loop's stuck detector still has signal to break).
+        Earlier this method picked the FIRST non-no-op candidate; the
+        beam-style version below uses all signals so a low-confidence
+        large-diff candidate can be passed over for a high-confidence
+        precise one. Non-mutating verbs (MarkDone/Branch/Research)
+        bypass scoring — they're not edits and the world model has
+        nothing to simulate; they're returned with their confidence.
+
+        Falls back to the first candidate if scoring rejects everything
+        (so the loop's stuck detector still has signal to break).
         """
         import os
         import sys
@@ -190,17 +196,42 @@ class AgentLoop:
         if not actions:
             return None
 
+        scored: list[tuple[float, Action, str]] = []
         for action in actions:
             if not self._is_mutating(action):
-                return action
+                # Non-mutating: score by confidence only.
+                conf = float(getattr(action, "confidence", 0.5))
+                scored.append((conf, action, "non-mutating"))
+                continue
             try:
                 compiled = compile_action(action, self.overlay)
-            except (CompileError, NonMutatingAction):
-                return action  # let _handle_action surface the error
-            if not compiled.is_noop:
-                return action
+            except (CompileError, NonMutatingAction) as exc:
+                # Compile errors get a tiny positive score so they can
+                # still be picked if every candidate failed — the agent
+                # loop will surface them as errors and learn from them.
+                scored.append((0.01, action, f"compile-error: {exc}"))
+                continue
+            if compiled.is_noop:
+                scored.append((0.05, action, "no-op"))
+                continue
+            # Composite: confidence + lines-changed bonus (capped).
+            conf = float(getattr(action, "confidence", 0.5))
+            lines_changed = sum(
+                _count_diff_added_lines(c.diff)
+                for c in compiled.file_changes
+                if not c.is_noop
+            )
+            change_bonus = min(0.3, 0.02 * lines_changed)
+            score = conf + change_bonus + 1.0  # +1.0 ensures real edits beat no-ops
+            scored.append((score, action, f"score=conf{conf:.2f}+lines{lines_changed}"))
 
-        return actions[0]
+        if os.environ.get("LATTICE_LLM_DEBUG"):
+            for s, a, note in scored:
+                sys.stderr.write(f"  candidate {a.verb} score={s:.2f} ({note})\n")
+
+        # Highest score wins; stable order on ties.
+        scored.sort(key=lambda t: -t[0])
+        return scored[0][1] if scored else actions[0]
 
     @staticmethod
     def _is_mutating(action: Action) -> bool:
@@ -515,6 +546,17 @@ class AgentLoop:
             f"researched {page.final_url} ({reason}); "
             f"top excerpt: {snippet[:240].replace(chr(10), ' ')}"
         )
+
+
+def _count_diff_added_lines(diff: str) -> int:
+    """Count '+' (added) lines in a unified diff, skipping the header."""
+    if not diff:
+        return 0
+    n = 0
+    for line in diff.splitlines():
+        if line.startswith("+") and not line.startswith("+++"):
+            n += 1
+    return n
 
 
 def _summarize_diff(diff: str) -> str:
