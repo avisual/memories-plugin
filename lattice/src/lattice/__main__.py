@@ -240,6 +240,70 @@ def _atom_add(args: argparse.Namespace) -> int:
     return 0
 
 
+def _brain_inspect(args: argparse.Namespace) -> int:
+    from lattice.atoms import SQLiteAtomStore
+
+    store = SQLiteAtomStore(args.db)
+    try:
+        results = store.recall(args.task, k=args.k)
+    finally:
+        store.close()
+
+    if not results:
+        sys.stderr.write("(no atoms recalled)\n")
+        return 0
+    sys.stdout.write(f"brain hints for task: {args.task!r}\n")
+    for r in results:
+        sys.stdout.write(
+            f"  [{r.score:.3f}] {r.atom.type.value:<12} {r.atom.region:<18} {r.atom.content}\n"
+        )
+    return 0
+
+
+def _brain_dump(args: argparse.Namespace) -> int:
+    from lattice.atoms import SQLiteAtomStore, stats
+
+    store = SQLiteAtomStore(args.db)
+    try:
+        layout = stats(store)
+        total = store.count()
+    finally:
+        store.close()
+
+    sys.stdout.write(f"brain contains {total} atom(s)\n")
+    for region, counts in sorted(layout.items()):
+        region_total = sum(counts.values())
+        label = region or "(no region)"
+        sys.stdout.write(f"  {label}: {region_total}\n")
+        for atype, count in sorted(counts.items()):
+            sys.stdout.write(f"    - {atype}: {count}\n")
+    return 0
+
+
+def _brain_import(args: argparse.Namespace) -> int:
+    from lattice.atoms import SQLiteAtomStore, import_atoms
+
+    store = SQLiteAtomStore(args.db)
+    try:
+        added = import_atoms(store, args.file)
+    finally:
+        store.close()
+    sys.stdout.write(f"imported {added} atom(s) from {args.file}\n")
+    return 0
+
+
+def _brain_export(args: argparse.Namespace) -> int:
+    from lattice.atoms import SQLiteAtomStore, export_atoms
+
+    store = SQLiteAtomStore(args.db)
+    try:
+        count = export_atoms(store, args.file)
+    finally:
+        store.close()
+    sys.stdout.write(f"exported {count} atom(s) to {args.file}\n")
+    return 0
+
+
 def _atom_seed(args: argparse.Namespace) -> int:
     from lattice.atoms import SQLiteAtomStore, seed_store
 
@@ -535,6 +599,37 @@ def main(argv: list[str] | None = None) -> int:
     )
     seed_p.add_argument("--db", required=True, help="Atom-store DB path.")
     seed_p.set_defaults(func=_atom_seed)
+
+    brain_p = sub.add_parser("brain", help="Inspect and curate the lattice atom store.")
+    brain_sub = brain_p.add_subparsers(dest="brain_cmd", required=True)
+
+    inspect_p = brain_sub.add_parser(
+        "inspect",
+        help="Show what hints the brain would surface for a given task.",
+    )
+    inspect_p.add_argument("--db", required=True)
+    inspect_p.add_argument("--task", required=True)
+    inspect_p.add_argument("--k", type=int, default=6)
+    inspect_p.set_defaults(func=_brain_inspect)
+
+    dump_p = brain_sub.add_parser("dump", help="Group atoms by region and type.")
+    dump_p.add_argument("--db", required=True)
+    dump_p.set_defaults(func=_brain_dump)
+
+    import_p = brain_sub.add_parser(
+        "import",
+        help="Load atoms from a JSON or YAML file into the store.",
+    )
+    import_p.add_argument("--db", required=True)
+    import_p.add_argument("file", help="Path to a .json or .yaml/.yml file.")
+    import_p.set_defaults(func=_brain_import)
+
+    export_p = brain_sub.add_parser(
+        "export", help="Dump every atom in the store to a JSON file."
+    )
+    export_p.add_argument("--db", required=True)
+    export_p.add_argument("file", help="Output .json path.")
+    export_p.set_defaults(func=_brain_export)
 
     args = parser.parse_args(argv)
     return args.func(args)

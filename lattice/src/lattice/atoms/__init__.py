@@ -18,6 +18,7 @@ from lattice.atoms.feedback import (
     record_experience,
     summarize_trace_for_experience,
 )
+from lattice.atoms.io import export_atoms, import_atoms, stats
 from lattice.atoms.seed import SEED_ATOMS, SeedAtom, seed_store
 from lattice.atoms.store import AtomStore, RecallResult, SQLiteAtomStore
 
@@ -31,8 +32,11 @@ __all__ = [
     "SEED_ATOMS",
     "SQLiteAtomStore",
     "SeedAtom",
+    "export_atoms",
+    "import_atoms",
     "record_antipattern",
     "record_experience",
     "seed_store",
+    "stats",
     "summarize_trace_for_experience",
 ]
