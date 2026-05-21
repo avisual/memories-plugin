@@ -14,8 +14,10 @@ import libcst as cst
 from lattice.actions import (
     Action,
     AddField,
+    AddFunction,
     AddImport,
     AddParameter,
+    AddStatement,
     AddTest,
     Branch,
     MarkBlocked,
@@ -56,6 +58,10 @@ def compile_action(action: Action, workspace: Workspace) -> CompiledAction:
                 return _compile_wrap_in_try(action, workspace)
             case AddTest():
                 return _compile_add_test(action, workspace)
+            case AddStatement():
+                return _compile_add_statement(action, workspace)
+            case AddFunction():
+                return _compile_add_function(action, workspace)
             case RenameSymbol():
                 return _compile_rename_symbol(action, workspace)
             case RecallMore() | RevealBody() | MarkBlocked() | MarkDone() | Branch() | Research():
@@ -697,6 +703,155 @@ def _statement_from_code(code: str) -> cst.BaseSmallStatement:
         return parsed.body[0]
     raise CompileError(
         f"expected a single small statement, got {type(parsed).__name__} for {code!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# AddStatement
+# ---------------------------------------------------------------------------
+
+
+def _compile_add_statement(
+    action: AddStatement, workspace: Workspace
+) -> CompiledAction:
+    """Insert a module-level statement at the requested position.
+
+    `code` is parsed with libcst.parse_module — invalid Python is
+    rejected here, before anything touches disk. Multiple statements
+    inserted as-is. Idempotent on exact-match: if the same line(s)
+    already exist verbatim at the chosen insertion point, no-op.
+    """
+    path = action.file.path
+    before = workspace.read(path)
+
+    try:
+        new_block = cst.parse_module(action.code)
+    except cst.ParserSyntaxError as exc:
+        raise CompileError(f"AddStatement.code is not valid Python: {exc}") from exc
+
+    if not new_block.body:
+        raise CompileError("AddStatement.code parsed to zero statements")
+
+    module = cst.parse_module(before)
+
+    insertion_index = _statement_insertion_index(module, action.position)
+
+    # Idempotency: if every candidate statement already appears verbatim
+    # anywhere at module level, treat as a no-op. Simple set-membership
+    # by rendered source — works for the common 'I already added this
+    # line earlier' case without needing AST equivalence.
+    candidate_renders = [_render_statements([s]) for s in new_block.body]
+    existing_renders = {_render_statements([s]) for s in module.body}
+    if candidate_renders and all(r in existing_renders for r in candidate_renders):
+        return CompiledAction(
+            verb=action.verb,
+            file_changes=(FileChange(path=path, before=before, after=before, diff=""),),
+        )
+
+    new_body = (
+        *module.body[:insertion_index],
+        *new_block.body,
+        *module.body[insertion_index:],
+    )
+    new_module = module.with_changes(body=new_body)
+    after = new_module.code
+
+    return CompiledAction(
+        verb=action.verb,
+        file_changes=(
+            FileChange(
+                path=path,
+                before=before,
+                after=after,
+                diff=unified_diff(path=path, before=before, after=after),
+            ),
+        ),
+    )
+
+
+def _render_statements(statements: tuple | list) -> str:
+    if not statements:
+        return ""
+    return cst.Module(body=tuple(statements)).code.strip()
+
+
+def _statement_insertion_index(module: cst.Module, position: str) -> int:
+    """Resolve a position keyword to a body index.
+
+    'end' — after every existing top-level statement (length of body).
+    'top_after_imports' — after the docstring (if any) and the import
+        block (if any). If neither exists, returns 0 (very top of file).
+    """
+    if position == "end":
+        return len(module.body)
+
+    index = 0
+    if module.body and _is_docstring(module.body[0]):
+        index = 1
+    while index < len(module.body):
+        stmt = module.body[index]
+        if isinstance(stmt, cst.SimpleStatementLine) and stmt.body and isinstance(
+            stmt.body[0], (cst.Import, cst.ImportFrom)
+        ):
+            index += 1
+            continue
+        break
+    return index
+
+
+# ---------------------------------------------------------------------------
+# AddFunction
+# ---------------------------------------------------------------------------
+
+
+def _compile_add_function(
+    action: AddFunction, workspace: Workspace
+) -> CompiledAction:
+    """Insert a complete function (with decorators) at module level."""
+    path = action.file.path
+    before = workspace.read(path)
+
+    try:
+        parsed = cst.parse_statement(action.source)
+    except cst.ParserSyntaxError as exc:
+        raise CompileError(f"AddFunction.source is not a valid statement: {exc}") from exc
+
+    if not isinstance(parsed, cst.FunctionDef):
+        raise CompileError(
+            f"AddFunction.source must parse to a FunctionDef, got {type(parsed).__name__}"
+        )
+
+    module = cst.parse_module(before)
+    if _function_exists_in_module(module, parsed.name.value):
+        return CompiledAction(
+            verb=action.verb,
+            file_changes=(FileChange(path=path, before=before, after=before, diff=""),),
+        )
+
+    insertion_index = _statement_insertion_index(module, action.position)
+
+    # Insert with a blank-line gap before the function if it's not at top.
+    leading_lines = (cst.EmptyLine(), cst.EmptyLine()) if insertion_index > 0 else ()
+    new_fn = parsed.with_changes(leading_lines=leading_lines)
+
+    new_body = (
+        *module.body[:insertion_index],
+        new_fn,
+        *module.body[insertion_index:],
+    )
+    new_module = module.with_changes(body=new_body)
+    after = new_module.code
+
+    return CompiledAction(
+        verb=action.verb,
+        file_changes=(
+            FileChange(
+                path=path,
+                before=before,
+                after=after,
+                diff=unified_diff(path=path, before=before, after=after),
+            ),
+        ),
     )
 
 

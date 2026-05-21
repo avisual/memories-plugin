@@ -19,8 +19,10 @@ from hypothesis import strategies as st
 
 from lattice.actions import (
     AddField,
+    AddFunction,
     AddImport,
     AddParameter,
+    AddStatement,
     AddTest,
     Branch,
     Expr,
@@ -383,6 +385,187 @@ class TestAddParameter:
 # ---------------------------------------------------------------------------
 # Dispatch / error routing
 # ---------------------------------------------------------------------------
+
+
+class TestAddStatement:
+    def test_appends_at_end(self):
+        src = textwrap.dedent("""\
+            from flask import Flask
+            from flask_cors import CORS
+
+
+            app = Flask(__name__)
+        """)
+        ws = DictWorkspace({"a.py": src})
+        result = compile_action(
+            AddStatement(
+                file=FileRef(path="a.py"),
+                code="cors = CORS(app)",
+                position="end",
+                confidence=0.9,
+            ),
+            ws,
+        )
+        out = result.file_changes[0].after
+        assert _parses(out)
+        assert "cors = CORS(app)" in out
+        # Goes after `app = Flask(__name__)` (end of file).
+        assert out.rstrip().endswith("cors = CORS(app)")
+
+    def test_top_after_imports(self):
+        src = textwrap.dedent('''\
+            """Module."""
+            import os
+            import sys
+
+
+            def main():
+                pass
+        ''')
+        ws = DictWorkspace({"a.py": src})
+        result = compile_action(
+            AddStatement(
+                file=FileRef(path="a.py"),
+                code="CONST = 42",
+                position="top_after_imports",
+                confidence=0.9,
+            ),
+            ws,
+        )
+        out = result.file_changes[0].after
+        assert _parses(out)
+        lines = out.splitlines()
+        i_const = next(i for i, l in enumerate(lines) if "CONST" in l)
+        i_main = next(i for i, l in enumerate(lines) if "def main" in l)
+        i_sys = next(i for i, l in enumerate(lines) if "import sys" in l)
+        # CONST sits after the imports and before main.
+        assert i_sys < i_const < i_main
+
+    def test_multiple_statements(self):
+        ws = DictWorkspace({"a.py": "x = 1\n"})
+        result = compile_action(
+            AddStatement(
+                file=FileRef(path="a.py"),
+                code="y = 2\nz = 3",
+                position="end",
+                confidence=0.9,
+            ),
+            ws,
+        )
+        out = result.file_changes[0].after
+        assert _parses(out)
+        assert "y = 2" in out
+        assert "z = 3" in out
+
+    def test_invalid_code_rejected(self):
+        ws = DictWorkspace({"a.py": "x = 1\n"})
+        with pytest.raises(Exception):  # CompileError wraps the libcst ParserSyntaxError
+            compile_action(
+                AddStatement(
+                    file=FileRef(path="a.py"),
+                    code="@@@",
+                    position="end",
+                    confidence=0.9,
+                ),
+                ws,
+            )
+
+    def test_idempotent_at_end(self):
+        src = textwrap.dedent("""\
+            x = 1
+            y = 2
+        """)
+        ws = DictWorkspace({"a.py": src})
+        result = compile_action(
+            AddStatement(
+                file=FileRef(path="a.py"),
+                code="y = 2",
+                position="end",
+                confidence=0.9,
+            ),
+            ws,
+        )
+        assert result.is_noop
+
+
+class TestAddFunction:
+    def test_adds_simple_function(self):
+        ws = DictWorkspace({"a.py": "from flask import Flask\n\napp = Flask(__name__)\n"})
+        result = compile_action(
+            AddFunction(
+                file=FileRef(path="a.py"),
+                source=textwrap.dedent("""\
+                    def health() -> dict:
+                        return {"ok": True}
+                """),
+                position="end",
+                confidence=0.9,
+            ),
+            ws,
+        )
+        out = result.file_changes[0].after
+        assert _parses(out)
+        assert "def health() -> dict:" in out
+        assert 'return {"ok": True}' in out
+
+    def test_adds_function_with_decorator(self):
+        src = textwrap.dedent("""\
+            from flask import Flask
+
+
+            app = Flask(__name__)
+        """)
+        ws = DictWorkspace({"a.py": src})
+        result = compile_action(
+            AddFunction(
+                file=FileRef(path="a.py"),
+                source=textwrap.dedent("""\
+                    @app.route("/health")
+                    def health() -> dict:
+                        return {"ok": True}
+                """),
+                position="end",
+                confidence=0.9,
+            ),
+            ws,
+        )
+        out = result.file_changes[0].after
+        assert _parses(out)
+        assert '@app.route("/health")' in out
+        assert "def health" in out
+
+    def test_idempotent_when_function_exists(self):
+        src = textwrap.dedent("""\
+            def health() -> dict:
+                return {"ok": True}
+        """)
+        ws = DictWorkspace({"a.py": src})
+        result = compile_action(
+            AddFunction(
+                file=FileRef(path="a.py"),
+                source=textwrap.dedent("""\
+                    def health() -> dict:
+                        return {"ok": False}
+                """),
+                position="end",
+                confidence=0.9,
+            ),
+            ws,
+        )
+        assert result.is_noop
+
+    def test_rejects_non_function_source(self):
+        ws = DictWorkspace({"a.py": "x = 1\n"})
+        with pytest.raises(Exception):
+            compile_action(
+                AddFunction(
+                    file=FileRef(path="a.py"),
+                    source="x = 1\n",
+                    position="end",
+                    confidence=0.9,
+                ),
+                ws,
+            )
 
 
 class TestDispatch:

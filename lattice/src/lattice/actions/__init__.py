@@ -10,8 +10,10 @@ from lattice.actions.action import Action, parse_action
 from lattice.actions.refs import Expr, FileRef, IntentTag, SpanRef, SymbolRef, TypeExpr
 from lattice.actions.verbs import (
     AddField,
+    AddFunction,
     AddImport,
     AddParameter,
+    AddStatement,
     AddTest,
     Branch,
     MarkBlocked,
@@ -26,8 +28,10 @@ from lattice.actions.verbs import (
 __all__ = [
     "Action",
     "AddField",
+    "AddFunction",
     "AddImport",
     "AddParameter",
+    "AddStatement",
     "AddTest",
     "Branch",
     "Expr",

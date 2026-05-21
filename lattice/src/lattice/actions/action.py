@@ -8,8 +8,10 @@ from pydantic import Field, TypeAdapter, ValidationError
 
 from lattice.actions.verbs import (
     AddField,
+    AddFunction,
     AddImport,
     AddParameter,
+    AddStatement,
     AddTest,
     Branch,
     MarkBlocked,
@@ -29,6 +31,8 @@ Action = Annotated[
         AddParameter,
         WrapInTry,
         AddTest,
+        AddStatement,
+        AddFunction,
         RecallMore,
         RevealBody,
         MarkBlocked,

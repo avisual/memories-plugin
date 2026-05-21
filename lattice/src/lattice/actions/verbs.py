@@ -209,6 +209,49 @@ class MarkDone(_Verb):
 _HTTP_URL_RE = re.compile(r"^https?://[^\s<>\"']+$", re.IGNORECASE)
 
 
+_INSERT_POSITION = Literal["end", "top_after_imports"]
+
+
+class AddStatement(_Verb):
+    """Insert a module-level statement at a chosen position in a file.
+
+    Closes the gap between AddImport and 'actually wire it up' — e.g.
+    after AddImport of flask_cors, AddStatement(`cors = CORS(app)`)
+    completes the integration.
+
+    `code` is parsed with libcst.parse_module before insertion, so
+    invalid Python is rejected at compile time. Multiple statements
+    are allowed (each becomes its own SimpleStatementLine).
+    """
+
+    verb: Literal["AddStatement"] = "AddStatement"
+    file: FileRef
+    code: str = Field(min_length=1, max_length=4000)
+    position: _INSERT_POSITION = "end"
+
+
+class AddFunction(_Verb):
+    """Insert a complete function definition at module level.
+
+    `source` is the full source of the function (def or async def),
+    including any decorators. libcst.parse_statement validates it
+    before insertion so the file is guaranteed parseable.
+
+    Examples of `source`:
+        def health() -> dict:
+            return {"ok": True}
+
+        @app.route("/health")
+        def health():
+            return {"ok": True}
+    """
+
+    verb: Literal["AddFunction"] = "AddFunction"
+    file: FileRef
+    source: str = Field(min_length=4, max_length=8000)
+    position: _INSERT_POSITION = "end"
+
+
 class Research(_Verb):
     """Fetch a URL into the brain as an atom — the LLM learns at runtime.
 

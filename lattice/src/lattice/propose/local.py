@@ -61,6 +61,13 @@ AddField — {"verb":"AddField","cls":{"file":"src/x.py","name":"ClassName"},"na
 AddParameter — {"verb":"AddParameter","function":{"file":"src/x.py","name":"ClassName.method"},"name":"param","type":{"expr":"bool"},"default":{"code":"False"},"keyword_only":true,"confidence":0.7}
 WrapInTry — {"verb":"WrapInTry","span":{"file":"src/x.py","start_line":10,"end_line":14},"exception_type":{"expr":"ValueError"},"handler_body":[],"confidence":0.7}
 AddTest — {"verb":"AddTest","target":{"file":"src/x.py","name":"func"},"test_name":"test_func","given":{"code":"x = 1"},"when":{"code":"y = func(x)"},"then":{"code":"assert y == 2"},"confidence":0.7}
+AddStatement — insert a module-level statement (one or more lines of Python).
+  {"verb":"AddStatement","file":{"path":"src/app.py"},"code":"cors = CORS(app)","position":"end","confidence":0.8}
+  Use "position":"top_after_imports" to land it just after imports.
+AddFunction — insert a complete function definition (with optional decorators).
+  {"verb":"AddFunction","file":{"path":"src/app.py"},
+   "source":"@app.route(\"/health\")\\ndef health() -> dict:\\n    return {\"ok\": True}\\n",
+   "position":"end","confidence":0.8}
 RecallMore — {"verb":"RecallMore","query":"rate-limit middleware","confidence":0.5}
 RevealBody — {"verb":"RevealBody","symbol":{"file":"src/x.py","name":"func"},"confidence":0.5}
 MarkBlocked — {"verb":"MarkBlocked","reason_code":"missing_context","detail":"need to see User model","confidence":0.6}

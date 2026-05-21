@@ -50,6 +50,8 @@ _VERB_CHOICES: tuple[str, ...] = (
     "AddParameter",
     "WrapInTry",
     "AddTest",
+    "AddStatement",
+    "AddFunction",
     "RecallMore",
     "RevealBody",
     "MarkBlocked",
@@ -66,6 +68,8 @@ _VERB_HINTS: dict[str, str] = {
     "AddParameter": "Add a parameter to a function or method.",
     "WrapInTry": "Wrap a line span in try/except.",
     "AddTest": "Add a pytest test function for a target.",
+    "AddStatement": "Insert a module-level statement (e.g. 'cors = CORS(app)').",
+    "AddFunction": "Insert a complete function definition (decorators + body) at module level.",
     "RecallMore": "Ask the brain for more context (non-mutating).",
     "RevealBody": "Reveal the source of a known symbol (non-mutating).",
     "MarkBlocked": "Cannot proceed; needs human input.",
@@ -129,6 +133,16 @@ _VERB_SCHEMAS: dict[str, str] = {
         '"test_name":"test_<...>",'
         '"given":{"code":"<setup>"},"when":{"code":"<action>"},"then":{"code":"<assert ...>"},'
         '"confidence":0..1}'
+    ),
+    "AddStatement": (
+        '{"verb":"AddStatement","file":{"path":"<rel.py>"},'
+        '"code":"<one or more Python statements>",'
+        '"position":"end"|"top_after_imports","confidence":0..1}'
+    ),
+    "AddFunction": (
+        '{"verb":"AddFunction","file":{"path":"<rel.py>"},'
+        '"source":"def name(args) -> ret:\\n    body",'
+        '"position":"end"|"top_after_imports","confidence":0..1}'
     ),
     "RecallMore": '{"verb":"RecallMore","query":"<short query>","confidence":0..1}',
     "RevealBody": (
