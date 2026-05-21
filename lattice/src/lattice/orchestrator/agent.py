@@ -46,7 +46,7 @@ from lattice.compiler.diff import unified_diff
 from lattice.compiler.errors import NonMutatingAction
 from lattice.propose import ObservationContext, Proposer
 from lattice.sense import Symbol, walk_workspace
-from lattice.verify import SyntacticOutcome, verify_syntactic
+from lattice.verify import SyntacticOutcome, verify_syntactic, verify_types
 
 
 class StepRecord(BaseModel):
@@ -97,6 +97,7 @@ class AgentLoop:
         files: list[str] | None = None,
         noop_streak_limit: int = 2,
         preflight_candidates: int = 3,
+        type_check: bool = False,
     ) -> None:
         self.proposer = proposer
         self.workspace = workspace
@@ -106,6 +107,7 @@ class AgentLoop:
         self._files = files
         self._noop_streak_limit = noop_streak_limit
         self._preflight_candidates = preflight_candidates
+        self._type_check = type_check
 
     def run(self, task: str) -> AgentTrace:
         steps: list[StepRecord] = []
@@ -272,22 +274,48 @@ class AgentLoop:
                 "",
             )
         outcome = verify_syntactic(compiled)
-        if outcome.ok:
-            for change in compiled.file_changes:
-                if not change.is_noop:
-                    self.overlay.update(change.path, change.after)
-            joined_diff = "\n".join(c.diff for c in compiled.file_changes if c.diff)
+        if not outcome.ok:
             return (
                 StepRecord(
                     step=step_idx,
                     action=action,
-                    kind="edit",
+                    kind="error",
                     verify=outcome,
-                    diff=joined_diff,
+                    error="; ".join(f"{p}: {m}" for p, m in outcome.errors),
                 ),
                 False,
                 "",
             )
+        if self._type_check:
+            type_outcome = verify_types(compiled)
+            if not type_outcome.ok:
+                return (
+                    StepRecord(
+                        step=step_idx,
+                        action=action,
+                        kind="error",
+                        verify=outcome,
+                        error="type-check failed: "
+                        + "; ".join(f"{p}: {m}" for p, m in type_outcome.errors[:3]),
+                    ),
+                    False,
+                    "",
+                )
+        for change in compiled.file_changes:
+            if not change.is_noop:
+                self.overlay.update(change.path, change.after)
+        joined_diff = "\n".join(c.diff for c in compiled.file_changes if c.diff)
+        return (
+            StepRecord(
+                step=step_idx,
+                action=action,
+                kind="edit",
+                verify=outcome,
+                diff=joined_diff,
+            ),
+            False,
+            "",
+        )
         return (
             StepRecord(
                 step=step_idx,
@@ -329,6 +357,17 @@ class AgentLoop:
     ) -> ObservationContext:
         symbols = self._gather_symbols()
         hints: list[str] = []
+
+        # Pin the workspace file list explicitly so the model uses real
+        # paths, not paths it might hallucinate from prompt examples.
+        ws_files = self._files
+        if ws_files is None:
+            ws_files = self.overlay.iter_files(suffix=".py")
+        if ws_files:
+            hints.append(
+                "WORKSPACE FILES (use these EXACT paths, do not invent paths): "
+                + ", ".join(ws_files[:20])
+            )
 
         if self.atom_store is not None and not steps:
             try:

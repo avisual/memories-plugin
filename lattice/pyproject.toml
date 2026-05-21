@@ -42,6 +42,12 @@ llm = [
     "accelerate>=1.0",
     "sentence-transformers>=3.2",
 ]
+hosted = [
+    "anthropic>=0.40",
+]
+typecheck = [
+    "mypy>=1.13",
+]
 
 [project.scripts]
 lattice = "lattice.__main__:main"

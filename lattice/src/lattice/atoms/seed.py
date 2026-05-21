@@ -34,6 +34,22 @@ class SeedAtom:
     importance: float = 0.6
 
 
+def _antipattern(content: str, region: str, tags: tuple[str, ...], importance: float = 0.7) -> SeedAtom:
+    return SeedAtom(content=content, type=AtomType.ANTIPATTERN, region=region, tags=tags, importance=importance)
+
+
+def _preference(content: str, region: str, tags: tuple[str, ...], importance: float = 0.6) -> SeedAtom:
+    return SeedAtom(content=content, type=AtomType.PREFERENCE, region=region, tags=tags, importance=importance)
+
+
+def _skill(content: str, region: str, tags: tuple[str, ...], importance: float = 0.6) -> SeedAtom:
+    return SeedAtom(content=content, type=AtomType.SKILL, region=region, tags=tags, importance=importance)
+
+
+def _fact(content: str, region: str, tags: tuple[str, ...], importance: float = 0.6) -> SeedAtom:
+    return SeedAtom(content=content, type=AtomType.FACT, region=region, tags=tags, importance=importance)
+
+
 SEED_ATOMS: tuple[SeedAtom, ...] = (
     # ---- Antipatterns (concrete, single-rule things to avoid) ----
     SeedAtom(
@@ -248,6 +264,277 @@ SEED_ATOMS: tuple[SeedAtom, ...] = (
         region="python:concurrency",
         tags=("gil", "concurrency"),
         importance=0.6,
+    ),
+    # ---- Expanded antipatterns ----
+    _antipattern(
+        "Don't use global state to share data between functions; pass arguments or use a class.",
+        "python:design", ("globals", "state"), 0.75,
+    ),
+    _antipattern(
+        "Avoid magic numbers in code; define a named constant or enum.",
+        "python:style", ("magic-numbers", "constants"), 0.6,
+    ),
+    _antipattern(
+        "Don't catch an exception just to re-raise it unchanged. Either handle it or let it propagate.",
+        "python:errors", ("exceptions", "re-raise"), 0.7,
+    ),
+    _antipattern(
+        "Avoid using `*args, **kwargs` in public APIs unless you're explicitly building a wrapper; it hides the contract.",
+        "python:design", ("api", "signature"), 0.55,
+    ),
+    _antipattern(
+        "Don't shadow built-in names like `list`, `dict`, `id`, `type` with local variables.",
+        "python:style", ("builtins", "shadowing"), 0.7,
+    ),
+    _antipattern(
+        "Don't store secrets in code or in the repo. Use environment variables or a secret manager.",
+        "security", ("secrets", "config"), 0.95,
+    ),
+    _antipattern(
+        "Don't run untrusted code, even via pickle.loads — pickle can execute arbitrary code on load.",
+        "python:security", ("pickle", "deserialization"), 0.9,
+    ),
+    _antipattern(
+        "Don't compare floats with `==`; use math.isclose or a small absolute tolerance.",
+        "python:style", ("floats", "comparison"), 0.65,
+    ),
+    _antipattern(
+        "Avoid bare `assert` for input validation in production — Python with `-O` strips assertions.",
+        "python:validation", ("assert", "validation"), 0.7,
+    ),
+    _antipattern(
+        "Don't use `from module import *`; it pollutes the namespace and breaks static analysis.",
+        "python:imports", ("imports", "wildcards"), 0.6,
+    ),
+    _antipattern(
+        "Don't mutate a list while iterating over it; copy first or build a new list.",
+        "python:iteration", ("iteration", "mutation"), 0.7,
+    ),
+    _antipattern(
+        "Don't hardcode file paths; use pathlib relative to a known root or load from config.",
+        "python:io", ("paths", "config"), 0.55,
+    ),
+    _antipattern(
+        "Avoid using mutable class attributes shared across instances unless you mean to share.",
+        "python:classes", ("classes", "mutable"), 0.6,
+    ),
+    _antipattern(
+        "Don't write tests that depend on each other's ordering or shared state.",
+        "python:testing", ("tests", "isolation"), 0.7,
+    ),
+    _antipattern(
+        "Don't catch `KeyboardInterrupt` or `SystemExit` in generic exception handlers.",
+        "python:errors", ("exceptions", "control-flow"), 0.75,
+    ),
+    _antipattern(
+        "Don't use deprecated APIs (e.g. datetime.utcnow, asyncio.coroutine, imp module). Check the warning.",
+        "python:deprecation", ("deprecation",), 0.65,
+    ),
+    _antipattern(
+        "Avoid deep nesting (>3 levels). Extract functions or use early returns.",
+        "python:style", ("nesting", "readability"), 0.55,
+    ),
+    _antipattern(
+        "Don't use `print` for application logging; use the `logging` module or a structured logger.",
+        "python:logging", ("logging", "print"), 0.65,
+    ),
+    _antipattern(
+        "Don't catch and log an exception and continue silently — the upstream code thinks it succeeded.",
+        "python:errors", ("exceptions", "logging"), 0.75,
+    ),
+    _antipattern(
+        "Don't run shell commands with user-supplied strings; use subprocess.run with a list and never shell=True on untrusted input.",
+        "python:security", ("shell", "injection"), 0.9,
+    ),
+
+    # ---- Expanded preferences ----
+    _preference(
+        "Use `with open(...)` instead of bare open() so files get closed on exception.",
+        "python:io", ("files", "context-manager"), 0.7,
+    ),
+    _preference(
+        "Use f-strings for formatting, not %-formatting or .format() in new code.",
+        "python:style", ("strings", "fstrings"), 0.65,
+    ),
+    _preference(
+        "Module docstrings go at the top of the file. Function docstrings use triple double-quotes.",
+        "python:style", ("docstrings", "pep257"), 0.55,
+    ),
+    _preference(
+        "Public APIs export via `__all__` in __init__.py for clarity.",
+        "python:packaging", ("packaging", "all"), 0.5,
+    ),
+    _preference(
+        "Use `dataclasses.field(default_factory=list)` for mutable default factories — never `field(default=[])`.",
+        "python:dataclasses", ("dataclasses", "defaults"), 0.7,
+    ),
+    _preference(
+        "Prefer Pydantic v2 models for I/O-shaped data (API payloads, config). Use dataclasses for internal value types.",
+        "python:design", ("pydantic", "dataclasses"), 0.6,
+    ),
+    _preference(
+        "Type Optional values as `X | None` (PEP 604) on Python 3.10+.",
+        "python:typing", ("typing", "optional"), 0.6,
+    ),
+    _preference(
+        "Prefer `enum.StrEnum` (3.11+) over plain string constants for string-typed enums.",
+        "python:typing", ("enum", "strenum"), 0.55,
+    ),
+    _preference(
+        "Use ruff for linting + import sorting, mypy or pyright for type checking.",
+        "python:tooling", ("ruff", "mypy"), 0.6,
+    ),
+    _preference(
+        "Use uv (or pip-tools) for reproducible installs; pin transitive dependencies via a lockfile.",
+        "python:tooling", ("uv", "packaging"), 0.55,
+    ),
+    _preference(
+        "Format with ruff format (or black). Set line length to 88 (black default) or 100; keep it consistent.",
+        "python:style", ("format", "ruff"), 0.55,
+    ),
+    _preference(
+        "In tests, parametrize over inputs instead of writing N similar test functions.",
+        "python:testing", ("pytest", "parametrize"), 0.6,
+    ),
+    _preference(
+        "Keep function bodies short (~30 lines). When a function grows, extract helpers.",
+        "python:style", ("readability",), 0.5,
+    ),
+    _preference(
+        "Use `assert` only for invariants the author believes always hold — never for input validation.",
+        "python:style", ("assert",), 0.55,
+    ),
+
+    # ---- Expanded skills ----
+    _skill(
+        "For environment-driven config, use pydantic-settings (or os.environ + a small parser). Pin types in the schema.",
+        "python:config", ("config", "pydantic-settings"), 0.65,
+    ),
+    _skill(
+        "For background tasks, asyncio.TaskGroup (3.11+) cancels siblings on failure. Cleaner than gather(*, return_exceptions=False).",
+        "python:async", ("asyncio", "taskgroup"), 0.65,
+    ),
+    _skill(
+        "For long-running data pipelines, use generators (yield) so memory doesn't grow with input size.",
+        "python:performance", ("generators", "memory"), 0.6,
+    ),
+    _skill(
+        "For caching, functools.lru_cache works for pure functions; cachetools.TTLCache for time-based eviction.",
+        "python:caching", ("cache", "lru"), 0.6,
+    ),
+    _skill(
+        "Use struct.pack / struct.unpack for binary protocol work; bytes.hex() / .fromhex() for hex.",
+        "python:binary", ("struct", "binary"), 0.5,
+    ),
+    _skill(
+        "For concurrent network I/O, prefer asyncio + httpx. For CPU-bound, concurrent.futures.ProcessPoolExecutor.",
+        "python:concurrency", ("asyncio", "process-pool"), 0.65,
+    ),
+    _skill(
+        "For schema migrations, use Alembic with SQLAlchemy. Never edit the DB directly in production.",
+        "python:db", ("migrations", "alembic"), 0.7,
+    ),
+    _skill(
+        "For HTTP servers, FastAPI (async-first, pydantic-native) for APIs; Flask if you need sync simplicity.",
+        "python:web", ("fastapi", "flask"), 0.7,
+    ),
+    _skill(
+        "For ML: PyTorch for research and most production; JAX for high-end numerics; transformers for HF models.",
+        "python:ml", ("ml", "pytorch"), 0.6,
+    ),
+    _skill(
+        "For data wrangling, polars (faster) is supplanting pandas; both are fine on small data.",
+        "python:data", ("polars", "pandas"), 0.6,
+    ),
+    _skill(
+        "Use `subprocess.run([...], check=True, capture_output=True, text=True)` to run a command and get its output.",
+        "python:shell", ("subprocess",), 0.7,
+    ),
+    _skill(
+        "For random sampling, use `random.SystemRandom` for security-sensitive work, plain `random` for reproducible simulation (with seed).",
+        "python:random", ("random", "security"), 0.6,
+    ),
+    _skill(
+        "For zipping, gzipping, tarring: stdlib zipfile / gzip / tarfile. Don't shell out unless you have to.",
+        "python:io", ("archives", "stdlib"), 0.55,
+    ),
+    _skill(
+        "Write tests in pytest. Use `@pytest.fixture` for setup. Use `tmp_path` instead of /tmp; use `monkeypatch` to scope changes.",
+        "python:testing", ("pytest", "fixtures"), 0.7,
+    ),
+    _skill(
+        "For mocking external services in tests, use unittest.mock.patch as a decorator or context manager. Prefer dependency injection where possible.",
+        "python:testing", ("mock", "testing"), 0.65,
+    ),
+    _skill(
+        "For property-based testing, use hypothesis. Especially good for parsers, normalizers, and data transformations.",
+        "python:testing", ("hypothesis", "property"), 0.6,
+    ),
+    _skill(
+        "For logging, configure once in main() via logging.basicConfig(); use logging.getLogger(__name__) per-module.",
+        "python:logging", ("logging",), 0.65,
+    ),
+    _skill(
+        "For structured logging, use a JSON formatter (e.g. python-json-logger) so logs are queryable.",
+        "python:logging", ("logging", "json"), 0.6,
+    ),
+    _skill(
+        "For retries with backoff, use the `tenacity` library — declarative @retry decorators, exponential backoff included.",
+        "python:reliability", ("retry", "tenacity"), 0.6,
+    ),
+    _skill(
+        "For task queues, use celery (heavy, mature) or arq (asyncio-native, lighter).",
+        "python:queues", ("celery", "arq"), 0.55,
+    ),
+    _skill(
+        "For locking across processes, use file locks (filelock library) or a Redis-based lock; not threading.Lock.",
+        "python:concurrency", ("locks", "filelock"), 0.6,
+    ),
+    _skill(
+        "Profile before optimizing: `cProfile`, `py-spy`, or pytest-benchmark for micro-benchmarks.",
+        "python:performance", ("profiling",), 0.65,
+    ),
+
+    # ---- Expanded facts ----
+    _fact(
+        "Python 3.13 ships with the experimental free-threaded build (no GIL); production code shouldn't depend on it yet.",
+        "python:concurrency", ("gil", "3.13"), 0.5,
+    ),
+    _fact(
+        "asyncio coroutines must be awaited; calling one without await returns the coroutine object without running it.",
+        "python:async", ("asyncio", "coroutines"), 0.7,
+    ),
+    _fact(
+        "Pydantic v2 is a complete rewrite — model_config replaces Config class, model_validator replaces root_validator.",
+        "python:pydantic", ("pydantic", "v2"), 0.65,
+    ),
+    _fact(
+        "SQLAlchemy 2.0 uses `select(Model).where(...)`, not the legacy `Model.query`. Sessions are explicit; commit/rollback yourself.",
+        "python:db", ("sqlalchemy", "2.0"), 0.65,
+    ),
+    _fact(
+        "FastAPI dependency injection is via `Depends(...)`; dependencies can return generators for setup/teardown.",
+        "python:web", ("fastapi", "depends"), 0.6,
+    ),
+    _fact(
+        "JSON has no native datetime; use isoformat() strings and parse back with datetime.fromisoformat().",
+        "python:serialization", ("json", "datetime"), 0.6,
+    ),
+    _fact(
+        "Python lists are O(1) append, O(n) prepend. For frequent prepends, collections.deque is O(1) on both ends.",
+        "python:data-structures", ("list", "deque"), 0.6,
+    ),
+    _fact(
+        "dict and set lookups are O(1) average; sorted iteration of dict preserves insertion order (3.7+).",
+        "python:data-structures", ("dict", "set"), 0.55,
+    ),
+    _fact(
+        "Python integers have arbitrary precision; floats are IEEE 754 doubles (53-bit mantissa).",
+        "python:numerics", ("int", "float"), 0.5,
+    ),
+    _fact(
+        "Type hints are not enforced at runtime by Python itself; use Pydantic, dataclasses, or runtime checkers like beartype if you need enforcement.",
+        "python:typing", ("typing", "runtime"), 0.55,
     ),
 )
 

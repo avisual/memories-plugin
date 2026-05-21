@@ -39,6 +39,7 @@ Action = Annotated[
 
 
 _action_adapter: TypeAdapter[Action] = TypeAdapter(Action)
+"""Public so HostedLLMProposer can emit tool-spec JSON schemas from it."""
 
 WrapInTry.model_rebuild()
 

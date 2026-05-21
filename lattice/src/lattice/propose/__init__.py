@@ -9,7 +9,9 @@ Implementations:
 - MockProposer: deterministic, for tests and the v0 demo.
 - LocalLLMProposer: a small instruct model via transformers, with
   Pydantic-validated JSON output + retry-on-parse-failure.
-- (planned) AnthropicProposer: hosted small model via API.
+- HostedLLMProposer: Anthropic API with tool-use; constrained
+  decoding via tool schema = the action verb set. Quality jump
+  for users with ANTHROPIC_API_KEY.
 - (planned) ApprenticeProposer: the distilled policy net (Organ 8).
 """
 
@@ -28,3 +30,9 @@ __all__ = [
     "ProposerError",
     "proposer_for_intent",
 ]
+
+
+def _make_hosted_proposer_class():  # pragma: no cover (import deferred)
+    from lattice.propose.hosted import HostedLLMProposer
+
+    return HostedLLMProposer

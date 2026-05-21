@@ -56,10 +56,7 @@ def compile_action(action: Action, workspace: Workspace) -> CompiledAction:
             case AddTest():
                 return _compile_add_test(action, workspace)
             case RenameSymbol():
-                raise UnsupportedAction(
-                    f"compiler does not yet implement {action.verb!r} "
-                    "(needs cross-file reference rewrite via the lattice store)"
-                )
+                return _compile_rename_symbol(action, workspace)
             case RecallMore() | RevealBody() | MarkBlocked() | MarkDone() | Branch():
                 raise NonMutatingAction(
                     f"{action.verb!r} does not produce file changes; "
@@ -368,6 +365,107 @@ def _compile_add_parameter(action: AddParameter, workspace: Workspace) -> Compil
             ),
         ),
     )
+
+
+# ---------------------------------------------------------------------------
+# RenameSymbol
+# ---------------------------------------------------------------------------
+
+
+def _compile_rename_symbol(
+    action: RenameSymbol, workspace: Workspace
+) -> CompiledAction:
+    """Rename a symbol in its defining file (and same-file references).
+
+    v0 scope: rewrites the definition (def/class) and bare-name references
+    within the same file. Cross-file rewriting is a follow-up that needs
+    the unified symbol graph (Organ 1 fully landed) to find call sites.
+
+    The dotted name in action.symbol selects the definition; only the
+    leaf component is renamed (renaming 'Foo.bar' to 'baz' renames just
+    the method, not the class).
+    """
+    path = action.symbol.file
+    before = workspace.read(path)
+    module = cst.parse_module(before)
+
+    node = _find_symbol(module, action.symbol.name)
+    if node is None:
+        raise SymbolNotFound(
+            f"could not find symbol {action.symbol.name!r} in {path}"
+        )
+    if not isinstance(node, (cst.FunctionDef, cst.ClassDef)):
+        raise SymbolNotFound(
+            f"symbol {action.symbol.name!r} is not a function or class; "
+            f"got {type(node).__name__}"
+        )
+
+    old_leaf = node.name.value
+    new_leaf = action.new_name
+
+    if old_leaf == new_leaf:
+        return CompiledAction(
+            verb=action.verb,
+            file_changes=(
+                FileChange(path=path, before=before, after=before, diff=""),
+            ),
+        )
+
+    transformer = _RenameTransformer(old_leaf=old_leaf, new_leaf=new_leaf)
+    new_module = module.visit(transformer)
+    after = new_module.code
+
+    return CompiledAction(
+        verb=action.verb,
+        file_changes=(
+            FileChange(
+                path=path,
+                before=before,
+                after=after,
+                diff=unified_diff(path=path, before=before, after=after),
+            ),
+        ),
+    )
+
+
+class _RenameTransformer(cst.CSTTransformer):
+    """Rewrites Name and FunctionDef/ClassDef name tokens.
+
+    Only rewrites the leaf identifier; doesn't try to rewrite imports
+    that bind the symbol to a local alias (that's a follow-up requiring
+    scope analysis).
+    """
+
+    def __init__(self, *, old_leaf: str, new_leaf: str) -> None:
+        self._old = old_leaf
+        self._new = new_leaf
+
+    def leave_FunctionDef(
+        self,
+        original_node: cst.FunctionDef,
+        updated_node: cst.FunctionDef,
+    ) -> cst.FunctionDef:
+        if updated_node.name.value == self._old:
+            return updated_node.with_changes(name=cst.Name(self._new))
+        return updated_node
+
+    def leave_ClassDef(
+        self,
+        original_node: cst.ClassDef,
+        updated_node: cst.ClassDef,
+    ) -> cst.ClassDef:
+        if updated_node.name.value == self._old:
+            return updated_node.with_changes(name=cst.Name(self._new))
+        return updated_node
+
+    def leave_Name(
+        self,
+        original_node: cst.Name,
+        updated_node: cst.Name,
+    ) -> cst.Name:
+        if updated_node.value == self._old:
+            return cst.Name(self._new)
+        return updated_node
 
 
 # ---------------------------------------------------------------------------

@@ -110,17 +110,24 @@ def _agent(args: argparse.Namespace) -> int:
         summarize_trace_for_experience,
     )
     from lattice.orchestrator import AgentLoop, decompose, run_subtasks
-    from lattice.propose.local import LocalLLMProposer
 
     workspace = FilesystemWorkspace(args.workspace)
     atom_store = SQLiteAtomStore(args.atom_db) if args.atom_db else None
     try:
-        sys.stderr.write(f"loading model{(' ' + args.model) if args.model else ''}...\n")
-        proposer = (
-            LocalLLMProposer(model_name=args.model)
-            if args.model
-            else LocalLLMProposer()
-        )
+        if args.hosted:
+            from lattice.propose.hosted import HostedLLMProposer
+
+            sys.stderr.write(f"using hosted proposer ({args.model or 'default Anthropic model'})...\n")
+            proposer = HostedLLMProposer(model=args.model)
+        else:
+            from lattice.propose.local import LocalLLMProposer
+
+            sys.stderr.write(f"loading local model{(' ' + args.model) if args.model else ''}...\n")
+            proposer = (
+                LocalLLMProposer(model_name=args.model)
+                if args.model
+                else LocalLLMProposer()
+            )
 
         if args.subtasks:
             subtasks = [s.strip() for s in args.subtasks.split("|") if s.strip()]
@@ -174,6 +181,7 @@ def _agent(args: argparse.Namespace) -> int:
             workspace=workspace,
             atom_store=atom_store,
             max_steps=args.max_steps,
+            type_check=args.types,
         )
         trace = loop.run(args.task)
 
@@ -239,6 +247,42 @@ def _atom_add(args: argparse.Namespace) -> int:
         store.close()
     sys.stdout.write(f"added atom id={atom.id} type={atom.type.value}\n")
     return 0
+
+
+def _do(args: argparse.Namespace) -> int:
+    """One-shot convenience: init if needed, then run agent."""
+    from lattice.atoms import SQLiteAtomStore, seed_store
+
+    root = Path(args.workspace).resolve()
+    if not root.is_dir():
+        sys.stderr.write(f"workspace is not a directory: {root}\n")
+        return 2
+
+    brain_path = (root / args.brain).resolve()
+    brain_path.parent.mkdir(parents=True, exist_ok=True)
+    store = SQLiteAtomStore(brain_path)
+    try:
+        if store.count() == 0:
+            sys.stderr.write("first run — seeding brain with built-in atom pack...\n")
+            seed_store(store)
+    finally:
+        store.close()
+
+    task = " ".join(args.task)
+    # Forward to _agent via a stand-in namespace.
+    agent_ns = argparse.Namespace(
+        workspace=str(root),
+        task=task,
+        atom_db=str(brain_path),
+        model=None,
+        max_steps=args.max_steps,
+        subtasks="",
+        decompose=False,
+        hosted=args.hosted,
+        types=args.types,
+        write=not args.no_write,
+    )
+    return _agent(agent_ns)
 
 
 def _init(args: argparse.Namespace) -> int:
@@ -584,6 +628,22 @@ def main(argv: list[str] | None = None) -> int:
     )
     propose_p.set_defaults(func=_propose)
 
+    do_p = sub.add_parser(
+        "do",
+        help="One-shot: init if needed, then agent. Defaults the workspace to '.' and the brain to .lattice/brain.db.",
+    )
+    do_p.add_argument(
+        "task", nargs="+", help='Natural-language task, e.g. lattice do "add stripe import to src/foo.py"'
+    )
+    do_p.add_argument("--workspace", default=".")
+    do_p.add_argument("--brain", default=".lattice/brain.db")
+    do_p.add_argument("--max-steps", type=int, default=4)
+    do_p.add_argument("--hosted", action="store_true")
+    do_p.add_argument("--types", action="store_true")
+    do_p.add_argument("--write", action="store_true", help="Default for `do`: ON. Use --no-write to dry-run.")
+    do_p.add_argument("--no-write", action="store_true")
+    do_p.set_defaults(func=_do)
+
     init_p = sub.add_parser(
         "init",
         help="Initialize a lattice brain in a new project (seeded + ready to run).",
@@ -621,6 +681,24 @@ def main(argv: list[str] | None = None) -> int:
         help="HuggingFace model name. Default: Qwen/Qwen2.5-0.5B-Instruct.",
     )
     agent_p.add_argument("--max-steps", type=int, default=6)
+    agent_p.add_argument(
+        "--hosted",
+        action="store_true",
+        help=(
+            "Use the hosted Anthropic proposer (requires ANTHROPIC_API_KEY "
+            "and the [hosted] extras). Much more reliable than the local "
+            "0.5B for non-trivial tasks."
+        ),
+    )
+    agent_p.add_argument(
+        "--types",
+        action="store_true",
+        help=(
+            "Run mypy against each candidate edit's after-content; reject "
+            "edits that introduce type errors. Requires the [typecheck] "
+            "extras."
+        ),
+    )
     agent_p.add_argument(
         "--subtasks",
         default="",

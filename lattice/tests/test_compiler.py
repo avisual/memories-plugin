@@ -408,16 +408,30 @@ class TestDispatch:
                 DictWorkspace(),
             )
 
-    def test_rename_symbol_unsupported(self):
-        with pytest.raises(UnsupportedAction):
-            compile_action(
-                RenameSymbol(
-                    symbol=SymbolRef(file="a.py", name="x"),
-                    new_name="y",
-                    confidence=0.5,
-                ),
-                DictWorkspace({"a.py": ""}),
-            )
+    def test_rename_symbol_now_supported(self):
+        src = textwrap.dedent("""\
+            def old_name(x: int) -> int:
+                return x + 1
+
+
+            def caller() -> int:
+                return old_name(5)
+        """)
+        ws = DictWorkspace({"a.py": src})
+        result = compile_action(
+            RenameSymbol(
+                symbol=SymbolRef(file="a.py", name="old_name"),
+                new_name="new_name",
+                confidence=0.9,
+            ),
+            ws,
+        )
+        out = result.file_changes[0].after
+        assert _parses(out)
+        # Both the definition and the call site updated.
+        assert "def new_name(" in out
+        assert "return new_name(5)" in out
+        assert "old_name" not in out
 
 
 # ---------------------------------------------------------------------------
@@ -500,6 +514,80 @@ def test_property_add_field_always_parses(field_name: str, type_expr: str) -> No
     )
     result = compile_action(action, ws)
     assert _parses(result.file_changes[0].after)
+
+
+class TestRenameSymbol:
+    def test_renames_class(self):
+        src = textwrap.dedent("""\
+            class OldName:
+                pass
+
+
+            x = OldName()
+        """)
+        ws = DictWorkspace({"a.py": src})
+        result = compile_action(
+            RenameSymbol(
+                symbol=SymbolRef(file="a.py", name="OldName"),
+                new_name="NewName",
+                confidence=0.9,
+            ),
+            ws,
+        )
+        out = result.file_changes[0].after
+        assert _parses(out)
+        assert "class NewName:" in out
+        assert "x = NewName()" in out
+        assert "OldName" not in out
+
+    def test_renames_method_only_leaf(self):
+        src = textwrap.dedent("""\
+            class C:
+                def old(self) -> None:
+                    pass
+        """)
+        ws = DictWorkspace({"a.py": src})
+        result = compile_action(
+            RenameSymbol(
+                symbol=SymbolRef(file="a.py", name="C.old"),
+                new_name="new_name_for_method",
+                confidence=0.9,
+            ),
+            ws,
+        )
+        out = result.file_changes[0].after
+        assert _parses(out)
+        assert "def new_name_for_method(self)" in out
+        # The class name is unchanged.
+        assert "class C:" in out
+
+    def test_rename_missing_symbol_raises(self):
+        ws = DictWorkspace({"a.py": "def f() -> None:\n    pass\n"})
+        with pytest.raises(SymbolNotFound):
+            compile_action(
+                RenameSymbol(
+                    symbol=SymbolRef(file="a.py", name="does_not_exist"),
+                    new_name="x",
+                    confidence=0.5,
+                ),
+                ws,
+            )
+
+    def test_rename_target_must_be_def_or_class(self):
+        # Pydantic rejects identical leaves at schema time, so we can't
+        # exercise the no-op path here. The compiler-level check that
+        # the target is a function or class is what matters.
+        # (Vars defined by AnnAssign aren't returned by _find_symbol in v0.)
+        ws = DictWorkspace({"a.py": "X: int = 1\n"})
+        with pytest.raises(SymbolNotFound):
+            compile_action(
+                RenameSymbol(
+                    symbol=SymbolRef(file="a.py", name="X"),
+                    new_name="Y",
+                    confidence=0.5,
+                ),
+                ws,
+            )
 
 
 class TestWrapInTry:
