@@ -428,6 +428,35 @@ def _brain_export(args: argparse.Namespace) -> int:
     return 0
 
 
+def _evolve(args: argparse.Namespace) -> int:
+    from lattice.atoms import SQLiteAtomStore, discover
+
+    store = SQLiteAtomStore(args.db)
+    try:
+        report = discover(store, min_recurrence=args.min_recurrence)
+    finally:
+        store.close()
+
+    sys.stdout.write(
+        f"scanned {report.total_traces} trace(s); "
+        f"{len(report.candidates)} macro candidate(s) at "
+        f"min_recurrence={args.min_recurrence}\n"
+    )
+    if not report.candidates:
+        sys.stdout.write(
+            "(no recurring patterns yet — run agent tasks then come back)\n"
+        )
+        return 0
+    for i, cand in enumerate(report.candidates, 1):
+        sys.stdout.write(
+            f"\n  [{i}] x{cand.sample_count}  "
+            f"sequence: {' → '.join(cand.action_sequence)}\n"
+        )
+        for st in cand.sample_tasks[:3]:
+            sys.stdout.write(f"      sample task: {st[:160]}\n")
+    return 0
+
+
 def _atom_seed(args: argparse.Namespace) -> int:
     from lattice.atoms import SQLiteAtomStore, seed_store
 
@@ -852,6 +881,22 @@ def main(argv: list[str] | None = None) -> int:
     export_p.add_argument("--db", required=True)
     export_p.add_argument("file", help="Output .json path.")
     export_p.set_defaults(func=_brain_export)
+
+    evolve_p = sub.add_parser(
+        "evolve",
+        help=(
+            "Mine successful traces for recurring task→action-sequence "
+            "patterns; print macro candidates."
+        ),
+    )
+    evolve_p.add_argument("--db", required=True, help="Atom-store DB path.")
+    evolve_p.add_argument(
+        "--min-recurrence",
+        type=int,
+        default=3,
+        help="Minimum number of identical action-sequence runs to promote (default 3).",
+    )
+    evolve_p.set_defaults(func=_evolve)
 
     args = parser.parse_args(argv)
     return args.func(args)

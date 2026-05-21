@@ -13,6 +13,12 @@ the same Protocol; nothing in the orchestrator changes.
 
 from lattice.atoms.atom import Atom, AtomType
 from lattice.atoms.embedder import Embedder, MiniLMEmbedder
+from lattice.atoms.evolve import (
+    EvolveReport,
+    MacroCandidate,
+    discover,
+    write_trace,
+)
 from lattice.atoms.feedback import (
     record_antipattern,
     record_experience,
@@ -27,11 +33,14 @@ __all__ = [
     "AtomStore",
     "AtomType",
     "Embedder",
+    "EvolveReport",
+    "MacroCandidate",
     "MiniLMEmbedder",
     "RecallResult",
     "SEED_ATOMS",
     "SQLiteAtomStore",
     "SeedAtom",
+    "discover",
     "export_atoms",
     "import_atoms",
     "record_antipattern",
@@ -39,4 +48,5 @@ __all__ = [
     "seed_store",
     "stats",
     "summarize_trace_for_experience",
+    "write_trace",
 ]

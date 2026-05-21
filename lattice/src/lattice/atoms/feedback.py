@@ -29,6 +29,8 @@ def record_experience(
 
     Returns the atom id. Content is structured so it surfaces well
     under future task recall (the task wording stays prominent).
+    Also writes a parallel TRACE atom (region='traces') that EVOLVE
+    (Organ 9) mines for macro-promotion candidates.
     """
     region = project_region or "experiences"
     actions_clause = "; ".join(actions_summary[:5])
@@ -45,6 +47,21 @@ def record_experience(
         tags=("agent-run", "experience"),
         importance=0.65,
     )
+
+    # Parallel structured trace for Organ 9 (macro discovery).
+    try:
+        from lattice.atoms.evolve import write_trace
+
+        write_trace(
+            store=store,
+            task=task,
+            actions=actions_summary,
+            files_touched=files_touched,
+        )
+    except Exception:  # noqa: BLE001
+        # Trace logging is best-effort; never break the user-facing flow.
+        pass
+
     return atom.id  # type: ignore[return-value]
 
 
