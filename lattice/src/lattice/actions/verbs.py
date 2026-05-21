@@ -34,7 +34,11 @@ _BlockedReason = Literal[
 
 class _Verb(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
-    confidence: float = Field(ge=0.0, le=1.0)
+    # Default to 0.5 (mid-confidence) so a small model that forgets to
+    # emit the field still gets a valid action. The orchestrator can
+    # weight low-confidence candidates lower at pre-flight, so the
+    # signal is preserved without making confidence a structural gate.
+    confidence: float = Field(default=0.5, ge=0.0, le=1.0)
 
 
 class AddImport(_Verb):
