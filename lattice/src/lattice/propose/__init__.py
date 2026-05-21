@@ -22,13 +22,21 @@ from lattice.propose.base import (
     proposer_for_intent,
 )
 from lattice.propose.mock import MockProposer
+from lattice.propose.pattern import (
+    CompositeProposer,
+    PatternProposer,
+    task_to_action,
+)
 
 __all__ = [
+    "CompositeProposer",
     "MockProposer",
     "ObservationContext",
+    "PatternProposer",
     "Proposer",
     "ProposerError",
     "proposer_for_intent",
+    "task_to_action",
 ]
 
 

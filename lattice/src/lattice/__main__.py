@@ -41,6 +41,7 @@ from lattice.orchestrator import (
     execute_plan,
     expand_intent,
 )
+from lattice.propose import Proposer
 from lattice.verify import verify_syntactic
 
 
@@ -114,20 +115,26 @@ def _agent(args: argparse.Namespace) -> int:
     workspace = FilesystemWorkspace(args.workspace)
     atom_store = SQLiteAtomStore(args.atom_db) if args.atom_db else None
     try:
+        from lattice.propose import CompositeProposer, PatternProposer
+
+        rule_based: Proposer = PatternProposer()  # type: ignore[assignment]
+
         if args.hosted:
             from lattice.propose.hosted import HostedLLMProposer
 
             sys.stderr.write(f"using hosted proposer ({args.model or 'default Anthropic model'})...\n")
-            proposer = HostedLLMProposer(model=args.model)
+            llm_proposer: Proposer = HostedLLMProposer(model=args.model)  # type: ignore[assignment]
         else:
             from lattice.propose.local import LocalLLMProposer
 
             sys.stderr.write(f"loading local model{(' ' + args.model) if args.model else ''}...\n")
-            proposer = (
+            llm_proposer = (
                 LocalLLMProposer(model_name=args.model)
                 if args.model
                 else LocalLLMProposer()
             )
+
+        proposer = CompositeProposer([rule_based, llm_proposer])
 
         if args.subtasks:
             subtasks = [s.strip() for s in args.subtasks.split("|") if s.strip()]
@@ -274,7 +281,7 @@ def _do(args: argparse.Namespace) -> int:
         workspace=str(root),
         task=task,
         atom_db=str(brain_path),
-        model=None,
+        model=args.model,
         max_steps=args.max_steps,
         subtasks="",
         decompose=False,
@@ -638,6 +645,7 @@ def main(argv: list[str] | None = None) -> int:
     do_p.add_argument("--workspace", default=".")
     do_p.add_argument("--brain", default=".lattice/brain.db")
     do_p.add_argument("--max-steps", type=int, default=4)
+    do_p.add_argument("--model", default=None)
     do_p.add_argument("--hosted", action="store_true")
     do_p.add_argument("--types", action="store_true")
     do_p.add_argument("--write", action="store_true", help="Default for `do`: ON. Use --no-write to dry-run.")

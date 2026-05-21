@@ -40,28 +40,38 @@ _RETRIES = 2
 _VOCAB_DOC = """\
 Action vocabulary (emit exactly ONE of these as a single JSON object):
 
-AddImport     - add an import statement to a file.
-                {"verb":"AddImport", "file":{"path":"src/x.py"}, "module":"json", "confidence":0.9}
-                # 'file.path' = the .py file you are editing
-                # 'module'    = the Python package being imported (e.g. "os", "stripe",
-                #               "os.path"). NEVER a file path. Must be a dotted identifier.
+AddImport — add an import statement.
+  Three forms:
+  (a) plain 'import X':
+      task: 'add an import of os to src/main.py'
+      → {"verb":"AddImport","file":{"path":"src/main.py"},"module":"os","confidence":0.9}
+  (b) 'from X import Y, Z':
+      task: 'add an import of request from flask to src/app.py'
+      → {"verb":"AddImport","file":{"path":"src/app.py"},"module":"flask","names":["request"],"confidence":0.9}
+  (c) 'import X as Y':
+      task: 'import numpy as np in src/calc.py'
+      → {"verb":"AddImport","file":{"path":"src/calc.py"},"module":"numpy","alias":"np","confidence":0.9}
+  Rules: 'module' is a dotted Python identifier (e.g. 'os', 'os.path', 'flask').
+  It is NEVER a file path. If the task says 'X from Y', put Y in module and
+  X in names. If the task names exactly ONE thing to import, that goes in
+  module (plain form) — do NOT also invent a second import.
 
-RenameSymbol  - {"verb":"RenameSymbol", "symbol":{"file":"src/x.py","name":"OldName"}, "new_name":"NewName", "confidence":0.7}
-AddField      - {"verb":"AddField", "cls":{"file":"src/x.py","name":"ClassName"}, "name":"field_name", "type":{"expr":"int"}, "default":{"code":"0"}, "confidence":0.7}
-AddParameter  - {"verb":"AddParameter", "function":{"file":"src/x.py","name":"ClassName.method"}, "name":"param", "type":{"expr":"bool"}, "default":{"code":"False"}, "keyword_only":true, "confidence":0.7}
-WrapInTry     - {"verb":"WrapInTry", "span":{"file":"src/x.py","start_line":10,"end_line":14}, "exception_type":{"expr":"ValueError"}, "handler_body":[], "confidence":0.7}
-AddTest       - {"verb":"AddTest", "target":{"file":"src/x.py","name":"func"}, "test_name":"test_func", "given":{"code":"x = 1"}, "when":{"code":"y = func(x)"}, "then":{"code":"assert y == 2"}, "confidence":0.7}
-RecallMore    - {"verb":"RecallMore", "query":"rate-limit middleware", "confidence":0.5}
-RevealBody    - {"verb":"RevealBody", "symbol":{"file":"src/x.py","name":"func"}, "confidence":0.5}
-MarkBlocked   - {"verb":"MarkBlocked", "reason_code":"missing_context", "detail":"need to see User model", "confidence":0.6}
-MarkDone      - {"verb":"MarkDone", "summary":"added stripe import and dry_run param", "confidence":0.9}
-Branch        - {"verb":"Branch", "rationale":"try alternative approach", "confidence":0.5}
+RenameSymbol — {"verb":"RenameSymbol","symbol":{"file":"src/x.py","name":"OldName"},"new_name":"NewName","confidence":0.7}
+AddField — {"verb":"AddField","cls":{"file":"src/x.py","name":"ClassName"},"name":"field_name","type":{"expr":"int"},"default":{"code":"0"},"confidence":0.7}
+AddParameter — {"verb":"AddParameter","function":{"file":"src/x.py","name":"ClassName.method"},"name":"param","type":{"expr":"bool"},"default":{"code":"False"},"keyword_only":true,"confidence":0.7}
+WrapInTry — {"verb":"WrapInTry","span":{"file":"src/x.py","start_line":10,"end_line":14},"exception_type":{"expr":"ValueError"},"handler_body":[],"confidence":0.7}
+AddTest — {"verb":"AddTest","target":{"file":"src/x.py","name":"func"},"test_name":"test_func","given":{"code":"x = 1"},"when":{"code":"y = func(x)"},"then":{"code":"assert y == 2"},"confidence":0.7}
+RecallMore — {"verb":"RecallMore","query":"rate-limit middleware","confidence":0.5}
+RevealBody — {"verb":"RevealBody","symbol":{"file":"src/x.py","name":"func"},"confidence":0.5}
+MarkBlocked — {"verb":"MarkBlocked","reason_code":"missing_context","detail":"need to see User model","confidence":0.6}
+MarkDone — {"verb":"MarkDone","summary":"added stripe import","confidence":0.9}
+Branch — {"verb":"Branch","rationale":"try alternative approach","confidence":0.5}
 
 Rules:
 - Emit ONE JSON object on a single line.
 - No markdown code fences. No commentary. JSON only.
-- 'module' is a Python package name like 'os' or 'stripe', not a file path.
 - File paths must be repository-relative (no leading slash, no '..').
+- Use the EXACT file paths from WORKSPACE FILES — do not invent paths.
 - Use confidence in [0.0, 1.0].
 """
 
