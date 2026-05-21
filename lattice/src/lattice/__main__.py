@@ -443,6 +443,88 @@ def _brain_export(args: argparse.Namespace) -> int:
     return 0
 
 
+def _brain_audit_state(args: argparse.Namespace) -> int:
+    """Snapshot the brain's actual state — the kind of view you want
+    to read AFTER an audit to understand what the system learned.
+
+    Reports:
+      - total atoms, breakdown by region/type
+      - importance histogram in 0.1 buckets (so you can see drift
+        from the seed baseline)
+      - top-N hottest atoms (highest importance) per region
+      - count of step-outcome atoms (the ones the brain decision-
+        weighting actually consults) by SKILL / ANTIPATTERN
+
+    This is the introspection that lets you answer 'is the brain
+    accumulating useful signal?' without staring at SQL.
+    """
+    import sqlite3
+
+    db = args.db
+    conn = sqlite3.connect(db)
+    try:
+        rows = conn.execute(
+            "SELECT id, content, type, region, importance, access_count, "
+            "created_at FROM atoms"
+        ).fetchall()
+    finally:
+        conn.close()
+
+    if not rows:
+        sys.stdout.write(f"(brain at {db} is empty)\n")
+        return 0
+
+    total = len(rows)
+    by_type: dict[str, int] = {}
+    by_region: dict[str, int] = {}
+    importance_bins = [0] * 10  # 0.0-0.1, 0.1-0.2, ..., 0.9-1.0
+    for _id, _content, atype, region, importance, _ac, _ca in rows:
+        by_type[atype] = by_type.get(atype, 0) + 1
+        by_region[region or "(none)"] = by_region.get(region or "(none)", 0) + 1
+        idx = min(9, max(0, int(importance * 10)))
+        importance_bins[idx] += 1
+
+    sys.stdout.write(f"brain at {db}\n")
+    sys.stdout.write(f"  total atoms:    {total}\n\n")
+
+    sys.stdout.write("by type:\n")
+    for t, c in sorted(by_type.items(), key=lambda kv: -kv[1]):
+        sys.stdout.write(f"  {t:<14} {c}\n")
+
+    sys.stdout.write("\nby region:\n")
+    for r, c in sorted(by_region.items(), key=lambda kv: -kv[1]):
+        sys.stdout.write(f"  {r:<22} {c}\n")
+
+    sys.stdout.write("\nimportance histogram (bucket=0.1):\n")
+    max_bin = max(importance_bins) or 1
+    for i, count in enumerate(importance_bins):
+        lo, hi = i / 10, (i + 1) / 10
+        bar = "#" * int(40 * count / max_bin)
+        sys.stdout.write(f"  [{lo:.1f}-{hi:.1f})  {count:>4}  {bar}\n")
+
+    # Step-outcome breakdown — the atoms brain_score actually consults.
+    step_atoms = [r for r in rows if r[3] == "steps"]
+    if step_atoms:
+        sys.stdout.write(
+            f"\nstep-outcome atoms (region='steps'):  {len(step_atoms)}\n"
+        )
+        skills = sum(1 for r in step_atoms if r[2] == "skill")
+        antis = sum(1 for r in step_atoms if r[2] == "antipattern")
+        sys.stdout.write(f"  skill (successes):       {skills}\n")
+        sys.stdout.write(f"  antipattern (failures):  {antis}\n")
+
+    # Top-N hottest atoms (highest importance, after Hebbian updates).
+    n = args.top
+    sys.stdout.write(f"\ntop {n} hottest atoms (highest importance):\n")
+    rows_sorted = sorted(rows, key=lambda r: -r[4])
+    for _id, content, atype, region, importance, ac, _ca in rows_sorted[:n]:
+        snippet = content[:80].replace("\n", " ")
+        sys.stdout.write(
+            f"  [imp={importance:.2f} ac={ac:>3} {atype:<11} {region or '-':<14}] {snippet}\n"
+        )
+    return 0
+
+
 def _evolve(args: argparse.Namespace) -> int:
     from lattice.atoms import SQLiteAtomStore, boost_recurrent_traces, discover
 
@@ -928,6 +1010,22 @@ def main(argv: list[str] | None = None) -> int:
     export_p.add_argument("--db", required=True)
     export_p.add_argument("file", help="Output .json path.")
     export_p.set_defaults(func=_brain_export)
+
+    state_p = brain_sub.add_parser(
+        "audit-state",
+        help=(
+            "Snapshot the brain's state — type/region breakdown, "
+            "importance histogram, and top hottest atoms. The view "
+            "you want after running a benchmark or audit to see "
+            "what the system actually learned."
+        ),
+    )
+    state_p.add_argument("--db", required=True)
+    state_p.add_argument(
+        "--top", type=int, default=10,
+        help="Number of hottest atoms to print (default 10).",
+    )
+    state_p.set_defaults(func=_brain_audit_state)
 
     evolve_p = sub.add_parser(
         "evolve",

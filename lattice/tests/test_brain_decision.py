@@ -23,7 +23,7 @@ from lattice.actions import (
 )
 from lattice.atoms import AtomType, SQLiteAtomStore
 from lattice.compiler import DictWorkspace
-from lattice.orchestrator import AgentLoop
+from lattice.orchestrator import AgentLoop, StepRecord
 from lattice.propose.mock import MockProposer
 
 
@@ -235,15 +235,23 @@ def test_reinforce_bumps_importance_for_recalled_atoms_on_success(tmp_path):
     store.close()
 
 
-def test_reinforce_decays_importance_for_recalled_atoms_on_failure(tmp_path):
-    """Atoms recalled into the obs of a FAILED step get importance down."""
+def test_reinforce_does_not_decay_observation_atoms_on_failure(tmp_path):
+    """Observation-recall atoms are NOT decayed on a failed step.
+
+    This is the post-fix semantics: a failed step's
+    observation-recall atoms often contain context (or even the FIX
+    REQUIRED hint via prior failures) that helps the NEXT step
+    succeed. Penalising them buries the very signals that enable
+    self-correction. Only atoms in region='steps' that brain_score
+    used for the failing candidate get decayed.
+    """
     from lattice.actions import AddParameter, SymbolRef, TypeExpr
 
     store = _store(tmp_path)
     seeded = store.add(
         "skill: misleading guidance",
         type=AtomType.SKILL,
-        region="general",
+        region="general",  # NOT region='steps' — observation only
         importance=0.6,
     )
     bad = AddParameter(
@@ -262,8 +270,50 @@ def test_reinforce_decays_importance_for_recalled_atoms_on_failure(tmp_path):
     hits = store.recall("misleading guidance", k=3)
     same_atom = next((h for h in hits if h.atom.id == seeded.id), None)
     assert same_atom is not None
-    # -0.03 from being recalled into a failed step.
-    assert same_atom.atom.importance <= 0.6 - 0.02
+    # Observation-recall atom unchanged from 0.6.
+    assert abs(same_atom.atom.importance - 0.6) < 0.001
+    store.close()
+
+
+def test_reinforce_directly_decays_brain_score_atoms_on_failure(tmp_path):
+    """Direct unit test on _reinforce_recalled: a failure record with
+    _winning_brain_ids set DOES decay those atoms by -0.03.
+
+    Avoids the full agent loop (where compile-error candidates have
+    no brain_score contributors anyway) so we test the reinforce
+    semantics in isolation.
+    """
+    from lattice.actions import AddImport
+
+    store = _store(tmp_path)
+    a = store.add("contributor 1", type=AtomType.SKILL, importance=0.6)
+    b = store.add("contributor 2", type=AtomType.ANTIPATTERN, importance=0.6)
+
+    loop = AgentLoop(
+        proposer=MockProposer.empty(),
+        workspace=_ws(),
+        atom_store=store,
+        use_brain=True,
+    )
+    # Inject as-if a previous brain_score said "these atoms moved the
+    # decision toward this candidate", and the step then failed verify.
+    loop._winning_brain_ids = [a.id, b.id]
+    loop._cycle_recalled_ids = []
+    bad_record = StepRecord(
+        step=1,
+        action=AddImport(
+            file=FileRef(path="src/main.py"), module="json", confidence=0.9
+        ),
+        kind="error",
+        error="some verify failure",
+    )
+    loop._reinforce_recalled(bad_record)
+
+    # Both contributors decayed by 0.03.
+    hits = store.recall("contributor", k=5)
+    for h in hits:
+        if h.atom.id in (a.id, b.id):
+            assert h.atom.importance <= 0.6 - 0.02
     store.close()
 
 
@@ -550,6 +600,28 @@ def test_outcome_atom_embeds_near_brain_score_query(tmp_path):
     # The just-written SKILL atom should boost this candidate.
     assert delta > 0.0
     assert ids, "expected to find the atom we just wrote"
+    store.close()
+
+
+def test_winning_brain_ids_cleared_at_cycle_start(tmp_path):
+    """_winning_brain_ids must be cleared at the start of EVERY cycle.
+
+    Without this, atoms from a previous cycle's winning candidate get
+    reinforced for an outcome they didn't influence (proposer raised
+    or returned no candidates this cycle). Sets the IDs manually then
+    runs a cycle where the proposer returns no candidates; checks
+    they're cleared rather than carried forward.
+    """
+    store = _store(tmp_path)
+    proposer = MockProposer(batches=[])  # empty — terminates immediately
+    loop = AgentLoop(
+        proposer=proposer, workspace=_ws(), atom_store=store, use_brain=True
+    )
+    loop._winning_brain_ids = [999, 1000]  # stale state
+    loop.run("any task")
+    # After run, the loop should have cleared stale state before
+    # any reinforcement attempt could have used it.
+    assert loop._winning_brain_ids == []
     store.close()
 
 

@@ -167,6 +167,12 @@ class AgentLoop:
                 self._plan.begin(cur)
 
         for step_idx in range(1, self.max_steps + 1):
+            # Clear stale decision-state from the prior cycle BEFORE
+            # building obs or proposing. Prevents the case where the
+            # proposer raises (or returns no candidates) and we end up
+            # reinforcing atoms left over from a previous successful
+            # cycle's winning candidate.
+            self._winning_brain_ids = []
             obs = self._build_observation(task, steps)
             try:
                 action = self._propose_with_preflight(obs)
@@ -274,6 +280,13 @@ class AgentLoop:
         import os
         import sys
 
+        # Always clear stale decision-state before computing this
+        # cycle's winner. Any early return below ('no candidates',
+        # 'empty scored list', proposer exception caught upstream)
+        # must leave _winning_brain_ids = [] so we don't reinforce
+        # atoms from a previous cycle's decision against a current
+        # cycle's outcome.
+        self._winning_brain_ids = []
         actions = self.proposer.propose(obs, n=self._preflight_candidates)
         if os.environ.get("LATTICE_LLM_DEBUG"):
             sys.stderr.write(
@@ -469,27 +482,35 @@ class AgentLoop:
             return
         if not self._is_mutating(record.action):
             return
-        # Decide direction & magnitude.
+
+        # SUCCESS path: both observation-recall AND winning-brain-score
+        # atoms get reinforced. The observation atoms helped the LLM
+        # see the context; the brain-score atoms moved the decision
+        # toward the winning candidate. Both deserve credit.
         if record.kind == "edit" and not record.error:
-            delta = +0.05
-        elif record.kind == "error":
-            delta = -0.03
-        else:
+            participating = list(
+                set(self._cycle_recalled_ids) | set(self._winning_brain_ids)
+            )
+            if not participating:
+                return
+            try:
+                self.atom_store.reinforce(participating, +0.05)
+            except Exception:  # noqa: BLE001
+                pass
             return
-        # Reinforce TWO pools:
-        #   (a) atoms recalled into the observation (general task-level
-        #       context that the LLM saw),
-        #   (b) atoms that brain_score consulted for the WINNING candidate
-        #       (specific (verb, slot, task) signature matches that
-        #       earned the +/- decision delta).
-        # Union prevents double-counting when an atom appears in both.
-        participating = list(set(self._cycle_recalled_ids) | set(self._winning_brain_ids))
-        if not participating:
-            return
-        try:
-            self.atom_store.reinforce(participating, delta)
-        except Exception:  # noqa: BLE001
-            pass
+
+        # FAILURE path: only decay atoms that brain_score used to score
+        # the failing candidate. Observation-recall atoms are NOT
+        # decayed because they often produced the FIX REQUIRED hint
+        # that helps the NEXT step succeed — penalizing them buries
+        # the very signals that enable self-correction. Decay is also
+        # gentler than reinforcement (0.03 vs 0.05) because a single
+        # failure isn't strong evidence the atom is wrong.
+        if record.kind == "error" and self._winning_brain_ids:
+            try:
+                self.atom_store.reinforce(self._winning_brain_ids, -0.03)
+            except Exception:  # noqa: BLE001
+                pass
 
     def _persist_plan_atom(self, plan: Plan) -> None:
         """Write a TASK atom that summarizes the plan shape.
