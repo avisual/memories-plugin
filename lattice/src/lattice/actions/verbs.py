@@ -8,14 +8,19 @@ holds nested actions — that's the compositional point at the verb level.
 
 from __future__ import annotations
 
+import re
 from typing import TYPE_CHECKING, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from lattice.actions.refs import Expr, FileRef, IntentTag, SpanRef, SymbolRef, TypeExpr
 
 if TYPE_CHECKING:
     from lattice.actions.action import Action
+
+
+_DOTTED_IDENTIFIER_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*(\.[a-zA-Z_][a-zA-Z0-9_]*)*$")
+_IDENTIFIER_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
 
 
 _BlockedReason = Literal[
@@ -39,6 +44,32 @@ class AddImport(_Verb):
     names: list[str] | None = None
     alias: str | None = None
 
+    @field_validator("module")
+    @classmethod
+    def _module_is_dotted_identifier(cls, v: str) -> str:
+        if not _DOTTED_IDENTIFIER_RE.match(v):
+            raise ValueError(
+                f"module must be a dotted Python identifier (e.g. 'os.path'), got {v!r}"
+            )
+        return v
+
+    @field_validator("alias")
+    @classmethod
+    def _alias_is_identifier(cls, v: str | None) -> str | None:
+        if v is not None and not _IDENTIFIER_RE.match(v):
+            raise ValueError(f"alias must be a Python identifier, got {v!r}")
+        return v
+
+    @field_validator("names")
+    @classmethod
+    def _names_are_identifiers(cls, v: list[str] | None) -> list[str] | None:
+        if v is None:
+            return v
+        for name in v:
+            if not _IDENTIFIER_RE.match(name):
+                raise ValueError(f"import name must be a Python identifier, got {name!r}")
+        return v
+
     def model_post_init(self, __context) -> None:
         if self.alias is not None:
             if self.names is not None and len(self.names) != 1:
@@ -57,6 +88,13 @@ class RenameSymbol(_Verb):
     symbol: SymbolRef
     new_name: str = Field(min_length=1)
 
+    @field_validator("new_name")
+    @classmethod
+    def _new_name_is_identifier(cls, v: str) -> str:
+        if not _IDENTIFIER_RE.match(v):
+            raise ValueError(f"new_name must be a Python identifier, got {v!r}")
+        return v
+
     def model_post_init(self, __context) -> None:
         if self.new_name == self.symbol.name.split(".")[-1]:
             raise ValueError("new_name is identical to current name")
@@ -69,6 +107,13 @@ class AddField(_Verb):
     type: TypeExpr
     default: Expr | None = None
 
+    @field_validator("name")
+    @classmethod
+    def _name_is_identifier(cls, v: str) -> str:
+        if not _IDENTIFIER_RE.match(v):
+            raise ValueError(f"name must be a Python identifier, got {v!r}")
+        return v
+
 
 class AddParameter(_Verb):
     verb: Literal["AddParameter"] = "AddParameter"
@@ -78,6 +123,13 @@ class AddParameter(_Verb):
     default: Expr | None = None
     position: int | None = Field(default=None, ge=0)
     keyword_only: bool = False
+
+    @field_validator("name")
+    @classmethod
+    def _name_is_identifier(cls, v: str) -> str:
+        if not _IDENTIFIER_RE.match(v):
+            raise ValueError(f"name must be a Python identifier, got {v!r}")
+        return v
 
     def model_post_init(self, __context) -> None:
         if self.keyword_only and self.position is not None:

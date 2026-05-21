@@ -27,29 +27,38 @@ The full design is in [DESIGN.md](DESIGN.md).
 
 ## Status
 
-v0 working end-to-end through the composition spine: one intent
-expands into many typed actions, every action compiles to a verified
-diff. What runs today:
+v0 running end-to-end **with a real local LLM**: a small (~500MB)
+instruct model on CPU reads a structured Observation and emits a
+typed Action, which the harness compiles to a verified file diff.
+The thesis — "non-frontier LLM + this body beats a frontier model
+in a chat window" — has its first datapoint.
 
-- **Action DSL** (Organ 3): 10 typed verbs, Pydantic-validated,
-  discriminated-union parser, JSON-schema export for constrained
-  decoding.
+What runs today:
+
+- **Action DSL** (Organ 3): 10 typed verbs, Pydantic-validated with
+  identifier-shape guards, discriminated-union parser, JSON-schema
+  export for constrained decoding.
 - **Action compiler** (Python, libcst): `AddImport`, `AddField`,
   `AddParameter` produce real file diffs. Idempotent on already-
-  present state. `WrapInTry`, `AddTest`, `RenameSymbol` raise
-  `UnsupportedAction` until they land.
+  present state. Chained execution: each action sees prior ones'
+  output via an overlay workspace.
 - **Symbol-graph extractor** (Organ 2, Python): walks files via
-  libcst, yields typed `Symbol{file, name, kind, line}` records.
-- **Orchestrator**: takes a high-level `Intent`, expands it into many
-  typed `Action`s, runs each through compile + verify, returns an
-  `ExecutionReport` bundling diffs and outcomes.
+  libcst, yields typed `Symbol` records with dotted names.
+- **Orchestrator**: expands a high-level Intent into typed Actions
+  OR consumes Actions from a Proposer; runs compile + verify per
+  step; returns an `ExecutionReport` with consolidated diffs.
+- **Proposer abstraction**: `MockProposer` for tests;
+  `LocalLLMProposer` driving a small instruct model (Qwen2.5-0.5B
+  default) with prompt-based JSON output, loose-coercion of
+  common small-model mistakes, retry-on-invalid with the schema
+  error as a correction signal.
 - **Syntactic verify** (Organ 7, partial): every compiled diff is
   parsed with `ast.parse`.
-- **CLI**: `python -m lattice apply` (single action) and
-  `python -m lattice intent` (multi-action expansion).
+- **CLI**: `apply` (single action), `intent` (multi-action
+  expansion), `propose` (local-LLM-driven).
 
-Not yet: world model, steering, lattice store, apprentice, evolution,
-interface surfaces beyond the CLI.
+Not yet: world model, steering, lattice store integration,
+apprentice, evolution, interface surfaces beyond the CLI.
 
 ## Try it
 
@@ -106,6 +115,34 @@ or method), emits one `AddParameter` action per match, compiles each
 through libcst, and verifies the output parses. Output is a sequence
 of unified diffs across all touched files. Nothing is written to disk
 — the diff is the deliverable.
+
+### Local LLM (the headline)
+
+A small instruct model on CPU drives the loop end-to-end:
+
+```bash
+uv pip install -e ".[llm]"   # installs torch + transformers; ~1GB
+
+uv run python -m lattice propose /tmp/demo \
+  --task "Add an import of the 'stripe' module to src/payments/charge.py."
+```
+
+```
+loading model...
+proposed action:
+  {"verb":"AddImport","file":{"path":"src/payments/charge.py"},"module":"stripe",...}
+--- a/src/payments/charge.py
++++ b/src/payments/charge.py
+@@ -1,4 +1,5 @@
+ """Charge processing."""
++import stripe
+```
+
+Qwen2.5-0.5B-Instruct on a 4-core CPU, ~7 seconds from cold model
+load to verified diff. The LLM never sees source code as text; it
+sees a typed Observation (task + Symbol list) and emits one typed
+Action; the harness handles compile + verify. Override the model
+with `--model HuggingFace/name` or `LATTICE_LLM_MODEL`.
 
 ## Layout
 

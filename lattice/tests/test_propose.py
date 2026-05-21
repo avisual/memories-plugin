@@ -20,7 +20,7 @@ from lattice.propose import (
     Proposer,
     ProposerError,
 )
-from lattice.propose.local import _extract_json
+from lattice.propose.local import _coerce_loose, _extract_json
 
 
 # ---------------------------------------------------------------------------
@@ -112,6 +112,62 @@ class TestExtractJson:
 
     def test_malformed_object(self):
         assert _extract_json("{this is not, json}") is None
+
+
+# ---------------------------------------------------------------------------
+# Loose-coercion layer (forgives small-model JSON-shape mistakes)
+# ---------------------------------------------------------------------------
+
+
+class TestCoerceLoose:
+    def test_file_as_string_becomes_dict(self):
+        out = _coerce_loose({"file": "src/x.py"})
+        assert out["file"] == {"path": "src/x.py"}
+
+    def test_strips_leading_slash(self):
+        out = _coerce_loose({"file": "/src/x.py"})
+        assert out["file"] == {"path": "src/x.py"}
+
+    def test_strips_dot_slash(self):
+        out = _coerce_loose({"file": "./src/x.py"})
+        assert out["file"] == {"path": "src/x.py"}
+
+    def test_type_as_string_becomes_dict(self):
+        out = _coerce_loose({"type": "int"})
+        assert out["type"] == {"expr": "int"}
+
+    def test_default_as_string_becomes_dict(self):
+        out = _coerce_loose({"default": "0"})
+        assert out["default"] == {"code": "0"}
+
+    def test_symbol_double_colon(self):
+        out = _coerce_loose({"symbol": "a.py::Foo.bar"})
+        assert out["symbol"] == {"file": "a.py", "name": "Foo.bar"}
+
+    def test_symbol_single_colon(self):
+        out = _coerce_loose({"function": "a.py:f"})
+        assert out["function"] == {"file": "a.py", "name": "f"}
+
+    def test_span_file_normalized(self):
+        out = _coerce_loose({"span": {"file": "/a.py", "start_line": 1, "end_line": 2}})
+        assert out["span"]["file"] == "a.py"
+
+    def test_already_correct_passed_through(self):
+        payload = {"file": {"path": "a.py"}, "module": "json", "confidence": 0.9}
+        assert _coerce_loose(payload) == payload
+
+    def test_full_payload_with_addimport_shorthand(self):
+        from lattice.actions import parse_action
+
+        raw = {
+            "verb": "AddImport",
+            "file": "/src/payments/charge.py",
+            "module": "stripe",
+            "confidence": 0.9,
+        }
+        action = parse_action(_coerce_loose(raw))
+        assert action.verb == "AddImport"
+        assert action.file.path == "src/payments/charge.py"
 
 
 # ---------------------------------------------------------------------------

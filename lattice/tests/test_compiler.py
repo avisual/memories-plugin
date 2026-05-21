@@ -65,6 +65,26 @@ class TestAddImport:
         assert _parses(result.file_changes[0].after)
         assert "import json" in result.file_changes[0].after
 
+    def test_first_import_lands_after_docstring(self):
+        src = textwrap.dedent('''\
+            """Module docstring."""
+
+
+            CONST = 1
+        ''')
+        ws = DictWorkspace({"a.py": src})
+        result = compile_action(
+            AddImport(file=FileRef(path="a.py"), module="json", confidence=0.9), ws
+        )
+        out = result.file_changes[0].after
+        assert _parses(out)
+        lines = out.splitlines()
+        assert lines[0].strip().startswith('"""')
+        json_idx = next(i for i, line in enumerate(lines) if line.strip() == "import json")
+        const_idx = next(i for i, line in enumerate(lines) if line.startswith("CONST"))
+        assert json_idx > 0
+        assert json_idx < const_idx
+
     def test_after_existing_imports(self):
         src = textwrap.dedent("""\
             import os

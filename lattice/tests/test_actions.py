@@ -112,6 +112,22 @@ class TestAddImport:
         with pytest.raises(ValidationError):
             AddImport(file=_file(), module="json", names=[], confidence=0.5)
 
+    def test_module_must_be_dotted_identifier(self):
+        with pytest.raises(ValidationError):
+            AddImport(file=_file(), module="src/payments/charge.py", confidence=0.5)
+        with pytest.raises(ValidationError):
+            AddImport(file=_file(), module="some-pkg", confidence=0.5)
+        # Dotted is fine.
+        AddImport(file=_file(), module="os.path", confidence=0.5)
+
+    def test_alias_must_be_identifier(self):
+        with pytest.raises(ValidationError):
+            AddImport(file=_file(), module="numpy", alias="np-x", confidence=0.5)
+
+    def test_names_must_be_identifiers(self):
+        with pytest.raises(ValidationError):
+            AddImport(file=_file(), module="json", names=["loads", "bad-name"], confidence=0.5)
+
 
 class TestRenameSymbol:
     def test_basic(self):
@@ -278,7 +294,10 @@ class TestParseAction:
 
 
 @given(
-    module=st.from_regex(r"\A[a-z][a-z0-9_.]{0,30}\Z", fullmatch=True),
+    module=st.from_regex(
+        r"\A[a-z_][a-z0-9_]{0,12}(\.[a-z_][a-z0-9_]{0,12}){0,3}\Z",
+        fullmatch=True,
+    ),
     confidence=CONFIDENCE,
 )
 def test_add_import_round_trip(module: str, confidence: float):

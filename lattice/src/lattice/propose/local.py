@@ -40,22 +40,28 @@ _RETRIES = 2
 _VOCAB_DOC = """\
 Action vocabulary (emit exactly ONE of these as a single JSON object):
 
-AddImport     - {"verb":"AddImport", "file":{"path":"<rel.py>"}, "module":"<mod>", "names":["a","b"]?, "alias":"<a>"?, "confidence":0.5}
-RenameSymbol  - {"verb":"RenameSymbol", "symbol":{"file":"<rel.py>","name":"<dotted>"}, "new_name":"<new>", "confidence":0.5}
-AddField      - {"verb":"AddField", "cls":{"file":"<rel.py>","name":"<ClassName>"}, "name":"<field>", "type":{"expr":"<type>"}, "default":{"code":"<expr>"}?, "confidence":0.5}
-AddParameter  - {"verb":"AddParameter", "function":{"file":"<rel.py>","name":"<dotted>"}, "name":"<param>", "type":{"expr":"<type>"}, "default":{"code":"<expr>"}?, "position":<int>?, "keyword_only":<bool>, "confidence":0.5}
-WrapInTry     - {"verb":"WrapInTry", "span":{"file":"<rel.py>","start_line":<int>,"end_line":<int>}, "exception_type":{"expr":"<TypeName>"}, "handler_body":[], "confidence":0.5}
-AddTest       - {"verb":"AddTest", "target":{"file":"<rel.py>","name":"<dotted>"}, "test_name":"test_<...>", "given":{"code":"<expr>"}, "when":{"code":"<expr>"}, "then":{"code":"<assert expr>"}, "confidence":0.5}
-RecallMore    - {"verb":"RecallMore", "query":"<short query>", "confidence":0.5}
-RevealBody    - {"verb":"RevealBody", "symbol":{"file":"<rel.py>","name":"<dotted>"}, "confidence":0.5}
-MarkBlocked   - {"verb":"MarkBlocked", "reason_code":"ambiguous_intent|missing_context|incompatible_types|external_dependency|needs_human", "detail":"<short>", "confidence":0.5}
-Branch        - {"verb":"Branch", "rationale":"<short>", "confidence":0.5}
+AddImport     - add an import statement to a file.
+                {"verb":"AddImport", "file":{"path":"src/x.py"}, "module":"json", "confidence":0.9}
+                # 'file.path' = the .py file you are editing
+                # 'module'    = the Python package being imported (e.g. "os", "stripe",
+                #               "os.path"). NEVER a file path. Must be a dotted identifier.
+
+RenameSymbol  - {"verb":"RenameSymbol", "symbol":{"file":"src/x.py","name":"OldName"}, "new_name":"NewName", "confidence":0.7}
+AddField      - {"verb":"AddField", "cls":{"file":"src/x.py","name":"ClassName"}, "name":"field_name", "type":{"expr":"int"}, "default":{"code":"0"}, "confidence":0.7}
+AddParameter  - {"verb":"AddParameter", "function":{"file":"src/x.py","name":"ClassName.method"}, "name":"param", "type":{"expr":"bool"}, "default":{"code":"False"}, "keyword_only":true, "confidence":0.7}
+WrapInTry     - {"verb":"WrapInTry", "span":{"file":"src/x.py","start_line":10,"end_line":14}, "exception_type":{"expr":"ValueError"}, "handler_body":[], "confidence":0.7}
+AddTest       - {"verb":"AddTest", "target":{"file":"src/x.py","name":"func"}, "test_name":"test_func", "given":{"code":"x = 1"}, "when":{"code":"y = func(x)"}, "then":{"code":"assert y == 2"}, "confidence":0.7}
+RecallMore    - {"verb":"RecallMore", "query":"rate-limit middleware", "confidence":0.5}
+RevealBody    - {"verb":"RevealBody", "symbol":{"file":"src/x.py","name":"func"}, "confidence":0.5}
+MarkBlocked   - {"verb":"MarkBlocked", "reason_code":"missing_context", "detail":"need to see User model", "confidence":0.6}
+Branch        - {"verb":"Branch", "rationale":"try alternative approach", "confidence":0.5}
 
 Rules:
 - Emit ONE JSON object on a single line.
 - No markdown code fences. No commentary. JSON only.
+- 'module' is a Python package name like 'os' or 'stripe', not a file path.
+- File paths must be repository-relative (no leading slash, no '..').
 - Use confidence in [0.0, 1.0].
-- File paths must be repository-relative (no leading /, no ..).
 """
 
 
@@ -73,6 +79,73 @@ def _render_observation(obs: ObservationContext) -> str:
 
 
 _JSON_OBJECT_RE = re.compile(r"\{.*\}", re.DOTALL)
+
+
+_STRING_TO_REF_FIELDS = {
+    "file": "path",
+    "type": "expr",
+    "default": "code",
+    "given": "code",
+    "when": "code",
+    "then": "code",
+    "exception_type": "expr",
+    "intent": "label",
+}
+
+
+def _normalize_path(p: str) -> str:
+    """Strip leading slashes and leading './'. Repository-relative."""
+    while p.startswith("/"):
+        p = p[1:]
+    while p.startswith("./"):
+        p = p[2:]
+    return p
+
+
+def _coerce_loose(payload: dict[str, Any]) -> dict[str, Any]:
+    """Forgive common small-model JSON-shape mistakes.
+
+    The strict Pydantic schema is preserved — this only normalizes
+    obvious shorthand before validation runs. Mutates and returns a
+    shallow copy of *payload*.
+    """
+    if not isinstance(payload, dict):
+        return payload
+    out = dict(payload)
+
+    for field, inner_key in _STRING_TO_REF_FIELDS.items():
+        if isinstance(out.get(field), str):
+            value = out[field]
+            if inner_key == "path":
+                value = _normalize_path(value)
+            out[field] = {inner_key: value}
+
+    for sym_field in ("symbol", "cls", "function", "target"):
+        v = out.get(sym_field)
+        if isinstance(v, str):
+            # Accept "file::name" or "file:name" or "name" with a separate "file" field nearby.
+            for sep in ("::", ":"):
+                if sep in v:
+                    f, _, n = v.partition(sep)
+                    out[sym_field] = {"file": _normalize_path(f), "name": n}
+                    break
+        elif isinstance(v, dict) and isinstance(v.get("file"), str):
+            v = dict(v)
+            v["file"] = _normalize_path(v["file"])
+            out[sym_field] = v
+
+    span = out.get("span")
+    if isinstance(span, dict) and isinstance(span.get("file"), str):
+        span = dict(span)
+        span["file"] = _normalize_path(span["file"])
+        out["span"] = span
+
+    if isinstance(out.get("file"), dict) and isinstance(out["file"].get("path"), str):
+        f = dict(out["file"])
+        f["path"] = _normalize_path(f["path"])
+        out["file"] = f
+
+    return out
 
 
 def _extract_json(text: str) -> dict[str, Any] | None:
@@ -197,7 +270,7 @@ class LocalLLMProposer:
                 )
                 continue
             try:
-                action = parse_action(payload)
+                action = parse_action(_coerce_loose(payload))
             except ValidationError as exc:
                 last_error = str(exc)
                 correction = (

@@ -2,14 +2,19 @@
 
 Subcommands:
 
-    python -m lattice apply  <workspace> [--action JSON | -]
-    python -m lattice intent <workspace> [--intent JSON | -] [--files a.py,b.py]
+    python -m lattice apply   <workspace> [--action JSON | -]
+    python -m lattice intent  <workspace> [--intent JSON | -] [--files a.py,b.py]
+    python -m lattice propose <workspace> --task "..." [--model NAME]
 
 `apply` takes a single typed Action and prints its diff.
 `intent` takes a high-level Intent, expands it into many typed Actions
 (the composition spine: intent → primitives), compiles and verifies
-each, and prints a multi-file unified diff. No filesystem mutation —
-diffs are printed, not applied.
+each, and prints a multi-file unified diff.
+`propose` asks a small local LLM (default Qwen2.5-0.5B) to emit an
+Action for a task, then runs compile + verify + diff. The full
+non-text reasoning loop driven by a real model.
+
+No filesystem mutation — diffs are printed, not applied.
 
 Exit: 0 on success, 1 on compile/verify failure, 2 on input errors.
 """
@@ -91,6 +96,56 @@ def _apply(args: argparse.Namespace) -> int:
 _intent_adapter: TypeAdapter[Intent] = TypeAdapter(Intent)
 
 
+def _propose(args: argparse.Namespace) -> int:
+    from lattice.orchestrator import execute_plan
+    from lattice.propose import ObservationContext
+    from lattice.propose.local import LocalLLMProposer
+    from lattice.sense import walk_workspace
+
+    workspace = FilesystemWorkspace(args.workspace)
+    files = (
+        [p.strip() for p in args.files.split(",") if p.strip()]
+        if args.files
+        else workspace.iter_files(suffix=".py")
+    )
+    symbols = walk_workspace(workspace, files)
+
+    obs = ObservationContext(task=args.task, symbols=tuple(symbols[:30]))
+    sys.stderr.write(f"loading model{(' ' + args.model) if args.model else ''}...\n")
+    proposer = LocalLLMProposer(model_name=args.model) if args.model else LocalLLMProposer()
+
+    try:
+        actions = proposer.propose(obs)
+    except Exception as exc:  # noqa: BLE001
+        sys.stderr.write(f"proposer failed: {type(exc).__name__}: {exc}\n")
+        return 1
+    if not actions:
+        sys.stderr.write("(proposer returned no actions)\n")
+        return 1
+
+    sys.stderr.write(f"proposed action:\n  {actions[0].model_dump_json()}\n")
+
+    report = execute_plan(actions, workspace)
+    if not report.ok:
+        for step in report.steps:
+            if step.ok:
+                continue
+            if step.error:
+                sys.stderr.write(f"  step failed: {step.error}\n")
+            elif step.verify and step.verify.errors:
+                for path, msg in step.verify.errors:
+                    sys.stderr.write(f"  verify failed {path}: {msg}\n")
+        return 1
+
+    for diff in report.consolidated_diffs:
+        sys.stdout.write(diff)
+        if not diff.endswith("\n"):
+            sys.stdout.write("\n")
+    if not report.consolidated_diffs:
+        sys.stderr.write("(action was a no-op against the current workspace)\n")
+    return 0
+
+
 def _intent(args: argparse.Namespace) -> int:
     workspace = FilesystemWorkspace(args.workspace)
     payload = _read_action_json(args.intent, sys.stdin)
@@ -162,6 +217,24 @@ def main(argv: list[str] | None = None) -> int:
         help="Comma-separated repository-relative .py paths. Default: walk workspace.",
     )
     intent_p.set_defaults(func=_intent)
+
+    propose_p = sub.add_parser(
+        "propose",
+        help="Ask a local LLM to emit an Action for a task; compile + verify + diff.",
+    )
+    propose_p.add_argument("workspace", help="Repository root the action operates against.")
+    propose_p.add_argument("--task", required=True, help="One-line task description.")
+    propose_p.add_argument(
+        "--files",
+        default="",
+        help="Comma-separated repository-relative .py paths to surface as symbol context.",
+    )
+    propose_p.add_argument(
+        "--model",
+        default=None,
+        help="HuggingFace model name. Default: Qwen/Qwen2.5-0.5B-Instruct (~500MB, CPU).",
+    )
+    propose_p.set_defaults(func=_propose)
 
     args = parser.parse_args(argv)
     return args.func(args)

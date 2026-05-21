@@ -26,6 +26,7 @@ from lattice.actions import (
 )
 from lattice.compiler.diff import unified_diff
 from lattice.compiler.errors import (
+    CompileError,
     NonMutatingAction,
     SymbolNotFound,
     UnsupportedAction,
@@ -41,24 +42,27 @@ def compile_action(action: Action, workspace: Workspace) -> CompiledAction:
     carries `before` / `after` content for each affected file plus a
     unified diff. Applying it to disk is verify's job.
     """
-    match action:
-        case AddImport():
-            return _compile_add_import(action, workspace)
-        case AddField():
-            return _compile_add_field(action, workspace)
-        case AddParameter():
-            return _compile_add_parameter(action, workspace)
-        case WrapInTry() | AddTest() | RenameSymbol():
-            raise UnsupportedAction(
-                f"compiler does not yet implement {action.verb!r}"
-            )
-        case RecallMore() | RevealBody() | MarkBlocked() | Branch():
-            raise NonMutatingAction(
-                f"{action.verb!r} does not produce file changes; "
-                "the orchestrator handles it directly"
-            )
-        case _:
-            raise UnsupportedAction(f"unknown action: {type(action).__name__}")
+    try:
+        match action:
+            case AddImport():
+                return _compile_add_import(action, workspace)
+            case AddField():
+                return _compile_add_field(action, workspace)
+            case AddParameter():
+                return _compile_add_parameter(action, workspace)
+            case WrapInTry() | AddTest() | RenameSymbol():
+                raise UnsupportedAction(
+                    f"compiler does not yet implement {action.verb!r}"
+                )
+            case RecallMore() | RevealBody() | MarkBlocked() | Branch():
+                raise NonMutatingAction(
+                    f"{action.verb!r} does not produce file changes; "
+                    "the orchestrator handles it directly"
+                )
+            case _:
+                raise UnsupportedAction(f"unknown action: {type(action).__name__}")
+    except (cst.CSTValidationError, cst.ParserSyntaxError) as exc:
+        raise CompileError(f"libcst rejected {action.verb!r}: {exc}") from exc
 
 
 # ---------------------------------------------------------------------------
@@ -138,13 +142,23 @@ def _render(node: cst.CSTNode) -> str:
 
 
 def _last_top_level_import_index(module: cst.Module) -> int:
+    """Index of the last top-level import.
+
+    If no imports exist, returns the index *just after* a leading
+    docstring (if present), so PEP-8 placement is preserved when we add
+    the very first import to a previously import-free file.
+    """
     last = -1
     for i, stmt in enumerate(module.body):
         if isinstance(stmt, cst.SimpleStatementLine) and stmt.body and isinstance(
             stmt.body[0], (cst.Import, cst.ImportFrom)
         ):
             last = i
-    return last
+    if last >= 0:
+        return last
+    if module.body and _is_docstring(module.body[0]):
+        return 0  # insertion happens at index 1, after the docstring.
+    return -1  # insertion happens at index 0, at the top of the file.
 
 
 # ---------------------------------------------------------------------------
