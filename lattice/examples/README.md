@@ -32,6 +32,7 @@ runs use the cache and complete in seconds.
 | `03_brain_recall.sh` | The brain ships smart: a vague task ("payment library") resolves to `stripe` via recall. |
 | `04_agent_multistep.sh` | The stack-machine model: a 2-edit task done in two cycles by a 0.5B model. |
 | `05_brain_grow.sh` | Import a custom atom pack and watch the brain absorb new project knowledge. |
+| `06_full_stack.sh` | **The headline.** Research + two-stage LLM (Planner+Executor) + atom feedback. Qwen-1.5B fetches Flask-CORS docs at runtime and uses what it just learned to emit `from flask_cors import CORS`. |
 
 All examples run on a CPU-only machine in under a minute each (after
 the model is cached locally).
