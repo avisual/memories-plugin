@@ -209,25 +209,58 @@ class MarkDone(_Verb):
 _HTTP_URL_RE = re.compile(r"^https?://[^\s<>\"']+$", re.IGNORECASE)
 
 
-_INSERT_POSITION = Literal["end", "top_after_imports"]
+_INSERT_POSITION = Literal[
+    "end",
+    "top_after_imports",
+    "start_of_function",
+    "end_of_function",
+]
 
 
 class AddStatement(_Verb):
-    """Insert a module-level statement at a chosen position in a file.
+    """Insert a statement at a chosen position in a file.
 
-    Closes the gap between AddImport and 'actually wire it up' — e.g.
-    after AddImport of flask_cors, AddStatement(`cors = CORS(app)`)
-    completes the integration.
+    Module-level positions:
+      - 'end'                — at the end of the file.
+      - 'top_after_imports'  — after docstring + import block.
 
-    `code` is parsed with libcst.parse_module before insertion, so
+    Function-scoped positions (require `target` to be set to the
+    function or method):
+      - 'start_of_function'  — first statement in the function body
+                               (after the docstring, if any).
+      - 'end_of_function'    — last statement in the function body.
+
+    `code` is parsed with libcst.parse_module before insertion so
     invalid Python is rejected at compile time. Multiple statements
     are allowed (each becomes its own SimpleStatementLine).
+
+    Examples:
+        # 'cors = CORS(app)' at module end:
+        AddStatement(file=..., code='cors = CORS(app)', position='end')
+
+        # 'logger.info(\"start\")' at the top of charge() body:
+        AddStatement(file=..., code='logger.info(\"start\")',
+                     position='start_of_function',
+                     target=SymbolRef(file=..., name='charge'))
     """
 
     verb: Literal["AddStatement"] = "AddStatement"
     file: FileRef
     code: str = Field(min_length=1, max_length=4000)
     position: _INSERT_POSITION = "end"
+    target: SymbolRef | None = None
+
+    def model_post_init(self, __context) -> None:
+        if self.position in ("start_of_function", "end_of_function") and self.target is None:
+            raise ValueError(
+                f"AddStatement position {self.position!r} requires `target` to "
+                "be set to the function or method SymbolRef."
+            )
+        if self.position in ("end", "top_after_imports") and self.target is not None:
+            raise ValueError(
+                f"AddStatement position {self.position!r} does not use `target`. "
+                "Use 'start_of_function' or 'end_of_function' for function-scoped insertion."
+            )
 
 
 class AddDecorator(_Verb):

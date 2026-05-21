@@ -225,6 +225,39 @@ TASKS: tuple[BenchTask, ...] = (
         },
         expects={"src/cfg.py": ("@classmethod", "def from_dict")},
     ),
+    BenchTask(
+        name="insert-at-start-of-function",
+        tier="pattern",
+        task=(
+            'Insert `logger.info("start")` at the start of function '
+            "charge in src/billing.py"
+        ),
+        files={
+            "src/billing.py": (
+                "def charge(amount: int) -> None:\n"
+                "    process(amount)\n"
+            ),
+        },
+        expects={
+            "src/billing.py": ('logger.info("start")', "def charge", "process(amount)"),
+        },
+    ),
+    BenchTask(
+        name="insert-at-end-of-method",
+        tier="pattern",
+        task=(
+            "Insert `self._cleanup()` at the end of function close "
+            "of class Conn in src/db.py"
+        ),
+        files={
+            "src/db.py": (
+                "class Conn:\n"
+                "    def close(self) -> None:\n"
+                "        self._socket.close()\n"
+            ),
+        },
+        expects={"src/db.py": ("self._cleanup()", "def close")},
+    ),
 
     # ---- Research tier: hardest; LLM must fetch web docs and apply them ----
     BenchTask(

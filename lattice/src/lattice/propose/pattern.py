@@ -33,6 +33,7 @@ from lattice.actions import (
     AddField,
     AddImport,
     AddParameter,
+    AddStatement,
     AddTest,
     Expr,
     FileRef,
@@ -220,6 +221,25 @@ _PATTERNS: list[tuple[re.Pattern[str], str]] = [
         ),
         "add_test",
     ),
+    # 'Insert <code> at the start/end of function FUNC in FILE'
+    # 'Add <code> at the top/bottom of function FUNC in FILE'
+    (
+        re.compile(
+            r"""
+            (?:insert|add)\s+
+            (?P<stmt>['"`].+?['"`]|`.+?`)
+            \s+at\s+(?:the\s+)?(?P<where>start|top|beginning|end|bottom)
+            \s+of\s+(?:function|method)\s+
+            ['"`]?(?P<func>[A-Za-z_][\w.]*)['"`]?
+            (?:\s+(?:of\s+class\s+|in\s+class\s+)
+                ['"`]?(?P<cls>[A-Za-z_]\w*)['"`]?
+            )?
+            \s+(?:in|inside)\s+
+            """ + _PATH,
+            re.IGNORECASE | re.VERBOSE,
+        ),
+        "add_statement_in_function",
+    ),
 ]
 
 
@@ -318,6 +338,28 @@ def task_to_action(task: str) -> Action | None:
             when=Expr(code=f"result = {leaf}()"),
             then=Expr(code="assert result is not None"),
             confidence=0.7,
+        )
+    if kind == "add_statement_in_function":
+        # Strip the matched quote-bracket pair.
+        raw = groups["stmt"].strip()
+        if raw and raw[0] in ('"', "'", "`"):
+            raw = raw[1:-1]
+        if not raw.strip():
+            return None
+        where = (groups.get("where") or "").lower()
+        if where in ("start", "top", "beginning"):
+            position = "start_of_function"
+        else:
+            position = "end_of_function"
+        func = groups["func"]
+        if groups.get("cls"):
+            func = f"{groups['cls']}.{func}"
+        return AddStatement(
+            file=FileRef(path=file_path),
+            code=raw,
+            position=position,  # type: ignore[arg-type]
+            target=SymbolRef(file=file_path, name=func),
+            confidence=0.9,
         )
     if kind == "add_decorator":
         # Two branches collapsed; pull whichever group fired.

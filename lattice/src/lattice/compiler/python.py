@@ -717,12 +717,16 @@ def _statement_from_code(code: str) -> cst.BaseSmallStatement:
 def _compile_add_statement(
     action: AddStatement, workspace: Workspace
 ) -> CompiledAction:
-    """Insert a module-level statement at the requested position.
+    """Insert a statement at the requested position.
+
+    Module-level positions ('end', 'top_after_imports') insert into
+    the module's top-level body. Function-scoped positions
+    ('start_of_function', 'end_of_function') insert into a specific
+    function/method's body — schema-required `target` carries the
+    SymbolRef.
 
     `code` is parsed with libcst.parse_module — invalid Python is
-    rejected here, before anything touches disk. Multiple statements
-    inserted as-is. Idempotent on exact-match: if the same line(s)
-    already exist verbatim at the chosen insertion point, no-op.
+    rejected here. Idempotent on exact-match.
     """
     path = action.file.path
     before = workspace.read(path)
@@ -731,34 +735,68 @@ def _compile_add_statement(
         new_block = cst.parse_module(action.code)
     except cst.ParserSyntaxError as exc:
         raise CompileError(f"AddStatement.code is not valid Python: {exc}") from exc
-
     if not new_block.body:
         raise CompileError("AddStatement.code parsed to zero statements")
 
     module = cst.parse_module(before)
 
-    insertion_index = _statement_insertion_index(module, action.position)
+    if action.position in ("start_of_function", "end_of_function"):
+        assert action.target is not None  # enforced by model_post_init
+        fn = _find_function(module, action.target.name)
 
-    # Idempotency: if every candidate statement already appears verbatim
-    # anywhere at module level, treat as a no-op. Simple set-membership
-    # by rendered source — works for the common 'I already added this
-    # line earlier' case without needing AST equivalence.
-    candidate_renders = [_render_statements([s]) for s in new_block.body]
-    existing_renders = {_render_statements([s]) for s in module.body}
-    if candidate_renders and all(r in existing_renders for r in candidate_renders):
-        return CompiledAction(
-            verb=action.verb,
-            file_changes=(FileChange(path=path, before=before, after=before, diff=""),),
+        body = fn.body
+        if not isinstance(body, cst.IndentedBlock):
+            raise CompileError(
+                f"{action.target.name!r} has no IndentedBlock body; "
+                "cannot insert statements"
+            )
+
+        # Idempotency: skip if every candidate already appears in the body.
+        candidate_renders = [_render_statements([s]) for s in new_block.body]
+        existing_renders = {_render_statements([s]) for s in body.body}
+        if candidate_renders and all(r in existing_renders for r in candidate_renders):
+            return CompiledAction(
+                verb=action.verb,
+                file_changes=(
+                    FileChange(path=path, before=before, after=before, diff=""),
+                ),
+            )
+
+        if action.position == "start_of_function":
+            # After docstring (if any), otherwise at index 0.
+            insert_at = 1 if body.body and _is_docstring(body.body[0]) else 0
+        else:  # end_of_function
+            insert_at = len(body.body)
+
+        new_inner = (
+            *body.body[:insert_at],
+            *new_block.body,
+            *body.body[insert_at:],
         )
+        new_body = body.with_changes(body=new_inner)
+        new_fn = fn.with_changes(body=new_body)
+        new_module = module.deep_replace(fn, new_fn)
+    else:
+        insertion_index = _statement_insertion_index(module, action.position)
 
-    new_body = (
-        *module.body[:insertion_index],
-        *new_block.body,
-        *module.body[insertion_index:],
-    )
-    new_module = module.with_changes(body=new_body)
+        candidate_renders = [_render_statements([s]) for s in new_block.body]
+        existing_renders = {_render_statements([s]) for s in module.body}
+        if candidate_renders and all(r in existing_renders for r in candidate_renders):
+            return CompiledAction(
+                verb=action.verb,
+                file_changes=(
+                    FileChange(path=path, before=before, after=before, diff=""),
+                ),
+            )
+
+        new_body = (
+            *module.body[:insertion_index],
+            *new_block.body,
+            *module.body[insertion_index:],
+        )
+        new_module = module.with_changes(body=new_body)
+
     after = new_module.code
-
     return CompiledAction(
         verb=action.verb,
         file_changes=(

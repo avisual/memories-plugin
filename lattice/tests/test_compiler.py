@@ -470,6 +470,121 @@ class TestAddStatement:
                 ws,
             )
 
+    def test_start_of_function_inserts_at_body_top(self):
+        src = textwrap.dedent("""\
+            def charge(amount: int) -> None:
+                process(amount)
+        """)
+        ws = DictWorkspace({"a.py": src})
+        result = compile_action(
+            AddStatement(
+                file=FileRef(path="a.py"),
+                code='logger.info("start")',
+                position="start_of_function",
+                target=SymbolRef(file="a.py", name="charge"),
+                confidence=0.9,
+            ),
+            ws,
+        )
+        out = result.file_changes[0].after
+        assert _parses(out)
+        # New statement appears before process(amount).
+        i_log = out.index('logger.info("start")')
+        i_proc = out.index("process(amount)")
+        assert i_log < i_proc
+
+    def test_start_of_function_after_docstring(self):
+        src = textwrap.dedent('''\
+            def charge(amount: int) -> None:
+                """Charge a customer."""
+                process(amount)
+        ''')
+        ws = DictWorkspace({"a.py": src})
+        result = compile_action(
+            AddStatement(
+                file=FileRef(path="a.py"),
+                code='logger.info("start")',
+                position="start_of_function",
+                target=SymbolRef(file="a.py", name="charge"),
+                confidence=0.9,
+            ),
+            ws,
+        )
+        out = result.file_changes[0].after
+        assert _parses(out)
+        # Order: docstring → log → process.
+        i_doc = out.index('"""Charge a customer."""')
+        i_log = out.index('logger.info("start")')
+        i_proc = out.index("process(amount)")
+        assert i_doc < i_log < i_proc
+
+    def test_end_of_function_inserts_at_body_bottom(self):
+        src = textwrap.dedent("""\
+            def charge(amount: int) -> int:
+                process(amount)
+                return amount
+        """)
+        ws = DictWorkspace({"a.py": src})
+        result = compile_action(
+            AddStatement(
+                file=FileRef(path="a.py"),
+                code='logger.info("done")',
+                position="end_of_function",
+                target=SymbolRef(file="a.py", name="charge"),
+                confidence=0.9,
+            ),
+            ws,
+        )
+        out = result.file_changes[0].after
+        assert _parses(out)
+        i_return = out.rindex("return amount")
+        i_log = out.rindex('logger.info("done")')
+        assert i_return < i_log
+
+    def test_method_via_dotted_target(self):
+        src = textwrap.dedent("""\
+            class API:
+                def charge(self, amount: int) -> None:
+                    process(amount)
+        """)
+        ws = DictWorkspace({"a.py": src})
+        result = compile_action(
+            AddStatement(
+                file=FileRef(path="a.py"),
+                code='self._guard()',
+                position="start_of_function",
+                target=SymbolRef(file="a.py", name="API.charge"),
+                confidence=0.9,
+            ),
+            ws,
+        )
+        out = result.file_changes[0].after
+        assert _parses(out)
+        assert "self._guard()" in out
+
+    def test_function_position_without_target_rejected_at_schema(self):
+        from pydantic import ValidationError
+
+        with pytest.raises(ValidationError):
+            AddStatement(
+                file=FileRef(path="a.py"),
+                code="x = 1",
+                position="start_of_function",
+                confidence=0.9,
+            )
+
+    def test_module_position_with_target_rejected_at_schema(self):
+        from pydantic import ValidationError
+
+        with pytest.raises(ValidationError):
+            AddStatement(
+                file=FileRef(path="a.py"),
+                code="x = 1",
+                position="end",
+                target=SymbolRef(file="a.py", name="f"),
+                confidence=0.9,
+            )
+
     def test_idempotent_at_end(self):
         src = textwrap.dedent("""\
             x = 1
