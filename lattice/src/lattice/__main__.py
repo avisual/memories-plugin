@@ -124,6 +124,16 @@ def _agent(args: argparse.Namespace) -> int:
 
             sys.stderr.write(f"using hosted proposer ({args.model or 'default Anthropic model'})...\n")
             llm_proposer: Proposer = HostedLLMProposer(model=args.model)  # type: ignore[assignment]
+        elif args.two_stage:
+            from lattice.propose.two_stage import TwoStageProposer
+
+            sys.stderr.write(
+                "loading two-stage local LLMs (planner + executor)...\n"
+            )
+            llm_proposer = TwoStageProposer(  # type: ignore[assignment]
+                planner_model=args.model,
+                executor_model=args.executor_model,
+            )
         else:
             from lattice.propose.local import LocalLLMProposer
 
@@ -286,6 +296,8 @@ def _do(args: argparse.Namespace) -> int:
         subtasks="",
         decompose=False,
         hosted=args.hosted,
+        two_stage=args.two_stage,
+        executor_model=args.executor_model,
         types=args.types,
         write=not args.no_write,
     )
@@ -647,6 +659,9 @@ def main(argv: list[str] | None = None) -> int:
     do_p.add_argument("--max-steps", type=int, default=4)
     do_p.add_argument("--model", default=None)
     do_p.add_argument("--hosted", action="store_true")
+    do_p.add_argument("--two-stage", action="store_true",
+                      help="Planner+Executor split (recommended for sub-1.5B models).")
+    do_p.add_argument("--executor-model", default=None)
     do_p.add_argument("--types", action="store_true")
     do_p.add_argument("--write", action="store_true", help="Default for `do`: ON. Use --no-write to dry-run.")
     do_p.add_argument("--no-write", action="store_true")
@@ -697,6 +712,20 @@ def main(argv: list[str] | None = None) -> int:
             "and the [hosted] extras). Much more reliable than the local "
             "0.5B for non-trivial tasks."
         ),
+    )
+    agent_p.add_argument(
+        "--two-stage",
+        action="store_true",
+        help=(
+            "Split the local LLM call into Planner (pick a verb) + "
+            "Executor (fill slots). Both can be the same small model. "
+            "Improves reliability with sub-1.5B models on multi-step tasks."
+        ),
+    )
+    agent_p.add_argument(
+        "--executor-model",
+        default=None,
+        help="Optional second model name for the Executor stage (otherwise the same as --model).",
     )
     agent_p.add_argument(
         "--types",

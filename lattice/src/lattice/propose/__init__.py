@@ -40,6 +40,12 @@ __all__ = [
 ]
 
 
+def _make_two_stage_proposer():  # pragma: no cover (import deferred)
+    from lattice.propose.two_stage import TwoStageProposer
+
+    return TwoStageProposer
+
+
 def _make_hosted_proposer_class():  # pragma: no cover (import deferred)
     from lattice.propose.hosted import HostedLLMProposer
 

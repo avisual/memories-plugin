@@ -339,26 +339,38 @@ class AgentLoop:
     # ----- helpers -----
 
     def _is_stuck(self, steps: list[StepRecord]) -> bool:
-        """Detect the harness-level no-op cycle (proposer repeating itself).
+        """Detect the harness-level no-progress cycle.
 
-        Triggers when the most recent N edit-or-error steps all repeat the
-        same action verb AND were no-ops or errors. This is the
-        scaffolding around small-model planning weakness: even if the LLM
-        can't track plan state, the harness will not loop forever.
+        Two patterns trip this:
+        1. The most recent N edit-or-error steps all repeat the same
+           verb AND were no-ops or errors. (Original detector.)
+        2. The most recent N steps all repeat the same verb,
+           regardless of kind. Covers the case where the LLM keeps
+           emitting Research (or any non-mutating verb) without
+           ever progressing to an edit. N defaults to 3 to give
+           legitimate research+act sequences room.
         """
         limit = self._noop_streak_limit
-        recent = [s for s in steps if s.kind in {"edit", "error"}]
-        if len(recent) < limit:
-            return False
-        tail = recent[-limit:]
-        verb = tail[0].verb
-        if not all(s.verb == verb for s in tail):
-            return False
-        return all(
-            s.kind == "error"
-            or (s.diff == "" or "no-op" in _summarize_diff(s.diff))
-            for s in tail
-        )
+
+        recent_edits = [s for s in steps if s.kind in {"edit", "error"}]
+        if len(recent_edits) >= limit:
+            tail = recent_edits[-limit:]
+            verb = tail[0].verb
+            if all(s.verb == verb for s in tail) and all(
+                s.kind == "error"
+                or (s.diff == "" or "no-op" in _summarize_diff(s.diff))
+                for s in tail
+            ):
+                return True
+
+        repeat_limit = max(3, limit + 1)
+        if len(steps) >= repeat_limit:
+            tail = steps[-repeat_limit:]
+            verb = tail[0].verb
+            if verb and all(s.verb == verb for s in tail):
+                return True
+
+        return False
 
     def _build_observation(
         self, task: str, steps: list[StepRecord]
@@ -377,13 +389,18 @@ class AgentLoop:
                 + ", ".join(ws_files[:20])
             )
 
-        if self.atom_store is not None and not steps:
+        # Recall atoms EVERY cycle, not just the first. New atoms
+        # written by mid-loop Research are exactly the ones that need
+        # to surface on the very next turn.
+        if self.atom_store is not None:
             try:
                 hits = self.atom_store.recall(task, k=4)
             except Exception:
                 hits = []
             for r in hits:
-                hints.append(f"{r.atom.type.value} (score {r.score:.2f}): {r.atom.content}")
+                hints.append(
+                    f"{r.atom.type.value} (score {r.score:.2f}): {r.atom.content[:600]}"
+                )
 
         for step in steps[-6:]:
             line = f"step {step.step} [{step.kind}] {step.verb}"
@@ -394,6 +411,8 @@ class AgentLoop:
                 line += f" -> error: {step.error[:140]}"
             elif step.kind == "recall" and step.payload:
                 line += f" -> recalled: {step.payload[:200]}"
+            elif step.kind == "research" and step.payload:
+                line += f" -> {step.payload[:600]}"
             elif step.kind == "reveal" and step.payload:
                 line += f" -> revealed: {step.payload[:200]}"
             elif step.kind == "branch":
