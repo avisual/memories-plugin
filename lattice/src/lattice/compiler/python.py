@@ -375,24 +375,31 @@ def _compile_add_parameter(action: AddParameter, workspace: Workspace) -> Compil
 def _compile_rename_symbol(
     action: RenameSymbol, workspace: Workspace
 ) -> CompiledAction:
-    """Rename a symbol in its defining file (and same-file references).
+    """Rename a symbol across the workspace.
 
-    v0 scope: rewrites the definition (def/class) and bare-name references
-    within the same file. Cross-file rewriting is a follow-up that needs
-    the unified symbol graph (Organ 1 fully landed) to find call sites.
+    Walks every .py file in the workspace; in each:
+    - In the file that DEFINES the symbol, rewrites the def/class
+      name AND every bare-name reference.
+    - In every OTHER file, rewrites bare-name references to the
+      symbol's leaf name (heuristic: same leaf, same intent).
+
+    Limitation: bare-name aliasing across import-as is not yet
+    detected. e.g. `from old_module import old_name as ox; ox()` —
+    we don't touch the `ox` reference. A future iteration uses the
+    lattice symbol graph (Organ 1) to resolve aliases precisely.
 
     The dotted name in action.symbol selects the definition; only the
-    leaf component is renamed (renaming 'Foo.bar' to 'baz' renames just
-    the method, not the class).
+    leaf component is renamed (renaming 'Foo.bar' to 'baz' renames
+    just the method, not the class).
     """
-    path = action.symbol.file
-    before = workspace.read(path)
-    module = cst.parse_module(before)
+    def_path = action.symbol.file
+    def_before = workspace.read(def_path)
+    def_module = cst.parse_module(def_before)
 
-    node = _find_symbol(module, action.symbol.name)
+    node = _find_symbol(def_module, action.symbol.name)
     if node is None:
         raise SymbolNotFound(
-            f"could not find symbol {action.symbol.name!r} in {path}"
+            f"could not find symbol {action.symbol.name!r} in {def_path}"
         )
     if not isinstance(node, (cst.FunctionDef, cst.ClassDef)):
         raise SymbolNotFound(
@@ -407,25 +414,51 @@ def _compile_rename_symbol(
         return CompiledAction(
             verb=action.verb,
             file_changes=(
-                FileChange(path=path, before=before, after=before, diff=""),
+                FileChange(path=def_path, before=def_before, after=def_before, diff=""),
             ),
         )
 
     transformer = _RenameTransformer(old_leaf=old_leaf, new_leaf=new_leaf)
-    new_module = module.visit(transformer)
-    after = new_module.code
 
-    return CompiledAction(
-        verb=action.verb,
-        file_changes=(
+    file_changes: list[FileChange] = []
+
+    new_def_module = def_module.visit(transformer)
+    def_after = new_def_module.code
+    file_changes.append(
+        FileChange(
+            path=def_path,
+            before=def_before,
+            after=def_after,
+            diff=unified_diff(path=def_path, before=def_before, after=def_after),
+        )
+    )
+
+    other_files = [p for p in workspace.iter_files(suffix=".py") if p != def_path]
+    for path in other_files:
+        try:
+            before = workspace.read(path)
+        except Exception:  # noqa: BLE001
+            continue
+        if old_leaf not in before:
+            continue
+        try:
+            module = cst.parse_module(before)
+        except cst.ParserSyntaxError:
+            continue
+        new_module = module.visit(transformer)
+        after = new_module.code
+        if after == before:
+            continue
+        file_changes.append(
             FileChange(
                 path=path,
                 before=before,
                 after=after,
                 diff=unified_diff(path=path, before=before, after=after),
-            ),
-        ),
-    )
+            )
+        )
+
+    return CompiledAction(verb=action.verb, file_changes=tuple(file_changes))
 
 
 class _RenameTransformer(cst.CSTTransformer):

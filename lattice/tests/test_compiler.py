@@ -589,6 +589,46 @@ class TestRenameSymbol:
                 ws,
             )
 
+    def test_rename_rewrites_references_in_other_files(self):
+        """Cross-file rename: definition + bare-name references everywhere."""
+        ws = DictWorkspace(
+            {
+                "src/billing.py": textwrap.dedent("""\
+                    def charge(amount: int) -> None:
+                        pass
+                """),
+                "src/api.py": textwrap.dedent("""\
+                    from src.billing import charge
+
+
+                    def handler() -> None:
+                        charge(100)
+                """),
+                "src/refund.py": textwrap.dedent("""\
+                    # this file does not reference charge
+                    def refund() -> None:
+                        pass
+                """),
+            }
+        )
+        result = compile_action(
+            RenameSymbol(
+                symbol=SymbolRef(file="src/billing.py", name="charge"),
+                new_name="take_payment",
+                confidence=0.9,
+            ),
+            ws,
+        )
+        # Two files changed (billing + api), refund.py is untouched.
+        changed = {fc.path for fc in result.file_changes if not fc.is_noop}
+        assert changed == {"src/billing.py", "src/api.py"}
+        out_billing = next(fc.after for fc in result.file_changes if fc.path == "src/billing.py")
+        out_api = next(fc.after for fc in result.file_changes if fc.path == "src/api.py")
+        assert "def take_payment(" in out_billing
+        assert "charge" not in out_billing
+        assert "from src.billing import take_payment" in out_api
+        assert "take_payment(100)" in out_api
+
 
 class TestWrapInTry:
     def _ws(self) -> DictWorkspace:
