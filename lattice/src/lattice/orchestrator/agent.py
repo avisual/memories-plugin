@@ -139,6 +139,17 @@ class AgentLoop:
         # the outcome of the step). Reset each cycle in
         # _build_observation.
         self._cycle_recalled_ids: list[int] = []
+        # Atom IDs that brain_score consulted for the WINNING candidate.
+        # These also participated in the decision and should receive
+        # the same Hebbian update as observation-recall atoms. Set in
+        # _propose_with_preflight after the winner is picked.
+        self._winning_brain_ids: list[int] = []
+        # The task string the proposer is actively attacking THIS cycle.
+        # In single-step runs it == run()'s task argument; in multi-step
+        # plan-DAG runs it's the current step's description. Set in
+        # _build_observation; used by _record_step_outcome and
+        # _brain_score so the SAME query embeds against the SAME atoms.
+        self._active_task: str = ""
 
     def run(self, task: str) -> AgentTrace:
         steps: list[StepRecord] = []
@@ -176,7 +187,7 @@ class AgentLoop:
                 break
             record, should_stop, stop_reason = self._handle_action(action, step_idx)
             steps.append(record)
-            self._record_step_outcome(record, task=task)
+            self._record_step_outcome(record)
             # HEBBIAN REINFORCEMENT: atoms that participated in THIS
             # cycle's decision (i.e. were recalled into the observation)
             # get nudged up on success or down on failure. The brain
@@ -273,12 +284,18 @@ class AgentLoop:
         if not actions:
             return None
 
-        scored: list[tuple[float, Action, str]] = []
+        # Track brain contributors per candidate so we can attribute
+        # the winner's Hebbian update correctly. Without this, atoms
+        # that scored the WINNING candidate get no reinforcement after
+        # a successful step — only observation-recall atoms do. That's
+        # a correctness gap: those atoms ARE participating in the
+        # decision and should be rewarded by outcome.
+        scored: list[tuple[float, Action, str, list[int]]] = []
         for action in actions:
             if not self._is_mutating(action):
                 # Non-mutating: score by confidence only.
                 conf = float(getattr(action, "confidence", 0.5))
-                scored.append((conf, action, "non-mutating"))
+                scored.append((conf, action, "non-mutating", []))
                 continue
             try:
                 compiled = compile_action(action, self.overlay)
@@ -286,10 +303,10 @@ class AgentLoop:
                 # Compile errors get a tiny positive score so they can
                 # still be picked if every candidate failed — the agent
                 # loop will surface them as errors and learn from them.
-                scored.append((0.01, action, f"compile-error: {exc}"))
+                scored.append((0.01, action, f"compile-error: {exc}", []))
                 continue
             if compiled.is_noop:
-                scored.append((0.05, action, "no-op"))
+                scored.append((0.05, action, "no-op", []))
                 continue
             # Composite: confidence + lines-changed bonus (capped).
             conf = float(getattr(action, "confidence", 0.5))
@@ -306,20 +323,33 @@ class AgentLoop:
             # EXPERIENCE atoms boost, ANTIPATTERN atoms penalize.
             # Bounded so a single hot atom can't drown out confidence,
             # but a clear repeat-failure pattern CAN flip the winner.
-            brain_delta = self._brain_score(action, obs.task)
+            # Uses self._active_task (set in _build_observation) — same
+            # query used here lands near atoms _record_step_outcome
+            # wrote with the same signature.
+            brain_delta, brain_ids = self._brain_score(action, self._active_task)
             score = conf + change_bonus + 1.0 + brain_delta
             scored.append((
                 score, action,
                 f"score=conf{conf:.2f}+lines{lines_changed}+brain{brain_delta:+.2f}",
+                brain_ids,
             ))
 
         if os.environ.get("LATTICE_LLM_DEBUG"):
-            for s, a, note in scored:
+            for s, a, note, _ids in scored:
                 sys.stderr.write(f"  candidate {a.verb} score={s:.2f} ({note})\n")
 
         # Highest score wins; stable order on ties.
         scored.sort(key=lambda t: -t[0])
-        return scored[0][1] if scored else actions[0]
+        if not scored:
+            self._winning_brain_ids = []
+            return actions[0]
+        winner = scored[0]
+        # Stash the brain-contributors for the winner so the post-step
+        # reinforcement Hebbian-updates them too (not just observation-
+        # recall atoms). Atoms that earned the +/- delta are exactly the
+        # ones whose importance should move with the outcome.
+        self._winning_brain_ids = winner[3]
+        return winner[1]
 
     @staticmethod
     def _is_mutating(action: Action) -> bool:
@@ -361,7 +391,7 @@ class AgentLoop:
             parts.append(f"{k}={_compact_value(v)}")
         return " ".join(parts)
 
-    def _brain_score(self, action: Action, task: str) -> float:
+    def _brain_score(self, action: Action, task: str) -> tuple[float, list[int]]:
         """Brain influence on candidate selection.
 
         Recalls atoms matching this candidate's signature. SKILL /
@@ -378,18 +408,28 @@ class AgentLoop:
         over a clear high-confidence candidate. Similarity threshold
         0.35 filters out near-irrelevant hits.
 
-        Returns 0.0 when brain is disabled or the store is empty.
+        Region filter: only consults atoms written by _record_step_outcome
+        (region='steps'). Generic seeded atoms in other regions don't
+        have the (verb, slots, task) signature shape that the query
+        expects, and admitting them produces spurious low-cosine boosts.
+        If the user wants seeded knowledge to score candidates they'd
+        need to seed under the 'steps' region explicitly.
+
+        Returns (delta, atom_ids_that_contributed) so the caller can
+        track which atoms participated in scoring the WINNING candidate
+        (for Hebbian reinforcement after verify).
         """
         if not self._use_brain or self.atom_store is None:
-            return 0.0
+            return 0.0, []
         from lattice.atoms import AtomType
 
-        query = f"{self._action_signature(action)} | task '{task[:120]}'"
+        query = _signature_with_task(self._action_signature(action), task)
         try:
-            hits = self.atom_store.recall(query, k=4)
+            hits = self.atom_store.recall(query, k=4, region="steps")
         except Exception:  # noqa: BLE001
-            return 0.0
+            return 0.0, []
         delta = 0.0
+        contributors: list[int] = []
         for hit in hits:
             sim = float(hit.score)
             if sim < 0.35:
@@ -397,9 +437,15 @@ class AgentLoop:
             atype = hit.atom.type
             if atype in (AtomType.SKILL, AtomType.EXPERIENCE):
                 delta += 0.25 * sim
+                atom_id = getattr(hit.atom, "id", None)
+                if atom_id is not None:
+                    contributors.append(int(atom_id))
             elif atype == AtomType.ANTIPATTERN:
                 delta -= 0.40 * sim
-        return max(-0.5, min(0.5, delta))
+                atom_id = getattr(hit.atom, "id", None)
+                if atom_id is not None:
+                    contributors.append(int(atom_id))
+        return max(-0.5, min(0.5, delta)), contributors
 
     def _reinforce_recalled(self, record: "StepRecord") -> None:
         """Hebbian update on the atoms recalled into THIS cycle's obs.
@@ -419,8 +465,6 @@ class AgentLoop:
         """
         if not self._use_brain or self.atom_store is None:
             return
-        if not self._cycle_recalled_ids:
-            return
         if record.action is None:
             return
         if not self._is_mutating(record.action):
@@ -432,8 +476,18 @@ class AgentLoop:
             delta = -0.03
         else:
             return
+        # Reinforce TWO pools:
+        #   (a) atoms recalled into the observation (general task-level
+        #       context that the LLM saw),
+        #   (b) atoms that brain_score consulted for the WINNING candidate
+        #       (specific (verb, slot, task) signature matches that
+        #       earned the +/- decision delta).
+        # Union prevents double-counting when an atom appears in both.
+        participating = list(set(self._cycle_recalled_ids) | set(self._winning_brain_ids))
+        if not participating:
+            return
         try:
-            self.atom_store.reinforce(self._cycle_recalled_ids, delta)
+            self.atom_store.reinforce(participating, delta)
         except Exception:  # noqa: BLE001
             pass
 
@@ -465,7 +519,7 @@ class AgentLoop:
         except Exception:  # noqa: BLE001
             pass
 
-    def _record_step_outcome(self, record: "StepRecord", *, task: str) -> None:
+    def _record_step_outcome(self, record: "StepRecord") -> None:
         """Write a SKILL atom on success / ANTIPATTERN on failure.
 
         Per-step granularity: the brain accumulates fine-grained
@@ -473,6 +527,13 @@ class AgentLoop:
         just an aggregate end-of-task summary. The next call to
         `_brain_score` for a similar candidate will surface this atom
         and bias selection accordingly.
+
+        Uses self._active_task (the step text the proposer was given
+        THIS cycle) so the atom embeds near where a future cycle's
+        brain_score query will land — both sides share the same
+        template via _signature_with_task. Without this alignment the
+        atom written for step N is in a different part of embedding
+        space from the query in step N+1, and brain_score misses it.
 
         Skipped when brain is off, when there's no atom_store, or when
         the action isn't a mutating one (non-mutating verbs don't
@@ -488,19 +549,18 @@ class AgentLoop:
         from lattice.atoms import AtomType
 
         sig = self._action_signature(record.action)
+        embed_key = _signature_with_task(sig, self._active_task)
         ok = record.kind == "edit" and not record.error
         if ok:
             content = (
-                f"Success: {sig} on task '{task[:140]}'. "
-                "The attempt passed verification."
+                f"{embed_key} :: Success. The attempt passed verification."
             )
             atype = AtomType.SKILL
             importance = 0.65
             tags = ("agent-step", "success", record.action.verb)
         else:
             content = (
-                f"Failure: {sig} on task '{task[:140]}'. "
-                f"Failed because: {(record.error or 'unknown')[:240]}"
+                f"{embed_key} :: Failure. {(record.error or 'unknown')[:240]}"
             )
             atype = AtomType.ANTIPATTERN
             importance = 0.6
@@ -707,6 +767,10 @@ class AgentLoop:
             if plan_view:
                 hints.append(plan_view)
             active_task = self._plan.render_task()
+        # Stash for brain_score + record_step_outcome so write & query
+        # use the SAME task string (otherwise atoms written for step N
+        # don't embed near the brain_score query in step N+1).
+        self._active_task = active_task
 
         # VERIFY-FAILURE FEEDBACK (Phase 3): when the last step was an
         # error from verify (parse / type / tests), surface it as the
@@ -945,6 +1009,17 @@ def _count_diff_added_lines(diff: str) -> int:
         if line.startswith("+") and not line.startswith("+++"):
             n += 1
     return n
+
+
+def _signature_with_task(signature: str, task: str) -> str:
+    """Canonical template the brain uses to embed step outcomes AND
+    to query for matching atoms. Both sides MUST use this exact
+    template; otherwise the embedding similarity between a stored
+    atom and the query that should match it is uselessly low.
+    Truncates the task to 120 chars (enough to disambiguate
+    different tasks, short enough to keep the embedding stable).
+    """
+    return f"{signature} :: task '{task[:120]}'"
 
 
 def _hint_priority(hint: str) -> int:

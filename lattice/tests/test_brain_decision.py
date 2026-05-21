@@ -57,7 +57,7 @@ def _store(tmp_path: Path) -> SQLiteAtomStore:
 
 
 def test_brain_score_zero_when_brain_disabled():
-    """use_brain=False → _brain_score returns 0.0 regardless of store."""
+    """use_brain=False → _brain_score returns (0.0, []) regardless of store."""
     loop = AgentLoop(
         proposer=MockProposer.empty(),
         workspace=_ws(),
@@ -65,11 +65,13 @@ def test_brain_score_zero_when_brain_disabled():
         use_brain=False,
     )
     action = AddImport(file=FileRef(path="src/main.py"), module="json", confidence=0.9)
-    assert loop._brain_score(action, "add json") == 0.0
+    delta, ids = loop._brain_score(action, "add json")
+    assert delta == 0.0 and ids == []
 
 
 def test_brain_score_positive_for_matching_success_atom(tmp_path):
-    """A SKILL atom whose embedding cosines >= 0.35 with the query → positive delta."""
+    """A SKILL atom in region='steps' whose embedding cosines >= 0.35
+    with the query → positive delta and IDs returned for reinforcement."""
     store = _store(tmp_path)
     store.add(
         "Success: verb=AddImport on task 'add an import of json'",
@@ -83,10 +85,11 @@ def test_brain_score_positive_for_matching_success_atom(tmp_path):
         use_brain=True,
     )
     action = AddImport(file=FileRef(path="src/main.py"), module="json", confidence=0.9)
-    delta = loop._brain_score(action, "add import of json")
+    delta, ids = loop._brain_score(action, "add import of json")
     # ConstantEmbedder → cosine 1.0; boost = 0.25 * 1.0 = +0.25 per hit.
     assert delta > 0.0
     assert delta <= 0.5  # bounded
+    assert ids, "matching SKILL atom should be returned as a contributor"
     store.close()
 
 
@@ -105,9 +108,10 @@ def test_brain_score_negative_for_matching_antipattern_atom(tmp_path):
         use_brain=True,
     )
     action = AddImport(file=FileRef(path="src/main.py"), module="json", confidence=0.9)
-    delta = loop._brain_score(action, "add import of json")
+    delta, ids = loop._brain_score(action, "add import of json")
     assert delta < 0.0
     assert delta >= -0.5  # bounded
+    assert ids
     store.close()
 
 
@@ -127,7 +131,8 @@ def test_brain_score_bounded(tmp_path):
         use_brain=True,
     )
     action = AddImport(file=FileRef(path="src/main.py"), module="json", confidence=0.9)
-    assert loop._brain_score(action, "add import of json") == 0.5
+    delta, _ids = loop._brain_score(action, "add import of json")
+    assert delta == 0.5
     store.close()
 
 
@@ -445,6 +450,106 @@ def test_brain_off_picks_first_candidate_same_setup(tmp_path):
     # With brain off, the brain delta is 0 for both — json (first in
     # list, stable sort) wins.
     assert "import json" in final
+    store.close()
+
+
+def test_winning_brain_contributors_get_reinforced(tmp_path):
+    """Atoms recalled by brain_score for the WINNING candidate get the
+    same Hebbian update as observation-recall atoms.
+
+    Without this wiring, brain_score atoms only get access_count++
+    (which doesn't move importance) — so their score contribution
+    would be invisible to future cycles. Correctness: the atom that
+    earned the +/- delta IS a participant in the decision and should
+    move by outcome like any other.
+    """
+    store = _store(tmp_path)
+    # Seed in region='steps' (only region brain_score consults).
+    contributor = store.add(
+        "verb=AddImport file=src/main.py module=json :: Success",
+        type=AtomType.SKILL,
+        region="steps",
+        importance=0.5,
+    )
+    proposer = MockProposer(
+        batches=[
+            [AddImport(file=FileRef(path="src/main.py"), module="json", confidence=0.9)],
+            [MarkDone(summary="done", confidence=0.9)],
+        ]
+    )
+    loop = AgentLoop(
+        proposer=proposer, workspace=_ws(), atom_store=store, use_brain=True
+    )
+    loop.run("add import of json")
+    # The contributor was the only steps-region atom; it scored the
+    # winning candidate so it should have been reinforced by +0.05.
+    hits = store.recall(
+        "verb=AddImport file=src/main.py module=json",
+        k=5,
+        region="steps",
+    )
+    same = next((h for h in hits if h.atom.id == contributor.id), None)
+    assert same is not None
+    assert same.atom.importance >= 0.55 - 0.001
+    store.close()
+
+
+def test_region_filter_excludes_non_steps_atoms(tmp_path):
+    """_brain_score only consults atoms in region='steps'.
+
+    Generic seeded atoms in other regions don't have the (verb, slots,
+    task) signature shape that the query expects and would produce
+    spurious low-cosine boosts. The region filter prevents that.
+    """
+    store = _store(tmp_path)
+    # Atom that would normally match (constant embedder → cosine 1.0)
+    # but is in the wrong region.
+    store.add(
+        "Success: verb=AddImport on task add import of json",
+        type=AtomType.SKILL,
+        region="seeded-knowledge",
+    )
+    loop = AgentLoop(
+        proposer=MockProposer.empty(),
+        workspace=_ws(),
+        atom_store=store,
+        use_brain=True,
+    )
+    action = AddImport(file=FileRef(path="src/main.py"), module="json", confidence=0.9)
+    delta, ids = loop._brain_score(action, "add import of json")
+    # No matching atom in 'steps' region → delta is 0.
+    assert delta == 0.0
+    assert ids == []
+    store.close()
+
+
+def test_outcome_atom_embeds_near_brain_score_query(tmp_path):
+    """The atom written by _record_step_outcome is recallable by the
+    same query that _brain_score will issue next cycle.
+
+    This is the correctness fix that closed the active_task mismatch:
+    both sides MUST use _signature_with_task or atoms written for step
+    N are in a different part of embedding space than the query for
+    step N+1's brain_score, and the brain misses its own data.
+    """
+    store = _store(tmp_path)
+    # Run a successful step so the loop writes an outcome atom.
+    proposer = MockProposer(
+        batches=[
+            [AddImport(file=FileRef(path="src/main.py"), module="json", confidence=0.9)],
+            [MarkDone(summary="done", confidence=0.9)],
+        ]
+    )
+    loop = AgentLoop(
+        proposer=proposer, workspace=_ws(), atom_store=store, use_brain=True
+    )
+    loop.run("add an import of json")
+    # Now query the brain in the same shape brain_score would.
+    action = AddImport(file=FileRef(path="src/main.py"), module="json", confidence=0.9)
+    delta, ids = loop._brain_score(action, "add an import of json")
+    # The just-written SKILL atom should boost this candidate.
+    assert delta > 0.0
+    assert ids, "expected to find the atom we just wrote"
     store.close()
 
 
