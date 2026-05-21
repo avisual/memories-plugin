@@ -1,6 +1,6 @@
 [project]
 name = "lattice"
-version = "0.1.1"
+version = "0.2.0"
 description = "A compositional, self-improving reasoning substrate for small coding LLMs"
 readme = "README.md"
 license = {text = "Apache-2.0"}

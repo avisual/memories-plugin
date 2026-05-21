@@ -3,6 +3,91 @@
 All notable changes to LATTICE will live here. Versions follow
 semantic versioning.
 
+## [0.2.0] — Every organ has a v0; refactoring tool is real
+
+The release where every organ in DESIGN.md has working code with
+tests, the verb set covers what real refactoring needs structurally,
+and the IMPROVES dial actually saves LLM calls via learned templates.
+
+### Added
+
+- **AddDecorator verb** — apply a decorator to a function or class.
+  Compiler handles outermost/innermost positioning, idempotency.
+  Pattern: 'Add @cached decorator to function f in src/x.py' /
+  'Decorate function f in src/x.py with @app.route("/health")'.
+
+- **DeleteSymbol verb** — remove a function/class/method by dotted
+  name. Top-level removal AND method-of-class removal. require_present
+  flag for soft 'ensure absent' semantics.
+
+- **AddStatement function-scoped positions** — `start_of_function` and
+  `end_of_function` (plus the existing module-level `end` and
+  `top_after_imports`). With a `target` SymbolRef, inserts inside a
+  specific function body. Closes the inside-the-body gap.
+
+- **Multi-action template inference (Organ 9 phase 3)** — apprentice
+  now learns CHAINS, not just single actions. Multi-step traces of
+  the same shape produce a chain of substituted action templates;
+  ApprenticeProposer emits each step as a candidate; the agent
+  loop's pre-flight picks whichever step isn't yet a no-op. Real
+  IMPROVES across multi-action workflows.
+
+- **Apprentice (Organ 8 v0)** — template-based proposer that fires
+  for novel tasks whose shape matches learned traces. Three training
+  examples of 'Add an import of X to Y' → infer the template →
+  arbitrary new (X, Y) get a typed Action via pure substitution. No
+  LLM call.
+
+- **STEER (Organ 4 v0)** — importance-weighted recall + priming
+  block at the prompt head. EVOLVE-boosted atoms sit in the LLM's
+  most-attended prompt position.
+
+- **POPULATION (Organ 6 v0)** — composite-scored candidates
+  (`conf + lines_added + (1.0 if not no-op)`). Replaces the prior
+  'first non-no-op wins' with proper beam scoring.
+
+- **Benchmark expansion** — pattern tier grew from 8 to 15 tasks
+  covering: imports (plain/from/alias), rename cross-file,
+  add-parameter, add-field, add-decorator (3 variants), multi-step
+  decompose, wrap-in-try, insert-at-start/end-of-function,
+  delete function / method-of-class.
+
+- **In-process benchmark mode + `--repeat N`** — shares the LLM
+  model across tasks (~10× faster than subprocess) and produces real
+  pass-rate measurements per task.
+
+### Fixed
+
+- Confidence-field default (0.5) — small models routinely forget the
+  field; missing-required-field validations were a real failure mode.
+- Quoted-default capture in the AddField / AddParameter patterns —
+  `default "1.0"` now preserves the string literal instead of
+  truncating to `1.0` (the number).
+
+### Scoreboard (last live run on a 4-CPU box, no GPU)
+
+  pattern: 15/15
+  llm:      2/2 single, 6/6 ×3 (Qwen-0.5B & 1.5B two-stage)
+  research: 1/1 (Qwen-1.5B + curl-cffi web fetch)
+  total measured: 18/18 single, 30/30 across repeats
+
+### Architecture parity against DESIGN.md (v0 implementations)
+
+  Organ 1  (lattice store)   — partial (atom store + EVOLVE traces)
+  Organ 2  (SENSE)            — done (libcst + Semble)
+  Organ 3  (ACT)              — 10 mutating verbs compile to diffs
+  Organ 4  (STEER)            — v0 lightweight (importance priming)
+  Organ 5  (world model)      — partial (preflight scoring)
+  Organ 6  (POPULATION)       — v0 (composite scoring beam)
+  Organ 7  (VERIFY)            — parse + optional mypy
+  Organ 8  (DISTILL)           — v0 (template-substitution apprentice)
+  Organ 9  (EVOLVE)            — phases 1-3 (discover, boost, infer)
+  Organ 10 (HUMAN INTERFACE)  — CLI + brain inspect/dump/import
+
+Heavyweight versions of Organs 4 and 8 (real activation patching and
+trained policy nets) still TODO; their interfaces and v0 paths are
+in place so the heavyweight implementations plug in cleanly.
+
 ## [0.1.1] — Composition that works
 
 The release where the parts actually started adding up. Live web
