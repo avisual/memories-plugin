@@ -302,8 +302,15 @@ def _print_audit(rows: list[AuditRow]) -> None:
                 "tasks are too easy for the LLM (brain irrelevant), "
                 "the persistent-brain isn't accumulating useful atoms, "
                 "or the decision-weighting isn't tipping the choices "
-                "enough to flip results. Inspect with "
-                "`lattice brain audit-state --db <keep-brain-db>/brain-on.db`."
+                "enough to flip results. Diagnostics:\n"
+                "  1. Re-run with LATTICE_BRAIN_DEBUG=1 to see per-cycle "
+                "brain_delta on each candidate and whether 'BRAIN FLIPPED' "
+                "fired.\n"
+                "  2. Inspect what got written with\n"
+                "     lattice brain audit-state --db <keep-brain-db>/brain-on.db\n"
+                "  3. Add tasks where the small model SOMETIMES fails — "
+                "without failures there's no ANTIPATTERN atom for the "
+                "brain to discourage wrong choices with."
             )
     elif total_on > total_off:
         print(
