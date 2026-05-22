@@ -28,6 +28,8 @@ What this is NOT:
 from __future__ import annotations
 
 import json
+import os
+import sys
 from typing import Any
 
 from pydantic import ValidationError
@@ -165,6 +167,19 @@ class ApprenticeProposer:
             actions.append(recorded_first)
             if len(actions) >= n:
                 break
+
+        # APPRENTICE_FIRED signal: surface whenever the apprentice
+        # returns a non-empty list, since that's the moment the LLM
+        # gets skipped. Without this, an audit can't tell from the
+        # output whether brain-on's wall-time speedup is the apprentice
+        # firing or just LLM-cache warmup. Cheap to compute, easy to
+        # grep, off by default.
+        if actions and os.environ.get("LATTICE_BRAIN_DEBUG"):
+            verbs = ",".join(a.verb for a in actions[:3])
+            sys.stderr.write(
+                f"APPRENTICE_FIRED: task={obs.task[:60]!r} "
+                f"emitted={verbs} (LLM skipped this cycle)\n"
+            )
         return actions
 
 
