@@ -52,9 +52,13 @@ def test_apprentice_empty_store_returns_empty(store: SQLiteAtomStore):
     assert out == []
 
 
-def test_apprentice_no_boost_returns_empty(store: SQLiteAtomStore):
-    """Traces below min_importance don't fire the apprentice — until
-    EVOLVE boosts them, the apprentice stays out of the proposer chain.
+def test_apprentice_below_threshold_returns_empty(store: SQLiteAtomStore):
+    """Traces below the apprentice's importance threshold don't fire.
+
+    Apprentice defaults to min_importance=0.5 (learning system fires on
+    one example). To exercise the threshold gating, pass a HIGHER bar
+    explicitly — a single fresh trace at importance 0.55 then sits
+    below it and the apprentice correctly stays silent.
     """
     write_trace(
         store=store,
@@ -62,10 +66,35 @@ def test_apprentice_no_boost_returns_empty(store: SQLiteAtomStore):
         actions=["AddImport"],
         files_touched=["src/a.py"],
     )
+    # min_importance bumped above the fresh-trace 0.55 baseline.
+    p = ApprenticeProposer(
+        atom_store=store, min_similarity=0.0, min_importance=0.7
+    )
+    out = p.propose(ObservationContext(task="Add an import of os to src/a.py"))
+    assert out == []
+
+
+def test_apprentice_fires_on_single_trace_at_default_threshold(store: SQLiteAtomStore):
+    """At the default min_importance=0.5, a SINGLE fresh trace fires.
+
+    Was the entire point of dropping the threshold from 0.7 to 0.5:
+    'learning system fires on one example' rather than 'requires three
+    recurrences before any payoff'. Without this behavior the brain's
+    biggest payoff path was effectively disabled in any audit shorter
+    than 3+ repeats.
+    """
+    write_trace(
+        store=store,
+        task="Add an import of os to src/a.py",
+        actions=["AddImport"],
+        files_touched=["src/a.py"],
+    )
+    # Default thresholds. The fresh trace at importance 0.55 should
+    # clear the new default 0.5 floor.
     p = ApprenticeProposer(atom_store=store, min_similarity=0.0)
     out = p.propose(ObservationContext(task="Add an import of os to src/a.py"))
-    # Importance is 0.55 (default), below the 0.7 min — no candidate.
-    assert out == []
+    assert len(out) >= 1
+    assert out[0].verb == "AddImport"
 
 
 def test_apprentice_fires_after_boost(store: SQLiteAtomStore):

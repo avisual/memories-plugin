@@ -37,7 +37,20 @@ from lattice.propose.base import ObservationContext, Proposer
 
 
 _TRACE_REGION = "traces"
-_DEFAULT_MIN_IMPORTANCE = 0.7
+# Apprentice fires when a stored trace's importance clears this bar.
+# write_trace stamps new traces at importance=0.55. Previously the
+# default was 0.7 — meaning the apprentice REFUSED to fire on a
+# single observed success and required boost_recurrent_traces to
+# raise the trace via repeated occurrence (min_recurrence=3 by default).
+# Result: in a 3-repeat audit the apprentice NEVER fired, so the
+# brain's biggest payoff path (LLM-skipping replay of a learned
+# action) was structurally inert. Lowered to 0.5 so a single
+# successful trace clears the bar — 'I learned from one example'
+# is the right default for a learning system. The cosine similarity
+# floor (0.6) still gates on task-shape match, and any action the
+# apprentice emits still goes through preflight + verify, so a
+# wrong replay is caught.
+_DEFAULT_MIN_IMPORTANCE = 0.5
 _DEFAULT_MIN_SIMILARITY = 0.6
 
 
