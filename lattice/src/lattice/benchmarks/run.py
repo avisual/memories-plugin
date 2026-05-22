@@ -134,6 +134,7 @@ def _parse_task_flags(flags: tuple[str, ...]) -> dict[str, str | bool]:
         "two_stage": False,
         "decompose": False,
         "hosted": False,
+        "no_brain": False,
         "model": "",
         "executor_model": "",
     }
@@ -145,6 +146,11 @@ def _parse_task_flags(flags: tuple[str, ...]) -> dict[str, str | bool]:
             out["decompose"] = True
         elif tok == "--hosted":
             out["hosted"] = True
+        elif tok == "--no-brain":
+            # Brain-off audit condition. Drops the apprentice from
+            # the composite (no template-replay) so the LLM path
+            # has to do all the work on its own.
+            out["no_brain"] = True
         elif tok == "--model":
             out["model"] = next(it)
         elif tok == "--executor-model":
@@ -152,12 +158,26 @@ def _parse_task_flags(flags: tuple[str, ...]) -> dict[str, str | bool]:
     return out
 
 
-def _build_inproc_proposer(cfg: dict[str, str | bool], cache: dict) -> Any:
+def _build_inproc_proposer(
+    cfg: dict[str, str | bool],
+    cache: dict,
+    *,
+    atom_store=None,
+) -> Any:
     """Build a Composite proposer, caching the LLM stage across calls.
 
     The Pattern proposer is cheap to recreate. The LocalLLM /
     TwoStage proposer loads transformers + a model — expensive — so
     we cache by (model, executor_model, two_stage) and reuse.
+
+    Now also slots in the ApprenticeProposer between Pattern and LLM
+    so the bench's composite chain matches what __main__.py builds
+    for real users: [Pattern, Apprentice, LLM]. Without the
+    apprentice the brain's biggest payoff path — recognize the task
+    from an earlier trace, replay the action without an LLM call —
+    is structurally disabled in every audit. The apprentice is
+    skipped (left out of the composite) when atom_store is None
+    or when --no-brain is in the task flags.
     """
     from lattice.propose import CompositeProposer, PatternProposer
 
@@ -174,7 +194,14 @@ def _build_inproc_proposer(cfg: dict[str, str | bool], cache: dict) -> Any:
             from lattice.propose.local import LocalLLMProposer
 
             cache[key] = LocalLLMProposer(model_name=cfg["model"] or None)
-    return CompositeProposer([PatternProposer(), cache[key]])
+
+    proposers: list[Any] = [PatternProposer()]
+    if atom_store is not None and not cfg.get("no_brain"):
+        from lattice.distill import ApprenticeProposer
+
+        proposers.append(ApprenticeProposer(atom_store=atom_store))
+    proposers.append(cache[key])
+    return CompositeProposer(proposers)
 
 
 def _run_one_inprocess(
@@ -215,7 +242,7 @@ def _run_one_inprocess(
             if store.count() == 0:
                 seed_store(store)
             cfg = _parse_task_flags(task.flags)
-            proposer = _build_inproc_proposer(cfg, llm_cache)
+            proposer = _build_inproc_proposer(cfg, llm_cache, atom_store=store)
             workspace = FilesystemWorkspace(root)
 
             step_count = 0
