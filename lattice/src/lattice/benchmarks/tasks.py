@@ -185,6 +185,36 @@ TASKS: tuple[BenchTask, ...] = (
         flags=("--two-stage", "--model", "Qwen/Qwen2.5-0.5B-Instruct"),
         timeout_s=900.0,
     ),
+    # Two-step LLM task where the SECOND step's plausible verb choice
+    # is ambiguous for the small model — AddStatement vs AddDecorator
+    # vs AddFunction could all plausibly land an @app.errorhandler(404)
+    # decorator on the existing health() function. The right move is
+    # AddDecorator. With brain ON and persistent atoms accumulating,
+    # the audit can show whether prior successes bias the small model
+    # toward the correct verb on later runs.
+    BenchTask(
+        name="add-error-handler-decorator",
+        tier="llm",
+        task=(
+            "Add an @app.errorhandler(404) decorator to function health "
+            "in src/app.py"
+        ),
+        files={
+            "src/app.py": _flask_app() + (
+                "\n@app.route(\"/health\")\n"
+                "def health() -> dict:\n"
+                "    return {\"ok\": True}\n"
+            ),
+        },
+        expects={
+            "src/app.py": (
+                "@app.errorhandler(404)",
+                "def health() -> dict:",
+            ),
+        },
+        flags=("--two-stage", "--model", "Qwen/Qwen2.5-0.5B-Instruct"),
+        timeout_s=600.0,
+    ),
     BenchTask(
         name="multi-step-pattern",
         tier="pattern",
