@@ -277,17 +277,33 @@ def _run_one_inprocess(
                 trace_ok = trace.ok
                 trace_for_experience = trace
 
-            # WRITE EXPERIENCE + TRACE ATOMS on full success. Without
-            # this, the audit's in-process runs never populate
-            # region='traces' — so the apprentice can't fire on
-            # subsequent runs, blocking the brain's biggest payoff
-            # path (LLM-skipping template reuse). The CLI does this
-            # already in __main__.py; the bench runner missed it.
+            # WRITE EXPERIENCE + TRACE ATOMS when the produced output
+            # actually matches the task's expectations — that's the
+            # bench's ground truth. Why NOT trace.ok (terminated_by
+            # == 'done'): trace.ok requires the LLM to emit MarkDone.
+            # Small models often complete the edit and then fall off
+            # the end of the loop without emitting MarkDone, so the
+            # trace exhausts at max_steps and terminated_by =
+            # 'exhausted' even though the edit landed correctly.
+            # Gating on trace.ok would block recording the trace
+            # atom that the apprentice needs to fire on subsequent
+            # runs — silently disabling the brain's payoff path.
             #
-            # Gating on trace_ok matches the partial-success guard
-            # we added to __main__.py — only fully-completed traces
-            # become experience/trace atoms.
-            if trace_ok and final_files:
+            # Write_final the file changes FIRST so _check_expectations
+            # reads from disk (it grep's the workspace files).
+            if final_files:
+                class _Report:
+                    pass
+
+                rep = _Report()
+                rep.final_files = final_files  # type: ignore[attr-defined]
+                write_final(rep, root=root)
+
+            # Check expectations BEFORE store.close() so we can use
+            # the result to gate experience-recording.
+            ok, detail, finals = _check_expectations(task, root)
+
+            if ok and final_files:
                 try:
                     from lattice.atoms.feedback import (
                         record_experience,
@@ -308,19 +324,10 @@ def _run_one_inprocess(
                     # Bench experience recording is best-effort; never
                     # let it sink an otherwise-successful run.
                     pass
-
-            if final_files:
-                class _Report:
-                    pass
-
-                rep = _Report()
-                rep.final_files = final_files  # type: ignore[attr-defined]
-                write_final(rep, root=root)
         finally:
             store.close()
 
         elapsed = time.time() - start
-        ok, detail, finals = _check_expectations(task, root)
         return TaskResult(
             task=task,
             passed=ok,
