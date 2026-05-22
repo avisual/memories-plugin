@@ -89,6 +89,18 @@ def main(argv: list[str] | None = None) -> int:
             "decision-weighting actually scores future candidates against."
         ),
     )
+    parser.add_argument(
+        "--keep-brain-db",
+        default="",
+        help=(
+            "Path to a directory where the brain-on.db and brain-off.db "
+            "files should be COPIED at the end of the audit (before the "
+            "tmp dir is removed). Without this, the audit DBs disappear "
+            "as soon as the verdict prints — making post-hoc `brain "
+            "audit-state` introspection impossible. Specify a directory; "
+            "the audit creates it if missing."
+        ),
+    )
     args = parser.parse_args(argv)
 
     selected = TASKS
@@ -171,6 +183,15 @@ def main(argv: list[str] | None = None) -> int:
             rows.append(row)
     finally:
         if audit_root is not None and audit_root.exists():
+            if args.keep_brain_db:
+                keep_dir = Path(args.keep_brain_db)
+                keep_dir.mkdir(parents=True, exist_ok=True)
+                for db in (brain_on_path, brain_off_path):
+                    if db is not None and db.exists():
+                        shutil.copy2(db, keep_dir / db.name)
+                sys.stderr.write(
+                    f"copied brain DBs to {keep_dir.resolve()}\n"
+                )
             shutil.rmtree(audit_root, ignore_errors=True)
 
     _print_audit(rows)
