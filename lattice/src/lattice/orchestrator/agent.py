@@ -384,7 +384,12 @@ class AgentLoop:
             if scored:
                 top = scored[0]
                 # Find the runner-up's baseline (without brain) to see if
-                # brain CHANGED the choice.
+                # brain CHANGED the choice. The "real" flip is when the
+                # winning VERB changes — if all candidates are the same
+                # verb (the small model is consistent on this task), a
+                # re-shuffle within same-verb candidates isn't a flip,
+                # it's just decision-weighting re-ordering ties. Only
+                # log when the verb identity actually moves.
                 baseline_sorted = sorted(
                     scored,
                     key=lambda t: -(
@@ -392,7 +397,10 @@ class AgentLoop:
                         if "conf" in t[2] else 0.0
                     ),
                 )
-                if baseline_sorted and baseline_sorted[0][1] is not top[1]:
+                if (
+                    baseline_sorted
+                    and baseline_sorted[0][1].verb != top[1].verb
+                ):
                     sys.stderr.write(
                         f"BRAIN FLIPPED: brain chose {top[1].verb} over "
                         f"{baseline_sorted[0][1].verb} (baseline winner)\n"
