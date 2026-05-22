@@ -219,6 +219,7 @@ def _run_one_inprocess(
             workspace = FilesystemWorkspace(root)
 
             step_count = 0
+            trace_ok = False  # Will gate experience-atom recording.
             if cfg["decompose"]:
                 subtasks = decompose(task.task)
                 report = run_subtasks(
@@ -234,6 +235,8 @@ def _run_one_inprocess(
                 step_count = sum(
                     len(getattr(t, "steps", ())) for t in getattr(report, "traces", ())
                 )
+                trace_ok = bool(getattr(report, "ok", False))
+                trace_for_experience = report
             else:
                 loop = AgentLoop(
                     proposer=proposer,
@@ -244,6 +247,40 @@ def _run_one_inprocess(
                 trace = loop.run(task.task)
                 final_files = trace.final_files
                 step_count = len(trace.steps)
+                trace_ok = trace.ok
+                trace_for_experience = trace
+
+            # WRITE EXPERIENCE + TRACE ATOMS on full success. Without
+            # this, the audit's in-process runs never populate
+            # region='traces' — so the apprentice can't fire on
+            # subsequent runs, blocking the brain's biggest payoff
+            # path (LLM-skipping template reuse). The CLI does this
+            # already in __main__.py; the bench runner missed it.
+            #
+            # Gating on trace_ok matches the partial-success guard
+            # we added to __main__.py — only fully-completed traces
+            # become experience/trace atoms.
+            if trace_ok and final_files:
+                try:
+                    from lattice.atoms.feedback import (
+                        record_experience,
+                        summarize_trace_for_experience,
+                    )
+
+                    actions, files = summarize_trace_for_experience(
+                        trace_for_experience
+                    )
+                    if actions:
+                        record_experience(
+                            store=store,
+                            task=task.task,
+                            actions_summary=actions,
+                            files_touched=files,
+                        )
+                except Exception:  # noqa: BLE001
+                    # Bench experience recording is best-effort; never
+                    # let it sink an otherwise-successful run.
+                    pass
 
             if final_files:
                 class _Report:
