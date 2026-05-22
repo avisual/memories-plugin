@@ -45,6 +45,11 @@ class TaskResult:
     detail: str = ""
     final_files: dict[str, str] = field(default_factory=dict)
     run_idx: int = 0  # 0-indexed when --repeat > 1
+    # Steps the agent loop took before terminating. With brain ON,
+    # a well-primed loop may converge in fewer cycles even when
+    # both ON and OFF eventually pass — this captures that delta.
+    # 0 when the run errored before producing a trace.
+    step_count: int = 0
 
 
 def _setup_workspace(task: BenchTask, root: Path) -> None:
@@ -213,6 +218,7 @@ def _run_one_inprocess(
             proposer = _build_inproc_proposer(cfg, llm_cache)
             workspace = FilesystemWorkspace(root)
 
+            step_count = 0
             if cfg["decompose"]:
                 subtasks = decompose(task.task)
                 report = run_subtasks(
@@ -223,6 +229,11 @@ def _run_one_inprocess(
                     max_steps_per_subtask=4,
                 )
                 final_files = report.final_files
+                # Sum step counts across subtask traces. report.traces
+                # is the list of per-subtask AgentTrace objects.
+                step_count = sum(
+                    len(getattr(t, "steps", ())) for t in getattr(report, "traces", ())
+                )
             else:
                 loop = AgentLoop(
                     proposer=proposer,
@@ -232,6 +243,7 @@ def _run_one_inprocess(
                 )
                 trace = loop.run(task.task)
                 final_files = trace.final_files
+                step_count = len(trace.steps)
 
             if final_files:
                 class _Report:
@@ -251,6 +263,7 @@ def _run_one_inprocess(
             elapsed_s=elapsed,
             detail=detail,
             final_files=finals,
+            step_count=step_count,
         )
     except Exception as exc:  # noqa: BLE001
         elapsed = time.time() - start

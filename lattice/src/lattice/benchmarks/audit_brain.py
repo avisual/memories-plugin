@@ -39,6 +39,12 @@ class AuditRow:
     brain_on_failures: list[str] = field(default_factory=list)
     brain_off_failures: list[str] = field(default_factory=list)
     runs: int = 0
+    # Cumulative step counts across all runs of this task. Step-delta
+    # is the second-tier signal (after pass-rate): if brain ON converges
+    # in fewer cycles even when both ON and OFF eventually pass, that's
+    # measurable brain help that the binary pass/fail misses.
+    brain_on_steps: int = 0
+    brain_off_steps: int = 0
 
 
 def _run_one_with_brain_flag(
@@ -158,6 +164,7 @@ def main(argv: list[str] | None = None) -> int:
                     brain_db_path=brain_on_path,
                 )
                 row.brain_on_time_s += time.time() - t0
+                row.brain_on_steps += getattr(res_on, "step_count", 0)
                 if res_on.passed:
                     row.brain_on_passes += 1
                 else:
@@ -171,14 +178,15 @@ def main(argv: list[str] | None = None) -> int:
                     brain_db_path=brain_off_path,
                 )
                 row.brain_off_time_s += time.time() - t0
+                row.brain_off_steps += getattr(res_off, "step_count", 0)
                 if res_off.passed:
                     row.brain_off_passes += 1
                 else:
                     row.brain_off_failures.append(res_off.detail[:200])
 
                 sys.stderr.write(
-                    f"on={'P' if res_on.passed else 'F'} "
-                    f"off={'P' if res_off.passed else 'F'}\n"
+                    f"on={'P' if res_on.passed else 'F'}({res_on.step_count}s) "
+                    f"off={'P' if res_off.passed else 'F'}({res_off.step_count}s)\n"
                 )
             rows.append(row)
     finally:
@@ -203,14 +211,14 @@ def _print_audit(rows: list[AuditRow]) -> None:
     print(
         f"\n{'task':<{name_w}}  {'tier':<8}  "
         f"{'brain on':>10}  {'brain off':>10}  "
-        f"{'on avg s':>9}  {'off avg s':>10}  delta"
+        f"{'on steps':>9}  {'off steps':>10}  delta"
     )
     print("-" * (name_w + 70))
     for r in rows:
         on_rate = f"{r.brain_on_passes}/{r.runs}"
         off_rate = f"{r.brain_off_passes}/{r.runs}"
-        on_avg = r.brain_on_time_s / max(1, r.runs)
-        off_avg = r.brain_off_time_s / max(1, r.runs)
+        on_steps_avg = r.brain_on_steps / max(1, r.runs)
+        off_steps_avg = r.brain_off_steps / max(1, r.runs)
         delta = r.brain_on_passes - r.brain_off_passes
         marker = ""
         if delta > 0:
@@ -220,16 +228,25 @@ def _print_audit(rows: list[AuditRow]) -> None:
         print(
             f"{r.task_name:<{name_w}}  {r.tier:<8}  "
             f"{on_rate:>10}  {off_rate:>10}  "
-            f"{on_avg:>8.1f}s  {off_avg:>9.1f}s  {delta:+d}{marker}"
+            f"{on_steps_avg:>8.1f}   {off_steps_avg:>8.1f}   {delta:+d}{marker}"
         )
 
     total_on = sum(r.brain_on_passes for r in rows)
     total_off = sum(r.brain_off_passes for r in rows)
     total_runs = sum(r.runs for r in rows)
+    total_on_steps = sum(r.brain_on_steps for r in rows)
+    total_off_steps = sum(r.brain_off_steps for r in rows)
     print()
     print(f"OVERALL brain ON:  {total_on}/{total_runs}")
     print(f"OVERALL brain OFF: {total_off}/{total_runs}")
-    print(f"NET DELTA:         {total_on - total_off:+d}")
+    print(f"NET pass delta:    {total_on - total_off:+d}")
+    # Step delta — second-tier brain signal. Negative means brain ON
+    # converged in fewer total steps across all runs (good — brain
+    # cuts cycles even when both eventually pass).
+    print(
+        f"NET step delta:    {total_on_steps - total_off_steps:+d} "
+        f"(ON={total_on_steps} OFF={total_off_steps})"
+    )
 
     on_time = sum(r.brain_on_time_s for r in rows)
     off_time = sum(r.brain_off_time_s for r in rows)
@@ -253,15 +270,40 @@ def _print_audit(rows: list[AuditRow]) -> None:
                 "outcomes here. Re-run with --tier llm for the meaningful "
                 "signal."
             )
+        elif total_on_steps < total_off_steps:
+            # Pass-rate tied but brain cut cycles. Real signal — brain
+            # CAN'T flip a passing task to a failing one or vice versa,
+            # so the only place its effect shows up is convergence
+            # speed. Negative step delta is the brain-helps proxy
+            # when both conditions clear the binary bar.
+            saved = total_off_steps - total_on_steps
+            pct = 100.0 * saved / max(1, total_off_steps)
+            print(
+                f"\nVerdict: brain HELPS via step efficiency — "
+                f"{saved} fewer total steps with brain ON ({pct:.0f}%). "
+                "Pass rates tied (both clear the bar), but brain ON "
+                "converges in fewer cycles. Real signal even though "
+                "binary pass-rate didn't move."
+            )
+        elif total_on_steps > total_off_steps:
+            extra = total_on_steps - total_off_steps
+            pct = 100.0 * extra / max(1, total_off_steps)
+            print(
+                f"\nVerdict: brain HURTS via step inefficiency — "
+                f"{extra} MORE total steps with brain ON ({pct:.0f}%). "
+                "Pass rates tied. Brain ON is adding cycles without "
+                "yielding pass-rate benefit — the recall+priming is "
+                "currently distracting the loop rather than focusing it."
+            )
         else:
             print(
                 "\nVerdict: brain DECORATION on this task set. "
-                "Wiring runs but doesn't move outcomes. Either the "
+                "Pass rates AND step counts identical. Either the "
                 "tasks are too easy for the LLM (brain irrelevant), "
                 "the persistent-brain isn't accumulating useful atoms, "
                 "or the decision-weighting isn't tipping the choices "
                 "enough to flip results. Inspect with "
-                "`lattice brain audit-state` on the brain-on.db."
+                "`lattice brain audit-state --db <keep-brain-db>/brain-on.db`."
             )
     elif total_on > total_off:
         print(
