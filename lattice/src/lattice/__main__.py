@@ -191,7 +191,14 @@ def _agent(args: argparse.Namespace) -> int:
                 written = write_final(report, root=args.workspace)
                 sys.stderr.write(f"wrote {len(written)} file(s)\n")
 
-            if atom_store is not None and report.final_files:
+            # Only record experience atoms on FULL success (report.ok).
+            # A partial run that touched files but terminated by 'stuck'
+            # or 'exhausted' represents an INCOMPLETE solution — recording
+            # it at the same importance as a full success poisons the
+            # apprentice's template-inference: future tasks of similar
+            # shape would replay an action sequence that didn't actually
+            # complete the original work.
+            if atom_store is not None and report.ok and report.final_files:
                 actions, files = summarize_trace_for_experience(report)
                 if actions:
                     record_experience(
@@ -246,7 +253,8 @@ def _agent(args: argparse.Namespace) -> int:
             written = write_final(trace, root=args.workspace)
             sys.stderr.write(f"wrote {len(written)} file(s)\n")
 
-        if atom_store is not None and trace.final_files:
+        # Same partial-success guard as the --decompose path above.
+        if atom_store is not None and trace.ok and trace.final_files:
             actions, files = summarize_trace_for_experience(trace)
             if actions:
                 record_experience(
